@@ -1,0 +1,17 @@
+node_modules/
+.next/
+.env*
+*.env
+*.env.*
+artifacts/
+outputs/
+videos/
+credentials.enc
+storage.key
+output-storage.json
+.local/
+coverage/
+test-results/
+playwright-report/
+*.tsbuildinfo
+*.log
