@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { assetPath, getProject, updateProject } from "./agent-store";
-import { needsPreviousPrompt, previousFrameDecision, suppliedImages, suppliedAudios, type AgentProject, type AgentClip, type GenerationSettings } from "./agent-types";
+import { plannedDuration, needsPreviousPrompt, previousFrameDecision, suppliedImages, suppliedAudios, type AgentProject, type AgentClip, type GenerationSettings } from "./agent-types";
 import { planFollowingClipPrompt } from "./agent-llm";
 import { RequestError } from "./request-error";
 import { wanPromptGuideVersion } from "./wan-prompt-guide";
@@ -23,7 +23,7 @@ function promptFingerprint(project: AgentProject, clip: AgentClip) {
   }
   return (settings: unknown) => {
     const hash = createHash("sha256");
-    hash.update(JSON.stringify({ previous: observed, target: { duration: clip.duration, references: clip.referenceIds, continuation: previousFrameDecision(clip), settings } }));
+    hash.update(JSON.stringify({ previous: observed, target: { duration: plannedDuration(clip), references: clip.referenceIds, continuation: previousFrameDecision(clip), settings } }));
     for (const part of content) hash.update(part);
     return hash.digest("hex");
   };

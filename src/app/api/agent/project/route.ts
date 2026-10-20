@@ -6,7 +6,7 @@ import { readJson } from "@/lib/runpod";
 import { getProject, updateProject } from "@/lib/agent-store";
 import { generationSchema, needsPreviousPrompt, previousFrameDecision, shotSchema, wanShotSchema, entityIdSchema, type AgentProject } from "@/lib/agent-types";
 import { optimizeScriptPlan, reviseClipPrompt, planFromReferences } from "@/lib/agent-llm";
-import { assertEditable, publicProject, recoverClip, retryClip } from "@/lib/agent-runner";
+import { assertEditable, isProjectActive, publicProject, recoverClip, retryClip } from "@/lib/agent-runner";
 import { RequestError } from "@/lib/request-error";
 import { promptApprovalKey } from "@/lib/prompt-approval";
 import { wanPromptGuideVersion } from "@/lib/wan-prompt-guide";
@@ -14,6 +14,7 @@ import { prepareSequentialPrompt, assertPreviousPromptReady, previousPromptKey, 
 export const runtime = "nodejs";
 export const maxDuration = 300;
 const mutation = z.discriminatedUnion("action", [
+  z.object({ projectId: z.uuid(), action: z.literal("setDuration"), clipId: entityIdSchema, duration: z.number() }),
   z.object({ projectId: z.uuid(), action: z.literal("planNextPrompt"), clipId: entityIdSchema, model: z.string().min(1).max(150), reasoningEffort: reasoningEffortSchema.optional(), prompt: shotSchema.shape.prompt.optional(), referenceIds: z.array(entityIdSchema).max(9).optional() }),
   z.object({ projectId: z.uuid(), action: z.literal("plan"), model: z.string().min(1).max(150), reasoningEffort: reasoningEffortSchema.optional() }),
   z.object({ projectId: z.uuid(), action: z.literal("prepareClip"), clipId: entityIdSchema, prompt: shotSchema.shape.prompt, referenceIds: z.array(entityIdSchema).max(9) }),
@@ -36,7 +37,24 @@ export async function POST(request: Request) {
   try {
     assertLocalRequest(request, true); const parsed = mutation.safeParse(await readJson(request, 50000));
     if (!parsed.success) throw new RequestError(parsed.error.issues[0].message, "invalid_project_edit");
-    const data = parsed.data; assertEditable(data.projectId);
+    const data = parsed.data;
+    if (data.action === "setDuration") {
+      const project = await updateProject(data.projectId, current => {
+        const clip = current.clips.find(item => item.id === data.clipId);
+        if (!clip) throw new RequestError("Choose an existing clip.", "invalid_clip_state");
+        const schema = current.settings.provider === "apimart" ? wanShotSchema.shape.duration : shotSchema.shape.duration;
+        if (!schema.safeParse(data.duration).success) throw new RequestError("Use 2-30 whole seconds for Wan or 2-10 seconds for H3.", "invalid_duration");
+        if ((clip.nextDuration ?? clip.duration) === data.duration) return current;
+        if (isProjectActive(current.id) || clip.requestId || clip.jobId || clip.source || !["pending", "awaiting-approval"].includes(clip.status)) {
+          clip.nextDuration = data.duration === clip.duration ? undefined : data.duration;
+        } else { clip.duration = data.duration; clip.nextDuration = undefined; }
+        clip.approvedPromptKey = undefined;
+        clip.promptContextKey = undefined;
+        return current;
+      });
+      return Response.json({ project: publicProject(project) }, { headers: privateHeaders });
+    }
+    assertEditable(data.projectId);
     let project;
     if (data.action === "planNextPrompt") project = await prepareSequentialPrompt(data.projectId, data.clipId, data.model, request.signal, data.reasoningEffort, { prompt: data.prompt, referenceIds: data.referenceIds });
     else if (data.action === "plan") {
@@ -138,7 +156,7 @@ export async function POST(request: Request) {
         if ((data.settings.provider || "runpod") !== (current.settings.provider || "runpod") && current.clips.some(clip => clip.status !== "complete" && (clip.requestId || clip.jobId || clip.source))) throw new RequestError("Resolve unfinished jobs before switching video providers. Existing jobs must be resumed with their original provider.", "provider_locked");
         const planningUnchanged = JSON.stringify(promptPlanningSettings(current.settings)) === JSON.stringify(promptPlanningSettings(data.settings));
         current.settings = data.settings;
-        if (current.clips.some(clip => !clip.requestId && !clip.jobId && clip.status !== "complete" && !(data.settings!.provider === "apimart" ? wanShotSchema : shotSchema).safeParse(clip).success)) throw new RequestError("Adjust unfinished clip durations before switching providers: H3 supports 2–10 seconds and Wan supports 2–30 whole seconds.", "invalid_duration");
+        if (current.clips.some(clip => !clip.requestId && !clip.jobId && clip.status !== "complete" && !(data.settings!.provider === "apimart" ? wanShotSchema : shotSchema).safeParse({ ...clip, duration: clip.nextDuration ?? clip.duration }).success)) throw new RequestError("Adjust unfinished clip durations before switching providers: H3 supports 2–10 seconds and Wan supports 2–30 whole seconds.", "invalid_duration");
         if (planningUnchanged) {
           for (const clip of current.clips) {
             clip.approvedPromptKey = undefined;

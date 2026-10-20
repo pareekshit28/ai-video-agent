@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { agentSubmissionSchema, buildPayload, type H3Job, type ReferenceFile } from "./h3";
-import { assetUrl, finalPrompt, markFollowingContinuityOutdated, needsPreviousPrompt, previousPromptAvailable, previousFrameDecision, suppliedReferences, suppliedImages, suppliedAudios, type AgentClip, type AgentProject, type PublicProject } from "./agent-types";
+import { plannedDuration, assetUrl, finalPrompt, markFollowingContinuityOutdated, needsPreviousPrompt, previousPromptAvailable, previousFrameDecision, suppliedReferences, suppliedImages, suppliedAudios, type AgentClip, type AgentProject, type PublicProject } from "./agent-types";
 import { prepareSequentialPrompt, assertPreviousPromptReady } from "./sequential-prompts";
 import { assetPath, getProject, updateProject, writeAsset, projectFolder } from "./agent-store";
 import { archiveAgentOutput, checkVideo, connectionInfo, jobHistory, submitAgentVideo, resolveUnknown } from "./runpod";
@@ -76,11 +76,15 @@ export async function reserveRun(id: string, model: string, options: { clipId?: 
         const job = history.find(job => job.localId === selected.requestId);
         if (job?.id || selected.jobId) await assertReplaceableJob(job?.id || selected.jobId!, job ? selected.requestId : undefined);
       }
-      const { versions, revision, ...take } = selected;
+      const { versions, revision, nextDuration, ...take } = selected;
       if (options.revision && revision?.referenceIds && (new Set(revision.referenceIds).size !== revision.referenceIds.length || revision.referenceIds.some(id => !project.references.some(slot => slot.id === id)))) throw new RequestError("Choose valid scene references for this revision.", "invalid_reference");
-      revised = { ...selected, referenceIds: options.revision ? revision!.referenceIds ?? selected.referenceIds : selected.referenceIds, promptGuideVersion: options.revision && project.settings.provider === "apimart" ? wanPromptGuideVersion : selected.promptGuideVersion, versions: [...(versions || []), { archivedAt: Date.now(), clip: take }], prompt: options.revision ? revision!.prompt : selected.prompt, compiledPrompt: options.revision ? revision!.prompt : selected.compiledPrompt || selected.prompt, revisionComments: options.revision ? revision!.comments : selected.revisionComments, revision: undefined, status: "pending", approvedPromptKey: undefined, requestId: undefined, jobId: undefined, requestedDuration: undefined, seed: undefined, endpoint: undefined, source: undefined, video: undefined, frame: undefined, extractedFrame: undefined, frameReplaced: false, media: undefined, firstFrameFrom: undefined, error: undefined, continuityOutdated: false };
+      revised = { ...selected, duration: plannedDuration(selected), nextDuration: undefined, referenceIds: options.revision ? revision!.referenceIds ?? selected.referenceIds : selected.referenceIds, promptGuideVersion: options.revision && project.settings.provider === "apimart" ? wanPromptGuideVersion : selected.promptGuideVersion, versions: [...(versions || []), { archivedAt: Date.now(), clip: take }], prompt: options.revision ? revision!.prompt : selected.prompt, compiledPrompt: options.revision ? revision!.prompt : selected.compiledPrompt || selected.prompt, revisionComments: options.revision ? revision!.comments : selected.revisionComments, revision: undefined, status: "pending", approvedPromptKey: undefined, requestId: undefined, jobId: undefined, requestedDuration: undefined, seed: undefined, endpoint: undefined, source: undefined, video: undefined, frame: undefined, extractedFrame: undefined, frameReplaced: false, media: undefined, firstFrameFrom: undefined, error: undefined, continuityOutdated: false };
     }
-    const candidate = { ...project, clips: project.clips.map(clip => clip.id === revised?.id ? revised : clip) };
+    const candidate = { ...project, clips: project.clips.map(clip => {
+      if (clip.id === revised?.id) return revised;
+      if ((!scopeId || clip.id === scopeId) && ["pending", "awaiting-approval"].includes(clip.status) && !clip.requestId && !clip.jobId && !clip.source && clip.nextDuration !== undefined) return { ...clip, duration: clip.nextDuration, nextDuration: undefined };
+      return clip;
+    }) };
     if (options.revision && revised) revised.approvedPromptKey = promptApprovalKey(candidate, revised);
     const targets = candidate.clips.filter(clip => !scopeId || clip.id === scopeId);
     for (const clip of targets.filter(clip => clip.status !== "complete" && !clip.jobId && !clip.source && (scopeId || !needsPreviousPrompt(candidate, clip)))) assertPreviousPromptReady(candidate, clip);
@@ -96,7 +100,7 @@ export async function reserveRun(id: string, model: string, options: { clipId?: 
       const maxSeconds = candidate.settings.provider === "apimart" ? 30 : 10;
       if (clip.duration > maxSeconds || clip.duration < 2 || (maxSeconds === 30 && !Number.isInteger(clip.duration))) throw new RequestError(`Every clip must be 2–${maxSeconds} seconds${maxSeconds === 30 ? " in whole seconds" : ""}.`, "invalid_duration");
     }
-    await updateProject(id, current => { controller.signal.throwIfAborted(); if (revised) current.clips[current.clips.findIndex(clip => clip.id === revised.id)] = revised; current.runClipId = scopeId; current.status = "preparing"; current.model = model; current.reasoningEffort = options.reasoningEffort || current.reasoningEffort || "low"; current.runEndpoint = connection.endpoint; current.error = undefined; return current; });
+    await updateProject(id, current => { controller.signal.throwIfAborted(); if (JSON.stringify(current) !== JSON.stringify(project)) throw new RequestError("The project changed while starting generation. Review the latest settings and try again.", "project_changed"); current.clips = candidate.clips; current.runClipId = scopeId; current.status = "preparing"; current.model = model; current.reasoningEffort = options.reasoningEffort || current.reasoningEffort || "low"; current.runEndpoint = connection.endpoint; current.error = undefined; return current; });
     if (state.active?.controller === controller) state.active.clipId = scopeId;
     if (revised && selected?.requestId && selected.video) await archiveAgentOutput(selected.requestId, new URL(`${assetUrl(id, "video", selected.id)}&version=${revised.versions!.length - 1}`, appOrigin()).href);
     return controller;

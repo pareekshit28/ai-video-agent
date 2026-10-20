@@ -49,6 +49,12 @@ async function setup(page: Page, initial?: PublicProject) {
         if (["complete", "failed"].includes(clip.status)) clip.revision = { prompt: body.prompt, referenceIds: body.referenceIds, comments: clip.revision?.comments || "", model: project!.model, createdAt: Date.now() };
         else Object.assign(clip, { prompt: body.prompt, compiledPrompt: body.prompt, referenceIds: body.referenceIds, revision: undefined, status: "pending" });
       }
+      if (body.action === "setDuration") {
+        const clip = project!.clips.find(clip => clip.id === body.clipId)!;
+        if (project!.active || clip.jobId || clip.requestId || clip.source || !["pending", "awaiting-approval"].includes(clip.status)) clip.nextDuration = body.duration;
+        else clip.duration = body.duration;
+        clip.promptContextKey = undefined; clip.approvedPromptKey = undefined;
+      }
       if (body.clip) Object.assign(project!.clips.find(clip => clip.id === body.clip.id)!, body.clip);
       if (body.reviewAfterEachClip !== undefined) project!.reviewAfterEachClip = body.reviewAfterEachClip;
       if (body.reasoningEffort !== undefined) project!.reasoningEffort = body.reasoningEffort;
@@ -59,7 +65,7 @@ async function setup(page: Page, initial?: PublicProject) {
       if (body.action === "recover") { project!.clips[0].status = "recoverable"; project!.clips[0].jobId = body.jobId; }
       return route.fulfill({ json: { project } });
     }
-    if (project?.active && ++polls >= 2) {
+    if (project?.active && (runningClip || !initial?.active) && ++polls >= 2) {
       project.active = false;
       const pending = project.clips.filter(clip => clip.status !== "complete" && (!runningClip || clip.id === runningClip));
       const targets = project.reviewAfterEachClip !== false && !runningClip ? pending.slice(0, 1) : pending;
@@ -71,6 +77,35 @@ async function setup(page: Page, initial?: PublicProject) {
   });
   await page.goto("/"); return requests;
 }
+
+test("clip duration stays editable after generation and persists on reload", async ({ page }, info) => {
+  const value = planned();
+  Object.assign(value.clips[0], { status: "complete", jobId: "saved-job", video: { path: "clips/arrival.mp4", name: "arrival.mp4", bytes: video.length, mime: "video/mp4" }, media: { width: 320, height: 180, fps: 24, duration: 5 } });
+  const requests = await setup(page, value);
+  await page.getByLabel("Clip 1 duration", { exact: true }).fill("7.5");
+  await page.getByRole("button", { name: "Save duration for clip 1", exact: true }).click();
+  await expect(page.getByLabel("Clip 1 duration", { exact: true })).toHaveValue("7.5");
+  await expect(page.getByRole("link", { name: "Download clip 1", exact: true })).toBeVisible();
+  await expect(page.getByText("7.5s saved for the next take.", { exact: false })).toBeVisible();
+  await page.reload();
+  await expect(page.getByLabel("Clip 1 duration", { exact: true })).toHaveValue("7.5");
+  expect(requests.filter(item => item.path === "run")).toHaveLength(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.locator(".agent-clip").first().screenshot({ path: `test-results/${info.project.name}-editable-duration.png` });
+});
+
+test("duration can be saved during an active job without pausing generation", async ({ page }) => {
+  const value = planned(); value.active = true; value.status = "running";
+  Object.assign(value.clips[0], { status: "rendering", jobId: "active-job", requestId: "active-request" });
+  const requests = await setup(page, value);
+  await expect(page.getByLabel("Clip 1 duration", { exact: true })).toBeEditable();
+  await page.getByLabel("Clip 1 duration", { exact: true }).fill("8");
+  await page.getByRole("button", { name: "Save duration for clip 1", exact: true }).click();
+  await expect(page.getByLabel("Clip 1 duration", { exact: true })).toHaveValue("8");
+  await expect(page.getByRole("button", { name: "Pause generation", exact: true })).toBeVisible();
+  expect(requests.filter(item => item.body.action === "setDuration").at(-1)?.body.duration).toBe(8);
+  expect(requests.filter(item => item.path === "run")).toHaveLength(0);
+});
 
 test("reference-first planning, editable prompts and individual generation preserve local playback", async ({ page }, info) => {
   const requests = await setup(page);

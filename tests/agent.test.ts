@@ -40,6 +40,56 @@ const plan = {
   clips: [{ id: "arrival", title: "Arrival", duration: 2, prompt: "A traveler approaches the station.", referenceIds: ["station", "traveler"], continuation: false }, { id: "boarding", title: "Boarding", duration: 2, prompt: "The traveler moves toward the train.", referenceIds: ["traveler", "station"], continuation: true }],
 };
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aBXkAAAAASUVORK5CYII=", "base64");
+describe("individual clip duration", () => {
+  it("updates unsubmitted clips independently and validates each provider", async () => {
+    const value = await project();
+    const set = (duration: number, clipId = "arrival") => projectRoute(localMutation("agent/project", { projectId: value.id, action: "setDuration", clipId, duration }));
+    expect((await set(7.5)).status).toBe(200);
+    let saved = await getProject(value.id);
+    expect(saved.clips[0].duration).toBe(7.5); expect(saved.clips[1]).toEqual(value.clips[1]);
+    for (const duration of [0, 1, 10.5, 31]) expect((await set(duration)).status).toBe(400);
+    expect((await set(5, "missing")).status).toBe(400);
+    await updateProject(value.id, current => { current.settings.provider = "apimart"; return current; });
+    expect((await set(30)).status).toBe(200); expect((await set(2.5)).status).toBe(400);
+    saved = await getProject(value.id); expect(saved.clips[0].duration).toBe(30);
+  });
+  it("stages duration changes during rendering and applies them to regeneration while archiving the original take", async () => {
+    const value = await project();
+    const submit = vi.fn(async (input) => {
+      const edit = await projectRoute(localMutation("agent/project", { projectId: value.id, action: "setDuration", clipId: "arrival", duration: 5 }));
+      expect(edit.status).toBe(200);
+      expect((await projectRoute(localMutation("agent/project", { projectId: value.id, action: "setDuration", clipId: "boarding", duration: 6 }))).status).toBe(200);
+      const saved = await getProject(value.id);
+      expect(saved.clips[0]).toMatchObject({ duration: 2, nextDuration: 5, requestedDuration: 2 });
+      return { localId: input.requestId, id: "original-job", endpoint: "xnnd4qobofshqz", prompt: input.settings.prompt, status: "COMPLETED", createdAt: Date.now(), output: { video: `data:video/mp4;base64,${video.toString("base64")}` } };
+    });
+    await executeProject(value.id, await reserveRun(value.id, "test-model", { clipId: "arrival" }), { compile: async () => [], submit });
+    let saved = await getProject(value.id);
+    expect(saved.clips[0]).toMatchObject({ status: "complete", duration: 2, nextDuration: 5, media: { duration: 2 } });
+    expect(saved.clips[1]).toMatchObject({ duration: 2, nextDuration: 6, status: "pending" });
+    const stopNext = vi.fn(async (input) => ({ localId: input.requestId, id: "boarding-job", endpoint: "xnnd4qobofshqz", prompt: input.settings.prompt, status: "FAILED", createdAt: Date.now(), error: "Test render stopped" }));
+    await executeProject(value.id, await reserveRun(value.id, "test-model", { clipId: "boarding" }), { compile: async () => [], submit: stopNext });
+    expect(stopNext.mock.calls[0][0].settings.duration).toBe(6);
+    expect((await getProject(value.id)).clips[1].nextDuration).toBeUndefined();
+    const originalVideo = saved.clips[0].video;
+    expect((await projectRoute(localMutation("agent/project", { projectId: value.id, action: "prepareClip", clipId: "arrival", prompt: "A slower arrival.", referenceIds: ["traveler"] }))).status).toBe(200);
+    const retry = vi.fn(async (input) => ({ localId: input.requestId, id: "new-job", endpoint: "xnnd4qobofshqz", prompt: input.settings.prompt, status: "FAILED", createdAt: Date.now(), error: "Test render stopped" }));
+    await executeProject(value.id, await reserveRun(value.id, "test-model", { clipId: "arrival", revision: true }), { compile: async () => [], submit: retry });
+    saved = await getProject(value.id);
+    expect(retry.mock.calls[0][0].settings.duration).toBe(5);
+    expect(saved.clips[0].duration).toBe(5); expect(saved.clips[0].nextDuration).toBeUndefined();
+    expect(saved.clips[0].versions![0].clip).toMatchObject({ duration: 2, video: originalVideo, media: { duration: 2 } });
+    expect(await readFile(assetPath(value.id, originalVideo!.path))).toBeTruthy();
+  }, 20000);
+  it.each(["complete", "failed", "recoverable", "submission-unknown"] as const)("stages edits for %s clips without changing jobs or saved media", async status => {
+    const value = await project();
+    await updateProject(value.id, current => { Object.assign(current.clips[0], { status, requestId: "saved-request", jobId: "saved-job", requestedDuration: 2 }); return current; });
+    const before = (await getProject(value.id)).clips[0];
+    expect((await projectRoute(localMutation("agent/project", { projectId: value.id, action: "setDuration", clipId: "arrival", duration: 6 }))).status).toBe(200);
+    expect((await getProject(value.id)).clips[0]).toEqual({ ...before, nextDuration: 6 });
+  });
+});
+
 describe("project drafts", () => {
   it("keeps scene files and scoped library assets inside their parent and rejects cross-project references", async () => {
     const parent = await createCollection("Film"), other = await createCollection("Other film");
@@ -388,6 +438,18 @@ describe("scene planning and reference selection", () => {
     await executeProject(value.id, await reserveRun(value.id, "test-model", { clipId: "arrival" }), { submit });
     return submit;
   }
+  it("requires a refreshed sequential prompt after a duration change and plans with the saved value", async () => {
+    const value = await sequentialScene(); planning.call.mockResolvedValue({ prompt: "Static shot. She boards slowly." });
+    await finishFirst(value);
+    const response = await projectRoute(localMutation("agent/project", { projectId: value.id, action: "setDuration", clipId: "boarding", duration: 8 }));
+    expect(response.status).toBe(200);
+    let saved = await getProject(value.id);
+    expect(() => assertPreviousPromptReady(saved, saved.clips[1])).toThrow("Plan this prompt");
+    expect((await projectRoute(localMutation("agent/project", { projectId: value.id, action: "planNextPrompt", clipId: "boarding", model: "test-model" }))).status).toBe(200);
+    expect(JSON.parse(planning.call.mock.calls.at(-1)![2]).target.duration).toBe(8);
+    saved = await getProject(value.id);
+    expect(() => assertPreviousPromptReady(saved, saved.clips[1])).not.toThrow();
+  }, 15000);
   it.each(["pending", "failed"] as const)("keeps a %s clip's frame-aware prompt when sampling steps change and submits the new steps", async status => {
     const value = await sequentialScene(); planning.call.mockResolvedValue({ prompt: "Static shot. She boards from her position at the door." });
     await finishFirst(value);
