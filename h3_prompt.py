@@ -1,7 +1,7 @@
 """H3 prompt-writing contract, adapted to this node pack's actual media binding."""
 import re
 
-VERSION = "h3-official-2026-10-22.1"
+VERSION = "h3-official-2026-10-22.2"
 BASE_FIELDS = ("integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
 REF_FIELDS = ("subject_definitions", "summary", "retention_analysis", "detailed_description", "overall_soundscape", "non_diegetic_music")
 FIELDS = re.compile(r"(?m)^\s*(" + "|".join(dict.fromkeys(BASE_FIELDS + REF_FIELDS)) + r")\s*:\s*")
@@ -17,14 +17,14 @@ SHOT = re.compile(r"\[Shot\s+(\d+)\]")
 CUT = re.compile(r"^\s*At\s+(\d{2}):([0-5]\d)\.(\d{3}),")
 
 RULES = """H3 PROMPT CONTRACT (apply to final prompts, not reference discovery or later-clip outlines):
-The outer response is still the requested JSON object. For each final prompt, return its prompt value
-as a JSON object with the section names below as keys and nonempty text as their values. The host
-assembles the headings in H3 order; do not put headings or Markdown fences inside the values. Escape
-newlines correctly in JSON. Later-clip outlines remain strings. Write descriptions in English; preserve the original language of
+The outer response is still the requested JSON object. Return each prompt as ONE complete text string,
+with the H3 headings below inside that string. Do not split a prompt into a JSON object of sections.
+Escape newlines correctly in JSON. Later-clip outlines remain strings. Write descriptions in English;
+preserve the original language of
 dialogue, lyrics and visible text. Use h3Prompting.mode and the reference manifest. For planning,
 choose the first prompt's mode from that clip's selected referenceIds, not all available references.
 
-REF2VA: Use these six section keys, once each. The host writes the headings in this order:
+REF2VA: Write these six section headings inside the single prompt string, once each, in this order:
 subject_definitions: define selected named references, their supplied subjectLabel when present,
 and the visible characteristics actually supported by the images. A subjectLabel is a reusable
 person/place/prop, not a frame anchor. For voice-only inputs describe the named vocal source without

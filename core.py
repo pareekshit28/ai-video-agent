@@ -44,6 +44,11 @@ def text(value, maximum=32000):
     return value.strip()
 
 
+def ensure_not_planning(scene):
+    if scene.get("planning", {}).get("status") == "running":
+        raise ValueError("Qwen is still planning this scene. Wait for it to finish before editing or deleting it.")
+
+
 def duration(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError("Duration must be a number")
@@ -156,6 +161,8 @@ class Store:
         return scene
 
     def trash_project(self, project_id):
+        for scene in self.scenes(project_id):
+            ensure_not_planning(scene)
         if any(c["status"] in ACTIVE for s in self.scenes(project_id) for c in s["clips"]):
             raise ValueError("Resolve active or uncertain jobs before deleting this project")
         destination = self.path(f".trash/{project_id}-{uid()}")
@@ -164,6 +171,7 @@ class Store:
 
     def trash_scene(self, project_id, scene_id, episode_id):
         scene = self.scene(project_id, scene_id, episode_id)
+        ensure_not_planning(scene)
         if any(c["status"] in ACTIVE for c in scene["clips"]):
             raise ValueError("Resolve active or uncertain jobs before deleting this scene")
         source = self.path(self.scene_dir(project_id, scene_id))
@@ -175,6 +183,8 @@ class Store:
         project = self.project(project_id)
         episode = self.episode(project_id, episode_id)
         scenes = self.scenes(project_id, episode_id)
+        for scene in scenes:
+            ensure_not_planning(scene)
         if any(c["status"] in ACTIVE for scene in scenes for c in scene["clips"]):
             raise ValueError("Resolve active or uncertain jobs before deleting this episode")
         relative = f".trash/episodes/{episode_id}-{uid()}"

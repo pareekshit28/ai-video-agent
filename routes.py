@@ -89,6 +89,7 @@ async def state(request):
     # Restore monitoring after a server restart, but never resubmit a job.
     for watched_project in projects:
         for watched_scene in eng.store.scenes(watched_project["id"]):
+            eng.planning_status(watched_scene)
             if not watched_scene.get("paused") and any(c["status"] in core.ACTIVE for c in watched_scene["clips"]):
                 eng.watch(watched_project["id"], watched_scene["id"], base_url(request))
     summaries = [{k: p[k] for k in ("id", "name", "createdAt")} for p in projects]
@@ -181,6 +182,14 @@ async def action(request):
         scene_id = core.identifier(body["sceneId"])
         async with eng.lock(scene_id):
             scene = store.scene(project_id, scene_id, body.get("episodeId"))
+            eng.planning_status(scene)
+            if command in ("identify", "plan", "planPrompt", "revisePrompt"):
+                core.settings(scene["settings"])
+                clip = find_clip(scene, body["clipId"]) if command in ("planPrompt", "revisePrompt") else None
+                eng.start_planning(scene, command, base_url(request), clip["id"] if clip else None,
+                                   body.get("comments", ""), body.get("requestId"))
+                return web.json_response({"scene": public_scene(eng, scene)}, status=202)
+            core.ensure_not_planning(scene)
             if command == "renameScene":
                 scene.update(name=core.text(body["name"], 150), autoName=False)
                 store.save_scene(scene)
@@ -199,12 +208,6 @@ async def action(request):
                 if script != scene["script"] and scene["clips"]:
                     scene["clips"] = []
                 scene.update(name=core.text(body["name"], 150), script=script, settings=new_settings)
-            elif command == "identify":
-                check_mutable(scene)
-                await eng.discover(scene, base)
-            elif command == "plan":
-                check_mutable(scene)
-                await eng.plan(scene, base)
             elif command == "addLibraryReference":
                 check_mutable(scene)
                 item = next(r for r in project["library"] if r["id"] == body["referenceId"])
@@ -250,9 +253,6 @@ async def action(request):
                 clip["nextDuration" if clip.get("takeId") else "duration"] = value
                 clip.pop("approvedKey", None)
                 clip.pop("promptContext", None)
-            elif command in ("planPrompt", "revisePrompt"):
-                check_mutable(scene, clip)
-                await eng.plan_prompt(scene, clip, base, body.get("comments", ""))
             elif command == "approveGenerate":
                 check_mutable(scene, clip)
                 # Require the exact latest saved draft that was visible when approval was clicked.
@@ -304,6 +304,7 @@ async def action(request):
 
 def public_scene(eng, scene):
     from . import timing
+    eng.planning_status(scene)
     result = copy.deepcopy(scene)
     for clip in result["clips"]:
         clip["timing"] = timing.public(clip)
@@ -319,7 +320,7 @@ def public_scene(eng, scene):
 @errors
 async def get_scene(request):
     eng = engine()
-    return web.json_response(public_scene(eng, eng.store.scene(request.query["projectId"], request.query["sceneId"], request.query.get("episodeId"))))
+    return web.json_response(public_scene(eng, eng.store.scene(request.query["projectId"], request.query["sceneId"], request.query.get("episodeId"))), headers={"Cache-Control": "no-store"})
 
 
 @PromptServer.instance.routes.post("/ava-agent/upload")
@@ -332,6 +333,9 @@ async def upload(request):
         async with eng.lock(scene_id or "library-" + project_id):
             project = eng.store.project(project_id)
             scene = eng.store.scene(project_id, scene_id, request.query.get("episodeId")) if scene_id else None
+            if scene:
+                eng.planning_status(scene)
+                core.ensure_not_planning(scene)
             frame_clip = find_clip(scene, request.query["clipId"]) if request.query.get("clipId") else None
             if frame_clip:
                 if frame_clip["status"] != "complete":

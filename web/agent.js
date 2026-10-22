@@ -3,6 +3,8 @@ import { api } from "../../scripts/api.js";
 
 const prefix = "/ava-agent";
 const active = new Set(["submitting", "submission-unknown", "queued", "rendering", "saving", "recoverable"]);
+const planningActions = new Set(["identify", "plan", "planPrompt", "revisePrompt"]);
+const planningLabels = { identify: "identifying references", plan: "planning clips", planPrompt: "writing the prompt", revisePrompt: "revising the prompt" };
 const $ = (tag, props = {}, ...children) => {
   const el = document.createElement(tag);
   for (const [key, value] of Object.entries(props)) {
@@ -109,18 +111,23 @@ async function readResponse(response) {
   try { data = JSON.parse(raw); }
   catch {
     const detail = raw.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 400);
-    throw new Error(`ComfyUI request failed (HTTP ${response.status}). ${detail || "The server returned an empty or non-JSON response."}`);
+    throw Object.assign(new Error(`ComfyUI request failed (HTTP ${response.status}). ${detail || "The server returned an empty or non-JSON response."}`), { status: response.status });
   }
   if (!response.ok) {
     const detail = typeof data?.error === "string" ? data.error : `ComfyUI returned HTTP ${response.status}.`;
-    throw new Error(detail);
+    throw Object.assign(new Error(detail), { status: response.status });
   }
   return data;
 }
 
 async function request(path, body) {
-  const response = await api.fetchApi(prefix + path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
-  return readResponse(response);
+  try {
+    const response = await api.fetchApi(prefix + path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+    return await readResponse(response);
+  } catch (error) {
+    if (!Number.isInteger(error.status)) error.transportFailure = true;
+    throw error;
+  }
 }
 function button(label, work, className = "", available = true) {
   const control = $("button", { text: label, class: className, disabled: busy || !available, onclick: () => run(work) });
@@ -141,7 +148,44 @@ async function run(work) {
   finally { busy = false; content.inert = false; projectHost.inert = false; workspace.setAttribute("aria-busy", "false"); workspace.querySelectorAll("button").forEach(b => { b.disabled = b.dataset.unavailable === "true"; }); }
 }
 async function action(command, values = {}) {
-  return request("/action", { action: command, projectId, episodeId, sceneId, ...values });
+  const scope = { projectId, episodeId, sceneId };
+  if (!planningActions.has(command)) return request("/action", { action: command, ...scope, ...values });
+  const requestId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  let jobId = requestId;
+  try {
+    const result = await request("/action", { action: command, ...scope, ...values, requestId });
+    // Older servers may still return the completed result synchronously.
+    if (!result.scene?.planning) return result;
+    jobId = result.scene.planning.id;
+  } catch (error) {
+    if (!error.transportFailure && !(error.status >= 500)) throw error;
+    // The server may have accepted the work. Recover by reading; never resubmit.
+    message.textContent = "Checking whether Qwen accepted the request…";
+  }
+  return waitForPlanning(scope, jobId);
+}
+async function waitForPlanning(scope, jobId) {
+  const query = new URLSearchParams(scope);
+  let failures = 0;
+  for (;;) {
+    let saved;
+    try { saved = await request(`/scene?${query}`); failures = 0; }
+    catch (error) {
+      if ((!error.transportFailure && !(error.status >= 500)) || ++failures >= 10) {
+        throw new Error(`${error.message} Qwen may still be running. Refresh the workspace to reconnect; this request was not resubmitted.`);
+      }
+      message.textContent = "Reconnecting to Qwen planning…";
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      continue;
+    }
+    const job = saved.planning;
+    if (!job || job.id !== jobId) throw new Error("The planning request could not be confirmed. Refresh the workspace and check its state before retrying.");
+    if (job.status === "failed") throw new Error(job.error || "Qwen planning failed. Check the ComfyUI server log.");
+    if (job.status === "complete") return { scene: saved };
+    const elapsed = Math.max(0, Math.floor(Date.now() / 1000 - job.startedAt));
+    message.textContent = `Qwen is ${planningLabels[job.inputs?.action] || "working"}… ${elapsed}s elapsed. You can reload and reconnect to this task.`;
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
 }
 function savedScope(id) {
   try { const saved = JSON.parse(localStorage.getItem(`ava-scope-${id}`) || "{}"); return { episodeId: saved.episodeId || "", scenes: saved.scenes || {} }; }
@@ -187,6 +231,10 @@ async function refresh(force = false) {
     updateStatus();
     // Preserve unsaved prompt, script, selection and comments during background checks.
     if (force || (snapshot() !== renderedSnapshot && !dirty && !busy && !workspace.contains(document.activeElement?.closest("input,textarea,select")))) render();
+    if (!busy && scene?.planning?.status === "running") {
+      const scope = { projectId, episodeId, sceneId }, jobId = scene.planning.id;
+      void run(() => waitForPlanning(scope, jobId));
+    }
   } finally { refreshing = false; finish(); }
 }
 
@@ -413,7 +461,7 @@ function render() {
   const detailsState = new Map([...workspace.querySelectorAll("details")].map((el, i) => [`${i}:${el.querySelector("summary")?.textContent}`, el.open]));
   message.classList.remove("ava-error");
   const agent = $("section", { id: "ava-panel-agent", role: "tabpanel", ariaLabel: "Agent" },
-    ...(scene ? [sceneEditor(), references(), studio(), scene.clips.length && heading("Review & render", `${scene.clips.filter(c => c.status === "complete").length} of ${scene.clips.length} clips complete · approve each take when ready`), ...scene.clips.map(clipEditor)].filter(Boolean) : [card(heading("Your next video starts here", "Create a project and scene above, then give Qwen your script."))]));
+    ...(scene ? [scene.planning?.status === "failed" && $("p", { class: "ava-error", text: scene.planning.error }), sceneEditor(), references(), studio(), scene.clips.length && heading("Review & render", `${scene.clips.filter(c => c.status === "complete").length} of ${scene.clips.length} clips complete · approve each take when ready`), ...scene.clips.map(clipEditor)].filter(Boolean) : [card(heading("Your next video starts here", "Create a project and scene above, then give Qwen your script."))]));
   const libraryPanel = $("section", { id: "ava-panel-library", role: "tabpanel", ariaLabel: "Library" }, projectId ? library() : card(note("Create a project to build its reference library.")));
   const settingsPanel = $("section", { id: "ava-panel-settings", role: "tabpanel", ariaLabel: "Settings" }, ...(state.project ? [manageSelection(), connection()] : []), ...(scene ? [generationSettings()] : []),
     card(heading("Render timing", "Automatic tracking for every new take."), note("Elapsed time includes time spent in the queue. Estimated finish uses recent completed takes with matching duration, steps, resolution and reference size. The first render shows a sampling estimate once its rate is known. Completion time is recorded after the video is verified and saved. Times use your browser's local timezone.")));

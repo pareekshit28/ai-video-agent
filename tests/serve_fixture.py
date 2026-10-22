@@ -39,6 +39,7 @@ sys.modules[spec.name] = package
 spec.loader.exec_module(package)
 eng = package.routes.engine()
 eng.watch = lambda *args: None
+planning_fixture = {"delay": 0, "fail": False, "calls": 0}
 
 
 def styled_prompt(refs, action):
@@ -59,6 +60,10 @@ async def ask(store, instruction, payload, images=(), model_file=None):
         return {"title": "Window scene", "summary": "A woman opens a window and smiles.", "references": [
             {"id": "woman", "name": "Woman", "kind": "character", "description": "The woman in the script"}]}
     if instruction == package.qwen.PLAN:
+        planning_fixture["calls"] += 1
+        await asyncio.sleep(planning_fixture["delay"])
+        if planning_fixture["fail"]:
+            raise ValueError("Fixture Qwen planning failed; the saved draft is retained.")
         ids = [r["id"] for r in payload["suppliedReferences"]]
         # Two clips deliberately exercise frame-aware continuation; this fake is not a planner-quality evaluation.
         return {"clips": [{"id": "open", "title": "Open window", "duration": 5, "referenceIds": ids, "transition": "first", "prompt": styled_prompt(payload["suppliedReferences"], "Woman opens the window.")},
@@ -68,6 +73,13 @@ package.qwen.ask = ask
 
 queue = []
 submissions = []
+@routes.post("/test/planning")
+async def configure_planning(request):
+    body = await request.json()
+    planning_fixture.update({key: body[key] for key in ("delay", "fail") if key in body})
+    return web.json_response(planning_fixture)
+@routes.get("/test/planning")
+async def planning_state(request): return web.json_response(planning_fixture)
 @routes.get("/queue")
 async def get_queue(request): return web.json_response({"queue_running": [], "queue_pending": queue})
 @routes.get("/history/{job}")
@@ -107,6 +119,7 @@ async def render_phase(request):
     return web.json_response({"ok": True})
 @routes.post("/test/reset")
 async def reset_fixture(request):
+    planning_fixture.update(delay=0, fail=False, calls=0)
     queue.clear()
     submissions.clear()
     import shutil

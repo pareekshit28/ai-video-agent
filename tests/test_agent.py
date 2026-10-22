@@ -714,6 +714,9 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(local_qwen.DEFAULT_MODEL, generate.call_args.args[0])
         self.assertEqual(paths, generate.call_args.args[3])
         self.assertIn(qwen.PROMPT, generate.call_args.args[1])
+        self.assertIn('Return {"prompt":string}', generate.call_args.args[1])
+        self.assertIn("ONE complete text string", generate.call_args.args[1])
+        self.assertNotIn('"prompt":{section_name', generate.call_args.args[1])
 
     async def test_qwen_model_override_is_stored_as_a_local_filename(self):
         model = "qwen3vl_8b_fp8_scaled.safetensors"
@@ -791,6 +794,7 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
         repaired = json.loads(generate.call_args.args[2])["formatRepair"]
         self.assertIn("missing: retention_analysis", repaired["error"])
         self.assertEqual(list(h3_prompt.REF_FIELDS), repaired["requiredPromptFields"])
+        self.assertIn("ONE complete prompt string", repaired["instruction"])
         self.assertNotIn("formatRepair", payload)
         self.assertEqual(2, generate.call_count)
 
@@ -874,6 +878,131 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual("rendering", self.clip["status"])
         self.assertNotIn("queuePosition", self.clip["timing"])
         self.assertGreater(self.clip["timing"]["renderStartedAt"], 100)
+
+
+class PlanningRouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.setup_fixture()
+        routes = web.RouteTableDef()
+        folders = types.SimpleNamespace(get_input_directory=lambda: str(self.root / "input"),
+                                        get_output_directory=lambda: str(self.root / "output"))
+        server = types.SimpleNamespace(PromptServer=types.SimpleNamespace(instance=types.SimpleNamespace(routes=routes)))
+        spec = importlib.util.spec_from_file_location(namespace.__name__ + ".routes", PACKAGE / "routes.py")
+        self.routes = importlib.util.module_from_spec(spec)
+        self.modules = patch.dict(sys.modules, {"folder_paths": folders, "server": server, spec.name: self.routes})
+        self.modules.start()
+        spec.loader.exec_module(self.routes)
+        self.engine = engine_module.Engine(self.store, self.root / "input", self.root / "output")
+        self.routes._engine = self.engine
+        self.gate = asyncio.Event()
+
+        async def slow_plan(scene, base):
+            await self.gate.wait()
+            scene["clips"][0]["prompt"] = REF_PROMPT
+        self.engine.plan = AsyncMock(side_effect=slow_plan)
+        application = web.Application()
+        application.add_routes(routes)
+        self.client = TestClient(TestServer(application))
+        await self.client.start_server()
+        self.scope = {"projectId": self.project["id"], "episodeId": core.DEFAULT_EPISODE, "sceneId": self.scene["id"]}
+
+    async def asyncTearDown(self):
+        self.gate.set()
+        await asyncio.gather(*list(self.engine.planning_tasks.values()), return_exceptions=True)
+        await self.client.close()
+        self.modules.stop()
+        self.teardown_fixture()
+
+    async def post(self, action, **values):
+        return await asyncio.wait_for(self.client.post("/ava-agent/action", json={**self.scope, "action": action, **values}), 0.5)
+
+    async def read_scene(self):
+        query = "&".join(f"{key}={value}" for key, value in self.scope.items())
+        response = await asyncio.wait_for(self.client.get("/ava-agent/scene?" + query), 0.5)
+        self.assertEqual(200, response.status)
+        self.assertEqual("no-store", response.headers["Cache-Control"])
+        return await response.json()
+
+    async def test_slow_planning_returns_immediately_and_duplicate_requests_do_not_rerun(self):
+        response = await self.post("plan", requestId="request_1")
+        self.assertEqual(202, response.status)
+        accepted = (await response.json())["scene"]["planning"]
+        self.assertEqual("running", accepted["status"])
+        self.assertFalse(self.gate.is_set())
+        duplicate = await self.post("plan", requestId="request_1")
+        self.assertEqual(accepted, (await duplicate.json())["scene"]["planning"])
+        another_tab = await self.post("plan", requestId="request_2")
+        self.assertEqual("request_1", (await another_tab.json())["scene"]["planning"]["id"])
+        self.assertEqual("running", (await self.read_scene())["planning"]["status"])
+        self.assertEqual(1, self.engine.plan.await_count)
+        self.gate.set()
+        await asyncio.gather(*list(self.engine.planning_tasks.values()))
+        completed = await self.read_scene()
+        self.assertEqual("complete", completed["planning"]["status"])
+        self.assertEqual(REF_PROMPT, completed["clips"][0]["prompt"])
+        self.assertEqual("awaiting-approval", completed["clips"][0]["status"])
+        self.assertNotIn("jobId", completed["clips"][0], "planning must never submit a render")
+        duplicate = await self.post("plan", requestId="request_1")
+        self.assertEqual("complete", (await duplicate.json())["scene"]["planning"]["status"])
+        self.assertEqual(1, self.engine.plan.await_count)
+
+    async def test_running_plan_rejects_edits_uploads_deletions_and_conflicting_jobs_quickly(self):
+        await self.post("plan", requestId="request_1")
+        for command, values in (("renameScene", {"name": "Changed"}), ("setDuration", {"clipId": self.clip["id"], "duration": 8}),
+                                ("deleteScene", {}), ("deleteEpisode", {}), ("deleteProject", {}),
+                                ("identify", {"requestId": "other"}), ("plan", {"requestId": "request_1", "comments": "Changed"})):
+            with self.subTest(command=command):
+                response = await self.post(command, **values)
+                self.assertEqual(400, response.status)
+        query = "&".join(f"{key}={value}" for key, value in self.scope.items())
+        uploaded = await self.client.post("/ava-agent/upload?" + query + "&referenceId=actor")
+        self.assertEqual(400, uploaded.status)
+        self.assertEqual(5, self.store.scene(self.project["id"], self.scene["id"])["clips"][0]["duration"])
+
+    async def test_background_failure_preserves_saved_drafts_and_completed_takes(self):
+        self.clip.update(status="complete", takeId="saved_take", video={"path": "saved.mp4"})
+        self.store.save_scene(self.scene)
+        before = copy.deepcopy(self.scene["clips"])
+
+        async def broken(scene, base):
+            scene["clips"] = []
+            raise ValueError("Qwen failed while planning")
+        self.engine.plan.side_effect = broken
+        await self.post("plan", requestId="failed_request")
+        await asyncio.gather(*list(self.engine.planning_tasks.values()))
+        saved = self.store.scene(self.project["id"], self.scene["id"])
+        self.assertEqual("failed", saved["planning"]["status"])
+        self.assertIn("Qwen failed", saved["planning"]["error"])
+        self.assertEqual(before, saved["clips"])
+
+    async def test_identify_prompt_and_revision_all_use_background_tasks(self):
+        self.engine.discover = AsyncMock()
+        self.engine.plan_prompt = AsyncMock()
+        for index, command in enumerate(("identify", "planPrompt", "revisePrompt")):
+            values = {"clipId": self.clip["id"], "comments": "Keep the original line."} if command != "identify" else {}
+            response = await self.post(command, requestId=f"task_{index}", **values)
+            self.assertEqual(202, response.status)
+            await asyncio.gather(*list(self.engine.planning_tasks.values()))
+            self.assertEqual("complete", (await self.read_scene())["planning"]["status"])
+        self.engine.discover.assert_awaited_once()
+        self.assertEqual(2, self.engine.plan_prompt.await_count)
+        self.assertEqual("Keep the original line.", self.engine.plan_prompt.call_args.args[-1])
+
+    async def test_restart_marks_interrupted_planning_failed_without_resubmitting(self):
+        self.scene["planning"] = {"id": "orphan", "status": "running", "startedAt": 1}
+        self.store.save_scene(self.scene)
+        saved = await self.read_scene()
+        self.assertEqual("failed", saved["planning"]["status"])
+        self.assertIn("restart", saved["planning"]["error"])
+        self.engine.plan.assert_not_awaited()
+
+    async def test_background_planning_keeps_origin_and_episode_checks(self):
+        response = await self.client.post("/ava-agent/action", headers={"Origin": "https://unrelated.example"},
+                                          json={**self.scope, "action": "plan", "requestId": "bad_origin"})
+        self.assertEqual(403, response.status)
+        response = await self.post("plan", episodeId="wrong_episode", requestId="bad_episode")
+        self.assertEqual(400, response.status)
+        self.engine.plan.assert_not_awaited()
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg tools required")

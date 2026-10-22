@@ -16,11 +16,82 @@ class Engine:
     def __init__(self, store, input_dir, output_dir):
         self.store, self.input_dir, self.output_dir = store, Path(input_dir), Path(output_dir).resolve()
         self.locks, self.tasks = {}, {}
+        self.planning_tasks = {}
         self.submit_lock = asyncio.Lock()
         self.qwen_lock = asyncio.Lock()
 
     def lock(self, scene_id):
         return self.locks.setdefault(scene_id, asyncio.Lock())
+
+    def planning_status(self, scene):
+        job = scene.get("planning", {})
+        if job.get("status") == "running" and scene["id"] not in self.planning_tasks:
+            job.update(status="failed", finishedAt=time.time(), error="Qwen planning was interrupted by a ComfyUI restart. Retry the planning action.")
+            self.store.save_scene(scene)
+        return job
+
+    def start_planning(self, scene, command, base, clip_id=None, comments="", request_id=None):
+        """Called under the scene lock. Persist acceptance before returning HTTP 202."""
+        if command not in ("identify", "plan", "planPrompt", "revisePrompt"):
+            raise ValueError("Unknown planning action")
+        request_id = core.identifier(request_id) if request_id else core.uid()
+        previous = self.planning_status(scene)
+        inputs = {"action": command, "clipId": clip_id, "comments": comments}
+        if previous.get("id") == request_id:
+            if previous.get("inputs") != inputs:
+                raise ValueError("This planning request ID was already used for different inputs")
+            return previous
+        if previous.get("status") == "running" and previous.get("inputs") == inputs:
+            return previous
+        core.ensure_not_planning(scene)
+        if command in ("planPrompt", "revisePrompt"):
+            clip = next(c for c in scene["clips"] if c["id"] == clip_id)
+            prior = core.previous(scene, clip)
+            if prior and (prior["status"] != "complete" or not prior.get("frame")):
+                raise ValueError("Complete the preceding clip first; its real final frame is required")
+        if any(c["status"] in core.ACTIVE for c in scene["clips"]):
+            raise ValueError("Finish or recover this scene's active render before Qwen planning")
+        job = {"id": request_id, "status": "running", "startedAt": time.time(), "inputs": inputs}
+        scene["planning"] = job
+        self.store.save_scene(scene)
+        self.planning_tasks[scene["id"]] = asyncio.create_task(self._run_planning(copy.deepcopy(scene), base))
+        return job
+
+    async def _run_planning(self, scene, base):
+        job = scene["planning"]
+        try:
+            inputs = job["inputs"]
+            if inputs["action"] == "identify":
+                await self.discover(scene, base)
+            elif inputs["action"] == "plan":
+                await self.plan(scene, base)
+            else:
+                clip = next(c for c in scene["clips"] if c["id"] == inputs["clipId"])
+                await self.plan_prompt(scene, clip, base, inputs["comments"])
+            job["status"] = "complete"
+        except asyncio.CancelledError:
+            job.update(status="failed", error="Qwen planning was interrupted. Restart ComfyUI before retrying.")
+            raise
+        except (ValueError, KeyError, TypeError, StopIteration) as error:
+            job.update(status="failed", error=str(error) or "Invalid planning request")
+        except Exception:
+            import logging
+            logging.exception("AI Video Agent background Qwen planning failed")
+            job.update(status="failed", error="Qwen planning failed. Check the ComfyUI server log.")
+        finally:
+            job["finishedAt"] = time.time()
+            try:
+                async with self.lock(scene["id"]):
+                    saved = self.store.scene(scene["projectId"], scene["id"])
+                    if saved.get("planning", {}).get("id") == job["id"]:
+                        # A failed run must not replace the prior plan, drafts or takes.
+                        if job["status"] == "complete":
+                            self.store.save_scene(scene)
+                        else:
+                            saved["planning"] = job
+                            self.store.save_scene(saved)
+            finally:
+                self.planning_tasks.pop(scene["id"], None)
 
     async def http(self, method, url, **kwargs):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:

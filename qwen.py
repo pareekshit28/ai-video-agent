@@ -33,18 +33,18 @@ Split only for the 15-second limit, natural performance timing, essential contin
 constraints. Never rush delivery, omit words, add filler or alter events just to reduce the count.
 Select only reference IDs with actual supplied files.
 Return {"clips":[{"id":"safe_slug","title":string,"duration":number,"referenceIds":[string],
-"transition":"first"|"continue"|"cut"|"scene-change"|"time-jump","prompt":object|string}]}.
+"transition":"first"|"continue"|"cut"|"scene-change"|"time-jump","prompt":string}]}.
 Only the first clip has transition 'first'. Write a final video prompt ONLY for the first clip. Every later
 prompt field is a story outline with full dialogue; its generation prompt must wait for the actual prior
 frame. Use 'continue' only for continuous action, otherwise respect the required cut or scene change.
 Fit every clip's action and dialogue into its planned duration. At most 40 clips. For the first clip,
-apply the H3 prompt contract: return its prompt as an object with the six Ref2VA section keys if its
-referenceIds select supplied references, otherwise the three T2VA section keys. Every section value
-is a nonempty string. Other prompt fields stay concise story outline strings, not final H3 prompts.
+apply the H3 prompt contract: return ONE prompt string containing the six Ref2VA headings if its
+referenceIds select supplied references, otherwise the three T2VA headings. Fill every section inside
+that string. Other prompt fields stay concise story outline strings, not final H3 prompts.
 Split lengthy speech at sentence boundaries, allowing natural pauses and reactions."""
 
-PROMPT = """Write only the target clip's generation prompt. Return {"prompt":{section_name:string,...}}
-using all section keys listed for h3Prompting.mode in h3Prompting.promptFieldsByMode. Inspect the final
+PROMPT = """Write only the target clip's generation prompt. Return {"prompt":string}, with ONE complete
+prompt containing all H3 headings for h3Prompting.mode inside the string. Inspect the final
 attachment when previousFrameAttachment is provided. Adapt to observed positions, poses, held objects,
 lighting, facing and composition, and to the preceding submitted prompt and actual duration. Do not repeat
 completed story beats. If continuation is true begin seamlessly from this frame; otherwise respect the
@@ -126,7 +126,7 @@ async def ask(store, instruction, payload, images=(), model_file=None):
             if attempt:
                 raise ValueError(f"Qwen could not produce a valid H3 prompt: {error}. Retry Plan prompt or revise the draft.") from error
             request_payload["formatRepair"] = {"error": str(error), "previousResponse": generated[:16000],
-                "instruction": "Return corrected JSON. The final prompt must be an object with exactly requiredPromptFields as keys when supplied, otherwise choose the fields from promptFieldsByMode using the first clip's selected referenceIds. Use nonempty strings as values. Fix the reported section/shot/dialogue issue. Preserve script, selected references, duration, later outlines and exact dialogue; add no new story content."}
+                "instruction": "Return corrected JSON with ONE complete prompt string. Include requiredPromptFields as headings inside the string when supplied, otherwise choose headings from promptFieldsByMode using the first clip's selected referenceIds. Fill each section. Fix the reported section/shot/dialogue issue. Preserve script, selected references, duration, later outlines and exact dialogue; add no new story content."}
             if required_fields is not None:
                 request_payload["formatRepair"]["requiredPromptFields"] = list(required_fields)
 

@@ -57,6 +57,8 @@ Version 0.7.0 follows MiniMax's current H3 prompt guides: six sections for refer
 
 Version 0.7.1 fixes false section-order failures: Qwen supplies named section values and the host assembles the required headings. Complete text drafts also accept Markdown headings, title case, spaces/hyphens and reordered sections. Missing or duplicate sections still fail with specific diagnostics; a retry receives the exact required fields. Section content and dialogue are preserved. Replace the node pack, restart ComfyUI, then retry **Plan prompt** or **Apply comments with Qwen** on the affected draft.
 
+Version 0.7.2 asks Qwen for **one complete prompt string**, with the H3 section headings inside that string. The app still normalizes heading variations and accepts section objects from older responses. Clip planning, reference discovery and prompt revisions now run as background tasks: the request returns immediately and the workspace checks status with short reads. It shows elapsed time and reconnects to the same task after reload or a lost response, without rerunning Qwen. Wait for planning to finish before editing the scene; a failed run preserves its saved drafts and takes. A ComfyUI restart marks unfinished planning as interrupted and requires an explicit retry.
+
 Use **Replan / optimize unsubmitted clips** to apply the fewer-clip policy before any takes are submitted. Existing rendered plans stay preserved; use a new scene to replan them. **Plan prompt** or **Apply comments with Qwen** applies the new H3 format to one draft. See [H3 prompting notes and official sources](docs/H3_PROMPTING.md) for reference binding, examples and validation limits.
 
 ### Projects, episodes and scenes
@@ -94,6 +96,8 @@ The workflow's lower row is muted initially. Enable it only for the specific rev
 Use **Check installation** to see missing H3/Qwen files and nodes before rendering. `AVA_COMFY_URL` can override the loopback URL when using HTTPS internally or a port other than 8188 for the canvas render node. `AVA_QWEN_MODEL` selects the initial planner filename. `FFMPEG_PATH` and `FFPROBE_PATH` override the media-tool executable paths.
 
 ### RunPod proxy request errors
+
+For **Fetch timeout** during **Understand references & plan clips**, update to version 0.7.2 or later, restart ComfyUI and hard-refresh the browser. Planning no longer holds a single HTTP request open throughout Qwen inference. Temporary status-read failures reconnect automatically; if the connection stays unavailable, the workspace reports that the task may still be running and asks you to refresh. It does not automatically resubmit a planning request or a render.
 
 Version 0.3.1 fixes a sidebar error reported as `Unexpected token 'U', "Use the wo"... is not valid JSON`. The browser's public ComfyUI URL can differ from the internal Host header after RunPod proxying. Same-origin browser requests now use browser Fetch Metadata, and rejected requests return JSON errors. The UI also displays plain-text proxy errors without trying to treat them as JSON.
 
