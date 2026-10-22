@@ -1,11 +1,5 @@
 [
   {
-    "name": "qwen3vl_4b_fp8_scaled.safetensors",
-    "url": "https://huggingface.co/Comfy-Org/Qwen3-VL/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors",
-    "directory": "text_encoders",
-    "sha256": "54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094"
-  },
-  {
     "name": "fasth3_omniref_8step_pruned_int8_convrot.safetensors",
     "url": "https://huggingface.co/FastVideo/FastH3-OmniRef-Comfy/resolve/main/diffusion_models/fasth3_omniref_8step_pruned_int8_convrot.safetensors",
     "directory": "diffusion_models"

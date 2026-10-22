@@ -1,4 +1,4 @@
-"""HTTP/UI integration fixture. Fake Comfy queue and Qwen; real routes, store and browser UI."""
+"""HTTP/UI integration fixture. Fake Comfy queue and Codex; real routes, store and browser UI."""
 import argparse
 import asyncio
 import importlib.util
@@ -39,7 +39,11 @@ sys.modules[spec.name] = package
 spec.loader.exec_module(package)
 eng = package.routes.engine()
 eng.watch = lambda *args: None
-planning_fixture = {"delay": 0, "fail": False, "calls": 0}
+planning_fixture = {"delay": 0, "fail": False, "calls": 0, "live": False}
+real_ask = package.planner.ask
+eng.bridge.pair()
+eng.bridge.touch("fixture_pc", [{"id": "codex-default-test", "name": "Default test model", "default": True, "images": True},
+                                {"id": "codex-alternate-test", "name": "Alternate test model", "default": False, "images": True}], "fixture")
 
 
 def styled_prompt(refs, action):
@@ -47,31 +51,33 @@ def styled_prompt(refs, action):
     prompt += " Live-action, warm sunrise light. Static shot, camera locked off; no camera movement. " + action
     prompt += " A window latch clicks over soft room ambience. No dialogue or music."
     prompt = prompt.strip()
-    return package.qwen.h3_prompt.validate(prompt, refs, 15)
+    return package.planner.h3_prompt.validate(prompt, refs, 15)
 
 
 async def ask(store, instruction, payload, images=(), model_file=None):
-    if instruction == package.qwen.DISCOVER:
+    if planning_fixture["live"]:
+        return await real_ask(store, instruction, payload, images, model_file=model_file)
+    if instruction == package.planner.DISCOVER:
         return {"title": "Window scene", "summary": "A woman opens a window and smiles.", "references": [
             {"id": "woman", "name": "Woman", "kind": "character", "description": "The woman in the script"}]}
-    if instruction == package.qwen.PLAN:
+    if instruction == package.planner.PLAN:
         planning_fixture["calls"] += 1
         await asyncio.sleep(planning_fixture["delay"])
         if planning_fixture["fail"]:
-            raise ValueError("Fixture Qwen planning failed; the saved draft is retained.")
+            raise ValueError("Fixture Codex planning failed; the saved draft is retained.")
         ids = [r["id"] for r in payload["suppliedReferences"]]
         # Two clips deliberately exercise frame-aware continuation; this fake is not a planner-quality evaluation.
         return {"clips": [{"id": "open", "title": "Open window", "duration": 5, "referenceIds": ids, "transition": "first", "prompt": styled_prompt(payload["suppliedReferences"], "Woman opens the window.")},
                           {"id": "smile", "title": "Smile", "duration": 5, "referenceIds": ids, "transition": "continue", "prompt": "She smiles at the sunrise."}]}
     return {"prompt": styled_prompt(payload.get("references", []), "Woman smiles at the sunrise.")}
-package.qwen.ask = ask
+package.planner.ask = ask
 
 queue = []
 submissions = []
 @routes.post("/test/planning")
 async def configure_planning(request):
     body = await request.json()
-    planning_fixture.update({key: body[key] for key in ("delay", "fail") if key in body})
+    planning_fixture.update({key: body[key] for key in ("delay", "fail", "live") if key in body})
     return web.json_response(planning_fixture)
 @routes.get("/test/planning")
 async def planning_state(request): return web.json_response(planning_fixture)
@@ -114,7 +120,7 @@ async def render_phase(request):
     return web.json_response({"ok": True})
 @routes.post("/test/reset")
 async def reset_fixture(request):
-    planning_fixture.update(delay=0, fail=False, calls=0)
+    planning_fixture.update(delay=0, fail=False, calls=0, live=False)
     queue.clear()
     submissions.clear()
     import shutil

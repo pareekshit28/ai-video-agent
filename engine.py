@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 import aiohttp
 
-from . import core, media as video_media, qwen, timing
+from . import core, media as video_media, planner, timing, codex_bridge
 
 
 class Engine:
@@ -18,7 +18,8 @@ class Engine:
         self.locks, self.tasks = {}, {}
         self.planning_tasks = {}
         self.submit_lock = asyncio.Lock()
-        self.qwen_lock = asyncio.Lock()
+        self.planner_lock = asyncio.Lock()
+        self.bridge = codex_bridge.get_bridge(store)
 
     def lock(self, scene_id):
         return self.locks.setdefault(scene_id, asyncio.Lock())
@@ -26,7 +27,7 @@ class Engine:
     def planning_status(self, scene):
         job = scene.get("planning", {})
         if job.get("status") == "running" and scene["id"] not in self.planning_tasks:
-            job.update(status="failed", finishedAt=time.time(), error="Qwen planning was interrupted by a ComfyUI restart. Retry the planning action.")
+            job.update(status="failed", finishedAt=time.time(), error="Codex planning was interrupted by a ComfyUI restart. Retry the planning action.")
             self.store.save_scene(scene)
         return job
 
@@ -50,7 +51,7 @@ class Engine:
             if prior and (prior["status"] != "complete" or not prior.get("frame")):
                 raise ValueError("Complete the preceding clip first; its real final frame is required")
         if any(c["status"] in core.ACTIVE for c in scene["clips"]):
-            raise ValueError("Finish or recover this scene's active render before Qwen planning")
+            raise ValueError("Finish or recover this scene's active render before Codex planning")
         job = {"id": request_id, "status": "running", "startedAt": time.time(), "inputs": inputs}
         scene["planning"] = job
         self.store.save_scene(scene)
@@ -70,14 +71,14 @@ class Engine:
                 await self.plan_prompt(scene, clip, base, inputs["comments"])
             job["status"] = "complete"
         except asyncio.CancelledError:
-            job.update(status="failed", error="Qwen planning was interrupted. Restart ComfyUI before retrying.")
+            job.update(status="failed", error="Codex planning was interrupted. Restart ComfyUI before retrying.")
             raise
         except (ValueError, KeyError, TypeError, StopIteration) as error:
             job.update(status="failed", error=str(error) or "Invalid planning request")
         except Exception:
             import logging
-            logging.exception("AI Video Agent background Qwen planning failed")
-            job.update(status="failed", error="Qwen planning failed. Check the ComfyUI server log.")
+            logging.exception("AI Video Agent background Codex planning failed")
+            job.update(status="failed", error="Codex planning failed. Check the ComfyUI server log.")
         finally:
             job["finishedAt"] = time.time()
             try:
@@ -95,23 +96,16 @@ class Engine:
 
     async def http(self, method, url, **kwargs):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
-            return await qwen.request_json(session, method, url, **kwargs)
+            return await planner.request_json(session, method, url, **kwargs)
 
     async def ask(self, base_url, instruction, payload, images=(), project_id=None):
-        async with self.qwen_lock:
-            # Only unload Comfy models while its global execution queue is idle.
-            queue = await self.http("GET", base_url + "/queue")
-            if queue.get("queue_running") or queue.get("queue_pending"):
-                raise ValueError("Wait for the ComfyUI queue to finish before Qwen planning on the shared GPU")
-            import comfy.model_management as mm
-            await asyncio.to_thread(mm.unload_all_models)
-            await asyncio.to_thread(mm.soft_empty_cache)
-            return await qwen.ask(self.store, instruction, payload, images, model_file=qwen.config(self.store, project_id)["model"])
+        async with self.planner_lock:
+            return await planner.ask(self.store, instruction, payload, images, model_file=planner.config(self.store, project_id)["model"])
 
     async def discover(self, scene, base_url):
         if any(c.get("takeId") for c in scene["clips"]):
             raise ValueError("Create a new scene to rediscover references after rendering takes")
-        result = await self.ask(base_url, qwen.DISCOVER, {"script": core.text(scene["script"])}, project_id=scene["projectId"])
+        result = await self.ask(base_url, planner.DISCOVER, {"script": core.text(scene["script"])}, project_id=scene["projectId"])
         references = core.validate_references(result)
         # Retain supplied media for slots with stable IDs.
         existing = {r["id"]: r for r in scene["references"]}
@@ -124,8 +118,8 @@ class Engine:
     async def plan(self, scene, base_url):
         if any(c.get("takeId") for c in scene["clips"]):
             raise ValueError("Plans with submitted takes are preserved. Create another scene to replan the script.")
-        manifest, images = qwen.reference_context(self.store, scene)
-        result = await self.ask(base_url, qwen.PLAN, {"script": core.text(scene["script"]), "suppliedReferences": manifest, "settings": scene["settings"]}, images, project_id=scene["projectId"])
+        manifest, images = planner.reference_context(self.store, scene)
+        result = await self.ask(base_url, planner.PLAN, {"script": core.text(scene["script"]), "suppliedReferences": manifest, "settings": scene["settings"]}, images, project_id=scene["projectId"])
         clips = core.validate_plan(scene, result)
         scene["clips"] = clips
         clips[0]["promptContext"] = core.prompt_context(self.store, scene, clips[0])
@@ -134,10 +128,10 @@ class Engine:
         prior = core.previous(scene, clip)
         if prior and (prior["status"] != "complete" or not prior.get("frame")):
             raise ValueError("Complete the preceding clip first; its real final frame is required")
-        manifest, paths = qwen.reference_context(self.store, scene, core.selected(scene, clip))
+        manifest, paths = planner.reference_context(self.store, scene, core.selected(scene, clip))
         if prior:
             paths.append(self.store.path(prior["frame"]["path"]))
-        result = await self.ask(base_url, qwen.PROMPT, {"script": scene["script"], "summary": scene["summary"],
+        result = await self.ask(base_url, planner.PROMPT, {"script": scene["script"], "summary": scene["summary"],
             "references": manifest, "previousFrameAttachment": len(paths) if prior else None,
             "previous": {"prompt": prior.get("submittedPrompt"), "actualDuration": prior.get("actualDuration")} if prior else None,
             "frameGuideEnabled": core.continuation(clip),
@@ -146,12 +140,12 @@ class Engine:
             "remainingOutline": [c["outline"] for c in scene["clips"][scene["clips"].index(clip) + 1:]]}, paths, project_id=scene["projectId"])
         prompt = core.text(result["prompt"], 12000)
         if core.TAGS.search(prompt):
-            raise ValueError("Qwen returned numbered media tags; retry prompt planning")
+            raise ValueError("Codex returned numbered media tags; retry prompt planning")
         clip.update(prompt=prompt, promptContext=core.prompt_context(self.store, scene, clip))
         clip.pop("approvedKey", None)
 
     async def submit(self, scene, clip, base_url):
-        async with self.submit_lock, self.qwen_lock:
+        async with self.submit_lock:
             if any(c["status"] in core.ACTIVE for p in self.store.projects() for s in self.store.scenes(p["id"]) for c in s["clips"]):
                 raise ValueError("Finish or recover the current job before approving another render")
             core.ensure_ready(self.store, scene, clip)

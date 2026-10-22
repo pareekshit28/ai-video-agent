@@ -1,4 +1,4 @@
-"""CPU-only contract tests. Comfy queue/model/Qwen calls are mocked, media is real FFmpeg."""
+"""CPU-only contract tests. Comfy queue/model/Codex calls are mocked, media is real FFmpeg."""
 import asyncio
 import copy
 from concurrent.futures import ThreadPoolExecutor
@@ -24,10 +24,10 @@ namespace = types.ModuleType("ava_tests_package")
 namespace.__path__ = [str(PACKAGE)]
 sys.modules[namespace.__name__] = namespace
 core = importlib.import_module(namespace.__name__ + ".core")
-qwen = importlib.import_module(namespace.__name__ + ".qwen")
+planner = importlib.import_module(namespace.__name__ + ".planner")
 media = importlib.import_module(namespace.__name__ + ".media")
 engine_module = importlib.import_module(namespace.__name__ + ".engine")
-local_qwen = importlib.import_module(namespace.__name__ + ".local_qwen")
+codex_bridge = importlib.import_module(namespace.__name__ + ".codex_bridge")
 http_contract = importlib.import_module(namespace.__name__ + ".http_contract")
 timing = importlib.import_module(namespace.__name__ + ".timing")
 h3_prompt = importlib.import_module(namespace.__name__ + ".h3_prompt")
@@ -103,14 +103,14 @@ class H3PromptTests(Fixture, unittest.TestCase):
     def tearDown(self): self.teardown_fixture()
 
     def test_base_and_reference_modes_preserve_original_dialogue(self):
-        refs, _ = qwen.reference_context(self.store, self.scene)
+        refs, _ = planner.reference_context(self.store, self.scene)
         self.assertEqual(BASE_PROMPT, h3_prompt.validate(BASE_PROMPT, [], 15))
         hindi = REF_PROMPT.replace("[English] Hello.", "[Hindi] दरवाज़ा खुला है।")
         self.assertEqual(hindi, h3_prompt.validate(hindi, refs, 15))
         self.assertEqual(BASE_PROMPT, h3_prompt.validate(BASE_PROMPT, refs, 15))
 
     def test_single_prompt_without_required_sections_or_tags_is_accepted(self):
-        refs, _ = qwen.reference_context(self.store, self.scene)
+        refs, _ = planner.reference_context(self.store, self.scene)
         plain = 'Static medium shot. Actor opens the door and says "दरवाज़ा खुला है।" with synchronized lips. The latch clicks over quiet room ambience.'
         for value in (plain, "subject_definitions: " + plain, "detailed_description: " + plain):
             for selected in ([], refs):
@@ -118,7 +118,7 @@ class H3PromptTests(Fixture, unittest.TestCase):
                     self.assertEqual(value, h3_prompt.normalize(value, selected, 15))
 
     def test_normalizes_complete_section_objects_and_formatted_text_without_changing_content(self):
-        refs, _ = qwen.reference_context(self.store, self.scene)
+        refs, _ = planner.reference_context(self.store, self.scene)
         for prompt, sections, selected in ((BASE_PROMPT, BASE_SECTIONS, []), (REF_PROMPT, REF_SECTIONS, refs)):
             variants = [dict(reversed(list(sections.items())))]
             for template in ("### {field}: {body}", "**{field}:** {body}", "**{field}**: {body}",
@@ -131,7 +131,7 @@ class H3PromptTests(Fixture, unittest.TestCase):
                     self.assertEqual(expected, h3_prompt.normalize(value, selected, 15))
 
     def test_partial_and_duplicate_legacy_headings_are_not_required_format_gates(self):
-        refs, _ = qwen.reference_context(self.store, self.scene)
+        refs, _ = planner.reference_context(self.store, self.scene)
         for value in (REF_PROMPT.replace("retention_analysis:", "retention_notes:"),
                       REF_PROMPT + "\nsummary: Another summary.", "Here is the prompt:\n" + REF_PROMPT):
             self.assertEqual(value, h3_prompt.normalize(value, refs, 15))
@@ -139,7 +139,7 @@ class H3PromptTests(Fixture, unittest.TestCase):
                          h3_prompt.normalize({"subject_definitions": "Actor opens the door."}, refs, 15))
 
     def test_normalization_rejects_empty_oversized_nontext_or_foreign_media(self):
-        refs, _ = qwen.reference_context(self.store, self.scene)
+        refs, _ = planner.reference_context(self.store, self.scene)
         invalid = [("", "nonempty"), ("x" * 12001, "12000"), ({}, "nonempty"),
                    ({**REF_SECTIONS, "non_diegetic_music": ["N/A"]}, "string"),
                    ("Actor <Picture 1> opens the door.", "media indices"),
@@ -149,14 +149,14 @@ class H3PromptTests(Fixture, unittest.TestCase):
                 h3_prompt.normalize(value, refs, 15)
 
     def test_normalization_preserves_markdown_dialogue_and_soundscape_content(self):
-        refs, _ = qwen.reference_context(self.store, self.scene)
+        refs, _ = planner.reference_context(self.store, self.scene)
         prompt = REF_PROMPT.replace("[English] Hello.", "[Hindi] **दरवाज़ा खुला है।**").replace("overall_soundscape: The", "overall_soundscape: **Soft** sounds. The")
         decorated = "\n".join("**" + line.replace(":", ":**", 1) for line in prompt.splitlines())
         self.assertEqual(decorated, h3_prompt.normalize(decorated, refs, 15))
 
     def test_reordered_reference_inputs_keep_subject_identity_and_bind_real_media(self):
         self.scene["references"].insert(0, {"id": "room", "name": "Room", "kind": "location", "description": "Room", "assets": [self.asset]})
-        refs, paths = qwen.reference_context(self.store, self.scene, core.selected(self.scene, self.clip))
+        refs, paths = planner.reference_context(self.store, self.scene, core.selected(self.scene, self.clip))
         self.assertEqual("<Subject 2>", refs[0]["subjectLabel"])
         self.assertEqual([self.store.path(self.asset["path"])], paths)
         self.clip["prompt"] = REF_PROMPT.replace("<Subject 1>", "<Subject 2>")
@@ -167,7 +167,7 @@ class H3PromptTests(Fixture, unittest.TestCase):
 
     def test_voice_only_reference_does_not_invent_a_visual_subject(self):
         self.scene["references"][0]["assets"] = [{"path": "voice.wav", "name": "voice.wav", "kind": "audio"}]
-        refs, paths = qwen.reference_context(self.store, self.scene)
+        refs, paths = planner.reference_context(self.store, self.scene)
         self.assertIsNone(refs[0]["subjectLabel"])
         self.assertEqual([], paths)
         voice = REF_PROMPT.replace("Actor <Subject 1> follows the supplied appearance.", "Actor supplies voice timbre only.").replace("<Subject 1>", "Actor")
@@ -189,7 +189,7 @@ class H3PromptTests(Fixture, unittest.TestCase):
         self.assertNotIn("Opening Frame:", core.final_prompt(self.scene, following))
 
     def test_rejects_guessed_or_foreign_labels_but_allows_names_without_subject_tags(self):
-        refs, _ = qwen.reference_context(self.store, self.scene)
+        refs, _ = planner.reference_context(self.store, self.scene)
         for invalid in (REF_PROMPT + "\n<Picture 1>", REF_PROMPT + "\n<Audio 1>",
                         REF_PROMPT.replace("<Subject 1>", "<Subject 2>")):
             with self.subTest(prompt=invalid), self.assertRaises(ValueError):
@@ -291,41 +291,14 @@ class CoreTests(Fixture, unittest.TestCase):
         self.clip["prompt"] = "Use <Picture 4>"
         with self.assertRaises(ValueError): core.final_prompt(self.scene, self.clip)
 
-    def test_qwen_json_and_configuration(self):
-        self.assertEqual({"a": 1}, qwen.parse_json('<think>reason</think>```json\n{"a":1}\n```'))
-        with self.assertRaises(ValueError): qwen.parse_json("[]")
-        with self.assertRaises(ValueError): qwen.validate_config({"model": "codex"})
+    def test_codex_json_and_configuration(self):
+        self.assertEqual({"a": 1}, planner.parse_json('<think>reason</think>```json\n{"a":1}\n```'))
+        with self.assertRaises(ValueError): planner.parse_json("[]")
+        with self.assertRaises(ValueError): planner.validate_config({"model": "../../model"})
 
     def test_h3_encoder_cannot_be_selected_as_a_planning_model(self):
-        with self.assertRaisesRegex(ValueError, "truncated Qwen text encoder"):
-            qwen.validate_config({"model": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"})
-
-    def test_native_qwen_uses_comfy_runtime_and_preserves_image_order(self):
-        clip = MagicMock()
-        clip.generate.return_value = [1, 2]
-        clip.decode.return_value = '{"prompt":"Native response"}'
-        loader = MagicMock()
-        loader.load_clip.return_value = (clip,)
-        mm = types.ModuleType("comfy.model_management")
-        mm.unload_all_models = MagicMock()
-        mm.soft_empty_cache = MagicMock()
-        comfy = types.ModuleType("comfy"); comfy.__path__ = []; comfy.model_management = mm
-        utils = types.SimpleNamespace(PROGRESS_BAR_HOOK=None)
-        utils.set_progress_bar_global_hook = lambda hook: setattr(utils, "PROGRESS_BAR_HOOK", hook)
-        comfy.utils = utils
-        modules = {"nodes": types.SimpleNamespace(CLIPLoader=lambda: loader),
-                   "folder_paths": types.SimpleNamespace(get_filename_list=lambda kind: [local_qwen.DEFAULT_MODEL]),
-                   "comfy": comfy, "comfy.model_management": mm, "comfy.utils": utils,
-                   "comfy_execution": types.SimpleNamespace(),
-                   "comfy_execution.utils": types.SimpleNamespace(get_executing_context=lambda: None)}
-        with patch.dict(sys.modules, modules), patch.object(local_qwen, "image_tensor", side_effect=["image-one", "image-two"]):
-            result = local_qwen.generate(local_qwen.DEFAULT_MODEL, "system", "content", ["one.png", "two.png"])
-        self.assertEqual('{"prompt":"Native response"}', result)
-        self.assertEqual(["image-one", "image-two"], clip.tokenize.call_args.kwargs["images"])
-        self.assertEqual(2, clip.tokenize.call_args.args[0].count("<|image_pad|>"))
-        loader.load_clip.assert_called_once_with(local_qwen.DEFAULT_MODEL, type="stable_diffusion", device="default")
-        self.assertEqual(2, mm.unload_all_models.call_count)
-        self.assertFalse(clip.generate.call_args.kwargs["do_sample"])
+        with self.assertRaisesRegex(ValueError, "model files"):
+            planner.validate_config({"model": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"})
 
     def test_workflow_links_models_and_requires_explicit_render_approval(self):
         workflow = json.loads((PACKAGE / "workflow.json").read_text(encoding="utf-8"))
@@ -333,7 +306,9 @@ class CoreTests(Fixture, unittest.TestCase):
         nodes = {n["type"]: n for n in workflow["nodes"]}
         self.assertEqual(2, nodes["AVAQueueReviewedClip"]["mode"])
         self.assertEqual(models, workflow["extra"]["models"])
-        self.assertEqual(models[0]["name"], nodes["AVAQwenPlan"]["widgets_values"][1])
+        self.assertEqual("", nodes["AVACodexPlan"]["widgets_values"][1])
+        self.assertEqual(4, len(models))
+        self.assertFalse(any("4b_fp8" in model["name"] for model in models))
         note = nodes["MarkdownNote"]["widgets_values"][0]
         for model in models:
             self.assertIn(model["url"], note)
@@ -386,21 +361,21 @@ class HierarchyTests(Fixture, unittest.TestCase):
         other = self.store.create_project("Another project")
         self.assertEqual([], self.store.project(other["id"])["library"])
 
-    def test_qwen_model_selection_is_project_specific(self):
+    def test_codex_model_selection_is_project_specific(self):
         other = self.store.create_project("Project B")
-        chosen = "qwen3vl_8b_fp8_scaled.safetensors"
-        self.store.write(f"projects/{self.project['id']}/qwen.json", qwen.validate_config({"model": chosen}))
-        self.assertEqual(chosen, qwen.config(self.store, self.project["id"])["model"])
-        self.assertEqual(local_qwen.DEFAULT_MODEL, qwen.config(self.store, other["id"])["model"])
-        self.assertFalse(self.store.path("qwen.json").exists())
+        chosen = "codex-alternate-test"
+        self.store.write(f"projects/{self.project['id']}/codex.json", planner.validate_config({"model": chosen}))
+        self.assertEqual(chosen, planner.config(self.store, self.project["id"])["model"])
+        self.assertEqual("", planner.config(self.store, other["id"])["model"])
+        self.assertFalse(self.store.path("codex.json").exists())
 
     def test_legacy_pod_model_remains_an_initial_default(self):
-        chosen = "qwen3vl_8b_fp8_scaled.safetensors"
-        self.store.write("qwen.json", qwen.validate_config({"model": chosen}))
-        self.assertEqual(chosen, qwen.config(self.store, self.project["id"])["model"])
-        self.store.write(f"projects/{self.project['id']}/qwen.json", qwen.validate_config({"model": local_qwen.DEFAULT_MODEL}))
-        self.assertEqual(local_qwen.DEFAULT_MODEL, qwen.config(self.store, self.project["id"])["model"])
-        self.assertEqual(chosen, qwen.config(self.store)["model"])
+        chosen = "codex-alternate-test"
+        self.store.write("codex.json", planner.validate_config({"model": chosen}))
+        self.assertEqual(chosen, planner.config(self.store, self.project["id"])["model"])
+        self.store.write(f"projects/{self.project['id']}/codex.json", planner.validate_config({"model": ""}))
+        self.assertEqual("", planner.config(self.store, self.project["id"])["model"])
+        self.assertEqual(chosen, planner.config(self.store)["model"])
 
     def test_creation_requires_parents_and_names_scenes_automatically(self):
         with self.assertRaisesRegex(ValueError, "Select an episode"):
@@ -468,115 +443,6 @@ class HierarchyTests(Fixture, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "selected episode"):
             self.store.trash_scene(self.project["id"], self.scene["id"], episode["id"])
         self.assertEqual(self.scene["id"], self.store.scene(self.project["id"], self.scene["id"])["id"])
-
-
-class NativeProgressTests(unittest.TestCase):
-    def setUp(self):
-        self.context = None
-        self.server = types.SimpleNamespace()  # Fresh server: no last_prompt_id.
-        self.mm = types.ModuleType("comfy.model_management")
-        self.mm.unload_all_models = MagicMock()
-        self.mm.soft_empty_cache = MagicMock()
-        self.mm.throw_exception_if_processing_interrupted = MagicMock()
-        self.utils = types.ModuleType("comfy.utils")
-        self.utils.set_progress_bar_global_hook = lambda hook: setattr(self.utils, "PROGRESS_BAR_HOOK", hook)
-
-        def native_hook(value, total, preview, node_id=None):
-            # Reproduce main.hijack_progress's missing queued-prompt fallback.
-            return self.context.prompt_id if self.context is not None else self.server.last_prompt_id
-
-        self.native_hook = MagicMock(side_effect=native_hook)
-        self.utils.PROGRESS_BAR_HOOK = self.native_hook
-        utils = self.utils
-
-        class ProgressBar:
-            def __init__(self, total):
-                self.total, self.current, self.hook = total, 0, utils.PROGRESS_BAR_HOOK
-
-            def update(self, value):
-                self.current += value
-                if self.hook is not None:
-                    self.hook(self.current, self.total, None, node_id=None)
-
-        self.utils.ProgressBar = ProgressBar
-        self.clip = MagicMock()
-        self.clip.generate.side_effect = lambda *args, **kwargs: (ProgressBar(1).update(1), [1])[1]
-        self.clip.decode.return_value = '{"references":[]}'
-        loader = MagicMock(); loader.load_clip.return_value = (self.clip,)
-        comfy = types.ModuleType("comfy"); comfy.__path__ = []
-        comfy.model_management, comfy.utils = self.mm, self.utils
-        modules = {"nodes": types.SimpleNamespace(CLIPLoader=lambda: loader),
-                   "folder_paths": types.SimpleNamespace(get_filename_list=lambda kind: [local_qwen.DEFAULT_MODEL]),
-                   "comfy": comfy, "comfy.model_management": self.mm, "comfy.utils": self.utils,
-                   "comfy_execution": types.SimpleNamespace(),
-                   "comfy_execution.utils": types.SimpleNamespace(get_executing_context=lambda: self.context)}
-        self.patcher = patch.dict(sys.modules, modules)
-        self.patcher.start()
-        self.addCleanup(self.patcher.stop)
-
-    def generate(self):
-        return local_qwen.generate(local_qwen.DEFAULT_MODEL, "system", "content")
-
-    def test_fresh_server_crash_is_reproduced_then_sidebar_generation_succeeds(self):
-        with self.assertRaisesRegex(AttributeError, "last_prompt_id"):
-            self.utils.ProgressBar(1).update(1)
-        self.native_hook.reset_mock()
-        self.assertEqual('{"references":[]}', self.generate())
-        self.native_hook.assert_not_called()
-        self.mm.throw_exception_if_processing_interrupted.assert_called_once()
-        self.assertIs(self.native_hook, self.utils.PROGRESS_BAR_HOOK)
-        self.assertFalse(local_qwen._sidebar_progress.get())
-
-    def test_canvas_generation_keeps_native_progress(self):
-        self.context = types.SimpleNamespace(prompt_id="canvas-prompt")
-        self.generate()
-        self.native_hook.assert_called_once_with(1, 1, None, node_id=None)
-        self.assertIs(self.native_hook, self.utils.PROGRESS_BAR_HOOK)
-
-    def test_other_thread_and_retained_bars_keep_native_progress(self):
-        self.server.last_prompt_id = "render-prompt"
-        bars = []
-
-        def tokens(*args, **kwargs):
-            self.utils.ProgressBar(1).update(1)  # Sidebar: must be suppressed.
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                bars.append(pool.submit(self.utils.ProgressBar, 2).result())
-                pool.submit(bars[0].update, 1).result()
-            return [1]
-
-        self.clip.generate.side_effect = tokens
-        self.generate()
-        self.native_hook.assert_called_once_with(1, 2, None, node_id=None)
-        bars[0].update(1)  # Captured wrapper still works after it is restored.
-        self.assertEqual(2, self.native_hook.call_count)
-
-    def test_generation_failure_restores_hook_and_offloads_model(self):
-        self.clip.generate.side_effect = RuntimeError("model failed")
-        with self.assertRaisesRegex(RuntimeError, "model failed"):
-            self.generate()
-        self.assertIs(self.native_hook, self.utils.PROGRESS_BAR_HOOK)
-        self.assertFalse(local_qwen._sidebar_progress.get())
-        self.assertEqual(2, self.mm.unload_all_models.call_count)
-        self.clip.decode.assert_not_called()
-
-    def test_sidebar_token_progress_keeps_cancellation(self):
-        self.mm.throw_exception_if_processing_interrupted.side_effect = RuntimeError("interrupted")
-        with self.assertRaisesRegex(RuntimeError, "interrupted"):
-            self.generate()
-        self.assertIs(self.native_hook, self.utils.PROGRESS_BAR_HOOK)
-        self.assertEqual(2, self.mm.unload_all_models.call_count)
-
-    def test_another_extension_hook_is_not_overwritten_on_exit(self):
-        replacement = MagicMock()
-        self.clip.generate.side_effect = lambda *a, **kw: (self.utils.set_progress_bar_global_hook(replacement), [1])[1]
-        self.generate()
-        self.assertIs(replacement, self.utils.PROGRESS_BAR_HOOK)
-
-    def test_generation_without_a_native_progress_hook(self):
-        self.utils.PROGRESS_BAR_HOOK = None
-        self.generate()
-        self.assertIsNone(self.utils.PROGRESS_BAR_HOOK)
-        self.mm.throw_exception_if_processing_interrupted.assert_called_once()
 
 
 class TimingTests(Fixture, unittest.TestCase):
@@ -711,40 +577,40 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
         async def complete(scene, clip, base):
             clip.update(status="complete", frame=self.asset, video={"path": "saved.mp4"}, actualDuration=5)
         self.engine.check = complete
-        self.engine.plan_prompt = AsyncMock(side_effect=ValueError("Qwen unavailable"))
+        self.engine.plan_prompt = AsyncMock(side_effect=ValueError("Codex unavailable"))
         await self.engine.monitor(self.project["id"], self.scene["id"], "http://unused")
         saved = self.store.scene(self.project["id"], self.scene["id"])
         self.assertEqual("complete", saved["clips"][0]["status"])
         self.assertEqual("saved.mp4", saved["clips"][0]["video"]["path"])
-        self.assertIn("Qwen unavailable", saved["clips"][1]["error"])
+        self.assertIn("Codex unavailable", saved["clips"][1]["error"])
 
-    async def test_qwen_json_uses_native_model_and_images_without_network(self):
+    async def test_codex_json_uses_selected_model_and_images_through_bridge(self):
         paths = [self.store.path(self.asset["path"])]
-        with patch.object(local_qwen, "generate", return_value=json.dumps({"prompt": BASE_PROMPT})) as generate:
-            result = await qwen.ask(self.store, qwen.PROMPT, {"target":"clip"}, paths)
+        with patch.object(codex_bridge.get_bridge(self.store), "generate", return_value=json.dumps({"prompt": BASE_PROMPT})) as generate:
+            result = await planner.ask(self.store, planner.PROMPT, {"target":"clip"}, paths)
         self.assertEqual(BASE_PROMPT, result["prompt"])
-        self.assertEqual(local_qwen.DEFAULT_MODEL, generate.call_args.args[0])
+        self.assertEqual("", generate.call_args.args[0])
         self.assertEqual(paths, generate.call_args.args[3])
-        self.assertIn(qwen.PROMPT, generate.call_args.args[1])
+        self.assertIn(planner.PROMPT, generate.call_args.args[1])
         self.assertIn('Return {"prompt":string}', generate.call_args.args[1])
         self.assertIn("ONE complete natural-language text string", generate.call_args.args[1])
         self.assertNotIn('"prompt":{section_name', generate.call_args.args[1])
 
-    async def test_qwen_model_override_is_stored_as_a_local_filename(self):
-        model = "qwen3vl_8b_fp8_scaled.safetensors"
-        self.store.write("qwen.json", qwen.validate_config({"model": model}))
-        with patch.object(local_qwen, "generate", return_value=json.dumps({"prompt": BASE_PROMPT})) as generate:
-            await qwen.ask(self.store, qwen.PROMPT, {})
+    async def test_codex_model_override_is_stored_as_a_model_id(self):
+        model = "codex-alternate-test"
+        self.store.write("codex.json", planner.validate_config({"model": model}))
+        with patch.object(codex_bridge.get_bridge(self.store), "generate", return_value=json.dumps({"prompt": BASE_PROMPT})) as generate:
+            await planner.ask(self.store, planner.PROMPT, {})
         self.assertEqual(model, generate.call_args.args[0])
-        self.assertEqual("comfyui", qwen.config(self.store)["runtime"])
+        self.assertEqual("codex-pc", planner.config(self.store)["runtime"])
 
     async def test_planning_minimizes_clips_and_validates_only_selected_reference_mode(self):
-        refs, _ = qwen.reference_context(self.store, self.scene)
+        refs, _ = planner.reference_context(self.store, self.scene)
         plan = {"clips": [{"id": "single", "title": "Complete scene", "duration": 15,
                            "referenceIds": [], "transition": "first", "prompt": BASE_SECTIONS}]}
         payload = {"script": "Actor opens a door and says Hello.", "suppliedReferences": refs}
-        with patch.object(local_qwen, "generate", return_value=json.dumps(plan)) as generate:
-            result = await qwen.ask(self.store, qwen.PLAN, payload)
+        with patch.object(codex_bridge.get_bridge(self.store), "generate", return_value=json.dumps(plan)) as generate:
+            result = await planner.ask(self.store, planner.PLAN, payload)
         clean = core.validate_plan(self.scene, result)
         self.assertEqual(1, len(clean))
         self.assertEqual(BASE_PROMPT, clean[0]["prompt"])
@@ -758,33 +624,33 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
         generate.assert_called_once()
 
     async def test_reference_plan_leaves_later_outlines_unformatted(self):
-        refs, _ = qwen.reference_context(self.store, self.scene)
+        refs, _ = planner.reference_context(self.store, self.scene)
         plan = {"clips": [{"id": "first", "duration": 15, "referenceIds": ["actor"], "prompt": REF_PROMPT},
                           {"id": "later", "duration": 6, "referenceIds": ["actor"], "prompt": "Later outline, awaiting actual prior frame."}]}
-        with patch.object(local_qwen, "generate", return_value=json.dumps(plan)) as generate:
-            self.assertEqual(plan, await qwen.ask(self.store, qwen.PLAN, {"suppliedReferences": refs}))
+        with patch.object(codex_bridge.get_bridge(self.store), "generate", return_value=json.dumps(plan)) as generate:
+            self.assertEqual(plan, await planner.ask(self.store, planner.PLAN, {"suppliedReferences": refs}))
         generate.assert_called_once()
 
     async def test_structured_plan_and_prompt_are_assembled_before_saving(self):
-        refs, paths = qwen.reference_context(self.store, self.scene)
+        refs, paths = planner.reference_context(self.store, self.scene)
         plan = {"clips": [{"id": "first", "duration": 15, "referenceIds": ["actor"], "prompt": dict(reversed(list(REF_SECTIONS.items())))},
                           {"id": "later", "duration": 6, "referenceIds": ["actor"], "prompt": "Unchanged later outline."}]}
-        with patch.object(local_qwen, "generate", return_value=json.dumps(plan)) as generate:
-            result = await qwen.ask(self.store, qwen.PLAN, {"suppliedReferences": refs}, paths)
+        with patch.object(codex_bridge.get_bridge(self.store), "generate", return_value=json.dumps(plan)) as generate:
+            result = await planner.ask(self.store, planner.PLAN, {"suppliedReferences": refs}, paths)
         self.assertEqual(REF_PROMPT, result["clips"][0]["prompt"])
         self.assertEqual(plan["clips"][1], result["clips"][1])
         generate.assert_called_once()
         for sections, selected, expected in ((BASE_SECTIONS, [], BASE_PROMPT), (REF_SECTIONS, refs, REF_PROMPT)):
-            with patch.object(local_qwen, "generate", return_value=json.dumps({"prompt": sections})) as generate:
-                result = await qwen.ask(self.store, qwen.PROMPT, {"references": selected, "target": {"duration": 15}})
+            with patch.object(codex_bridge.get_bridge(self.store), "generate", return_value=json.dumps({"prompt": sections})) as generate:
+                result = await planner.ask(self.store, planner.PROMPT, {"references": selected, "target": {"duration": 15}})
             self.assertEqual(expected, result["prompt"])
             generate.assert_called_once()
 
     async def test_h3_format_repair_once_preserves_source_payload_and_reference_binding(self):
-        refs, _ = qwen.reference_context(self.store, self.scene)
+        refs, _ = planner.reference_context(self.store, self.scene)
         payload = {"script": "Actor says Hello.", "references": refs, "frameGuideEnabled": True, "target": {"duration": 15}}
-        with patch.object(local_qwen, "generate", side_effect=['{"prompt":"Actor <Picture 1> opens the door."}', json.dumps({"prompt": REF_PROMPT})]) as generate:
-            result = await qwen.ask(self.store, qwen.PROMPT, payload)
+        with patch.object(codex_bridge.get_bridge(self.store), "generate", side_effect=['{"prompt":"Actor <Picture 1> opens the door."}', json.dumps({"prompt": REF_PROMPT})]) as generate:
+            result = await planner.ask(self.store, planner.PROMPT, payload)
         self.assertEqual(REF_PROMPT, result["prompt"])
         sent = json.loads(generate.call_args.args[2])
         self.assertEqual(payload["script"], sent["script"])
@@ -799,11 +665,11 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, generate.call_count)
 
     async def test_plain_prompt_with_only_one_legacy_heading_does_not_trigger_repair(self):
-        refs, _ = qwen.reference_context(self.store, self.scene)
+        refs, _ = planner.reference_context(self.store, self.scene)
         plain = 'subject_definitions: Actor opens the door and says "Hello." The room stays quiet.'
         payload = {"script": "Actor says Hello.", "references": refs, "target": {"duration": 15}}
-        with patch.object(local_qwen, "generate", return_value=json.dumps({"prompt": plain})) as generate:
-            result = await qwen.ask(self.store, qwen.PROMPT, payload)
+        with patch.object(codex_bridge.get_bridge(self.store), "generate", return_value=json.dumps({"prompt": plain})) as generate:
+            result = await planner.ask(self.store, planner.PROMPT, payload)
         self.assertEqual(plain, result["prompt"])
         sent = json.loads(generate.call_args.args[2])
         self.assertNotIn("formatRepair", sent)
@@ -812,15 +678,15 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("formatRepair", payload)
         generate.assert_called_once()
 
-    async def test_plain_clip_plan_preserves_qwen_clip_count_and_durations_without_section_checks(self):
-        refs, _ = qwen.reference_context(self.store, self.scene)
+    async def test_plain_clip_plan_preserves_codex_clip_count_and_durations_without_section_checks(self):
+        refs, _ = planner.reference_context(self.store, self.scene)
         for selected in ([], ["actor"]):
             plan = {"clips": [{"id": "first", "title": "Open", "duration": 12, "referenceIds": selected,
                                "transition": "first", "prompt": 'Actor opens the door and says "Hello."'},
                               {"id": "next", "title": "Reply", "duration": 7, "referenceIds": selected,
                                "transition": "continue", "prompt": "Actor waits for a reply."}]}
-            with patch.object(local_qwen, "generate", return_value=json.dumps(plan)) as generate:
-                result = await qwen.ask(self.store, qwen.PLAN, {"suppliedReferences": refs})
+            with patch.object(codex_bridge.get_bridge(self.store), "generate", return_value=json.dumps(plan)) as generate:
+                result = await planner.ask(self.store, planner.PLAN, {"suppliedReferences": refs})
             clips = core.validate_plan(self.scene, result)
             self.assertEqual(2, len(clips))
             self.assertEqual([12, 7], [clip["duration"] for clip in clips])
@@ -830,27 +696,27 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
             generate.assert_called_once()
 
     async def test_repeated_bad_format_stops_with_actionable_error(self):
-        with patch.object(local_qwen, "generate", return_value="Use the workflow") as generate:
+        with patch.object(codex_bridge.get_bridge(self.store), "generate", return_value="Use the workflow") as generate:
             with self.assertRaisesRegex(ValueError, "valid H3 prompt"):
-                await qwen.ask(self.store, qwen.PROMPT, {})
+                await planner.ask(self.store, planner.PROMPT, {})
         self.assertEqual(2, generate.call_count)
 
     async def test_reference_discovery_stays_separate_from_style_and_clip_planning(self):
         discovered = {"references": []}
-        with patch.object(local_qwen, "generate", return_value=json.dumps(discovered)) as generate:
-            self.assertEqual(discovered, await qwen.ask(self.store, qwen.DISCOVER, {"script": "A silent room."}))
+        with patch.object(codex_bridge.get_bridge(self.store), "generate", return_value=json.dumps(discovered)) as generate:
+            self.assertEqual(discovered, await planner.ask(self.store, planner.DISCOVER, {"script": "A silent room."}))
         self.assertNotIn("H3 PROMPT CONTRACT", generate.call_args.args[1])
         self.assertNotIn("h3Prompting", json.loads(generate.call_args.args[2]))
         generate.assert_called_once()
 
     async def test_engine_planning_uses_the_selected_projects_model(self):
-        chosen = "qwen3vl_8b_fp8_scaled.safetensors"
-        self.store.write(f"projects/{self.project['id']}/qwen.json", qwen.validate_config({"model": chosen}))
+        chosen = "codex-alternate-test"
+        self.store.write(f"projects/{self.project['id']}/codex.json", planner.validate_config({"model": chosen}))
         mm = types.SimpleNamespace(unload_all_models=lambda: None, soft_empty_cache=lambda: None)
         comfy = types.ModuleType("comfy"); comfy.__path__ = []; comfy.model_management = mm
         self.engine.http = AsyncMock(return_value={"queue_running": [], "queue_pending": []})
         result = {"title": "Scene", "summary": "Scene summary", "references": []}
-        with patch.dict(sys.modules, {"comfy": comfy, "comfy.model_management": mm}), patch.object(qwen, "ask", AsyncMock(return_value=result)) as ask:
+        with patch.dict(sys.modules, {"comfy": comfy, "comfy.model_management": mm}), patch.object(planner, "ask", AsyncMock(return_value=result)) as ask:
             await self.engine.discover(self.scene, "http://unused")
         self.assertEqual(chosen, ask.call_args.kwargs["model_file"])
 
@@ -985,13 +851,13 @@ class PlanningRouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
 
         async def broken(scene, base):
             scene["clips"] = []
-            raise ValueError("Qwen failed while planning")
+            raise ValueError("Codex failed while planning")
         self.engine.plan.side_effect = broken
         await self.post("plan", requestId="failed_request")
         await asyncio.gather(*list(self.engine.planning_tasks.values()))
         saved = self.store.scene(self.project["id"], self.scene["id"])
         self.assertEqual("failed", saved["planning"]["status"])
-        self.assertIn("Qwen failed", saved["planning"]["error"])
+        self.assertIn("Codex failed", saved["planning"]["error"])
         self.assertEqual(before, saved["clips"])
 
     async def test_identify_prompt_and_revision_all_use_background_tasks(self):
@@ -1022,6 +888,35 @@ class PlanningRouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
         response = await self.post("plan", episodeId="wrong_episode", requestId="bad_episode")
         self.assertEqual(400, response.status)
         self.engine.plan.assert_not_awaited()
+
+    async def test_pc_helper_routes_require_pairing_and_return_only_claimed_images(self):
+        paired = await self.post("pairCodex")
+        token = (await paired.json())["token"]
+        identity = {"helperId": "pc", "version": "0.8.0", "models": []}
+        denied = await self.client.post("/ava-agent/codex/connect", json=identity)
+        self.assertEqual(401, denied.status)
+        headers = {"Authorization": "Bearer " + token}
+        connected = await self.client.post("/ava-agent/codex/connect", json=identity, headers=headers)
+        self.assertEqual(200, connected.status)
+        task = asyncio.create_task(self.engine.bridge.generate("", "system", "script", [self.store.path(self.asset["path"])]))
+        try:
+            await asyncio.sleep(0)
+            claimed = await self.client.post("/ava-agent/codex/next", json=identity, headers=headers)
+            job = (await claimed.json())["job"]
+            image = await self.client.get(f"/ava-agent/codex/job/{job['id']}/image/0", headers={**headers, "X-AVA-Helper": "pc", "X-AVA-Claim": job["claimId"]})
+            self.assertEqual(self.store.path(self.asset["path"]).read_bytes(), await image.read())
+            denied = await self.client.get(f"/ava-agent/codex/job/{job['id']}/image/0", headers=headers)
+            self.assertEqual(400, denied.status)
+            result = await self.client.post(f"/ava-agent/codex/job/{job['id']}/result", headers=headers,
+                                            json={"helperId": "pc", "claimId": job["claimId"], "output": "Result"})
+            self.assertEqual(200, result.status)
+            self.assertEqual("Result", await task)
+            download = await self.client.get("/ava-agent/codex/helper.py")
+            self.assertEqual(200, download.status)
+            self.assertIn("pc_helper.py", download.headers["Content-Disposition"])
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg tools required")

@@ -46,7 +46,7 @@ def text(value, maximum=32000):
 
 def ensure_not_planning(scene):
     if scene.get("planning", {}).get("status") == "running":
-        raise ValueError("Qwen is still planning this scene. Wait for it to finish before editing or deleting it.")
+        raise ValueError("Codex is still planning this scene. Wait for it to finish before editing or deleting it.")
 
 
 def duration(value):
@@ -262,13 +262,13 @@ def ensure_ready(store, scene, clip):
 def validate_references(result):
     refs = result.get("references")
     if not isinstance(refs, list) or len(refs) > 40:
-        raise ValueError("Qwen must return up to 40 reference slots")
+        raise ValueError("Codex must return up to 40 reference slots")
     seen = set()
     clean = []
     for ref in refs:
         rid = identifier(ref["id"])
         if rid in seen or ref["kind"] not in ("character", "location", "prop"):
-            raise ValueError("Qwen returned duplicate or invalid references")
+            raise ValueError("Codex returned duplicate or invalid references")
         seen.add(rid)
         clean.append({"id": rid, "name": text(ref["name"], 120), "kind": ref["kind"], "description": text(ref["description"], 1000), "assets": []})
     return clean
@@ -277,7 +277,7 @@ def validate_references(result):
 def validate_plan(scene, result):
     clips = result.get("clips")
     if not isinstance(clips, list) or not 1 <= len(clips) <= 40:
-        raise ValueError("Qwen must return 1–40 clips")
+        raise ValueError("Codex must return 1–40 clips")
     supplied = {r["id"] for r in scene["references"] if r.get("assets")}
     seen = set()
     clean = []
@@ -285,14 +285,14 @@ def validate_plan(scene, result):
         cid = identifier(clip["id"])
         ids = clip["referenceIds"]
         if not isinstance(ids, list) or len(set(ids)) != len(ids) or not set(ids) <= supplied or cid in seen:
-            raise ValueError("Qwen selected missing or duplicate reference/clip IDs")
+            raise ValueError("Codex selected missing or duplicate reference/clip IDs")
         seen.add(cid)
         transition = clip["transition"]
         if (i == 0 and transition != "first") or (i > 0 and transition not in ("continue", "cut", "scene-change", "time-jump")):
-            raise ValueError("Qwen returned an invalid transition")
+            raise ValueError("Codex returned an invalid transition")
         prompt = text(clip["prompt"], 12000)
         if TAGS.search(prompt):
-            raise ValueError("Qwen must use names; numbered media tags are bound to real uploads later")
+            raise ValueError("Codex must use names; numbered media tags are bound to real uploads later")
         clean.append({"id": cid, "title": text(clip["title"], 150), "duration": duration(clip["duration"]),
                       "referenceIds": ids, "transition": transition, "continuityMode": "auto", "outline": prompt,
                       "prompt": prompt if i == 0 else "", "status": "awaiting-approval", "versions": []})

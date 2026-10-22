@@ -11,7 +11,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-from . import core, media, qwen, local_qwen
+from . import core, media, planner
 from .engine import Engine
 from .http_contract import origin_is_allowed
 
@@ -94,7 +94,7 @@ async def state(request):
                 eng.watch(watched_project["id"], watched_scene["id"], base_url(request))
     summaries = [{k: p[k] for k in ("id", "name", "createdAt")} for p in projects]
     return web.json_response({"projects": summaries, "project": project, "episodes": episodes, "selectedEpisodeId": episode_id, "scenes": scenes, "videos": videos,
-                              "qwen": qwen.config(eng.store, project_id if project else None), "storage": str(eng.store.root)})
+                              "planner": planner.config(eng.store, project_id if project else None), "helper": eng.bridge.status(), "storage": str(eng.store.root)})
 
 
 @PromptServer.instance.routes.get("/ava-agent/health")
@@ -106,12 +106,10 @@ async def health(request):
     missing = sorted(({n["class_type"] for n in template.values()} | {"MiniMaxH3AddGuide"}) - set(nodes.NODE_CLASS_MAPPINGS))
     required = {"diffusion_models": [template["127"]["inputs"]["unet_name"]], "text_encoders": [template["128"]["inputs"]["clip_name"]],
                 "vae": [template["119"]["inputs"]["vae_name"], template["120"]["inputs"]["vae_name"]]}
-    conf = qwen.validate_config(qwen.config(eng.store, request.query.get("projectId")))
-    required["text_encoders"].append(conf["model"])
+    conf = planner.validate_config(planner.config(eng.store, request.query.get("projectId")))
     missing_models = [name for kind, names in required.items() for name in names if name not in folder_paths.get_filename_list(kind)]
     result = {"missingNodes": missing, "missingModels": missing_models, "ffmpeg": bool(shutil.which(os.getenv("FFMPEG_PATH", "ffmpeg"))),
-              "ffprobe": bool(shutil.which(os.getenv("FFPROBE_PATH", "ffprobe"))), "qwen": conf,
-              "plannerInstalled": conf["model"] in folder_paths.get_filename_list("text_encoders"), "plannerDownload": local_qwen.MODEL_URL}
+              "ffprobe": bool(shutil.which(os.getenv("FFPROBE_PATH", "ffprobe"))), "planner": conf, "helper": eng.bridge.status()}
     return web.json_response(result)
 
 
@@ -137,9 +135,11 @@ async def action(request):
     project_id = core.identifier(body["projectId"])
     async with eng.lock(project_id):
         project = store.project(project_id)
-        if command == "qwenConfig":
-            store.write(f"projects/{project_id}/qwen.json", qwen.validate_config(body["config"]))
+        if command == "codexConfig":
+            store.write(f"projects/{project_id}/codex.json", planner.validate_config(body["config"]))
             return web.json_response({"ok": True})
+        if command == "pairCodex":
+            return web.json_response({"token": eng.bridge.pair()})
         if command == "renameProject":
             project["name"] = core.text(body["name"], 120)
             store.write(f"projects/{project_id}/project.json", project)
@@ -244,7 +244,7 @@ async def action(request):
                 if not core.previous(scene, clip) and body["continuityMode"] == "on":
                     raise ValueError("The first clip has no preceding frame")
                 clip.update(prompt=prompt, referenceIds=refs, continuityMode=body["continuityMode"])
-                # Manual prompts are valid for the first clip. Following clips must first be grounded by Qwen.
+                # Manual prompts are valid for the first clip. Following clips must first be grounded by Codex.
                 if not core.previous(scene, clip):
                     clip["promptContext"] = core.prompt_context(store, scene, clip)
                 clip.pop("approvedKey", None)
@@ -314,6 +314,73 @@ def public_scene(eng, scene):
         except (ValueError, FileNotFoundError):
             clip["reviewKey"] = None
     return result
+
+
+def helper_auth(request):
+    bridge = engine().bridge
+    if not bridge.authenticate(request.headers.get("Authorization", "")):
+        raise web.HTTPUnauthorized(text="PC helper pairing was rejected. Pair it again in ComfyUI Settings.")
+    return bridge
+
+
+async def helper_body(request):
+    raw = bytearray()
+    async for chunk in request.content.iter_chunked(65536):
+        raw.extend(chunk)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("Helper request is too large")
+    return json.loads(raw)
+
+
+@PromptServer.instance.routes.post("/ava-agent/codex/next")
+@errors
+async def helper_next(request):
+    bridge = helper_auth(request)
+    body = await helper_body(request)
+    job = bridge.claim(body["helperId"], body.get("models", []), body.get("version", "unknown"))
+    return web.json_response({"job": job}, headers={"Cache-Control": "no-store"})
+
+
+@PromptServer.instance.routes.post("/ava-agent/codex/connect")
+@errors
+async def helper_connect(request):
+    bridge = helper_auth(request)
+    body = await helper_body(request)
+    bridge.touch(body["helperId"], body.get("models", []), body.get("version", "unknown"))
+    return web.json_response({"ok": True})
+
+
+@PromptServer.instance.routes.post("/ava-agent/codex/job/{job_id}/heartbeat")
+@errors
+async def helper_heartbeat(request):
+    bridge = helper_auth(request)
+    body = await helper_body(request)
+    bridge.heartbeat(request.match_info["job_id"], body["helperId"], body["claimId"])
+    return web.json_response({"ok": True})
+
+
+@PromptServer.instance.routes.post("/ava-agent/codex/job/{job_id}/result")
+@errors
+async def helper_result(request):
+    bridge = helper_auth(request)
+    body = await helper_body(request)
+    bridge.complete(request.match_info["job_id"], body["helperId"], body["claimId"], body.get("output"), body.get("error"))
+    return web.json_response({"ok": True})
+
+
+@PromptServer.instance.routes.get("/ava-agent/codex/job/{job_id}/image/{index}")
+@errors
+async def helper_image(request):
+    bridge = helper_auth(request)
+    path = bridge.image(request.match_info["job_id"], int(request.match_info["index"]),
+                        request.headers.get("X-AVA-Helper", ""), request.headers.get("X-AVA-Claim", ""))
+    return web.FileResponse(path, headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@PromptServer.instance.routes.get("/ava-agent/codex/helper.py")
+@errors
+async def download_helper(request):
+    return web.FileResponse(Path(__file__).with_name("pc_helper.py"), headers={"Content-Disposition": 'attachment; filename="pc_helper.py"', "Cache-Control": "no-store"})
 
 
 @PromptServer.instance.routes.get("/ava-agent/scene")

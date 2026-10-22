@@ -29,7 +29,7 @@ const note = text => $("p", { class: "ava-note", text });
 const mediaUrl = asset => api.apiURL(`${prefix}/media?path=${encodeURIComponent(asset.path)}`);
 
 let workspace, message, content, projectHost, navigation, livePanel, openButton, projectId = localStorage.getItem("ava-project") || "", sceneId = localStorage.getItem("ava-scene") || "", episodeId = localStorage.getItem("ava-episode") || "";
-let state, scene, busy = false, dirty = false, modal, poller, refreshing = false, sidebarHost, diagnostics;
+let state, scene, busy = false, dirty = false, modal, poller, refreshing = false, sidebarHost, diagnostics, pairingToken;
 let renderedSnapshot = "", sceneReceivedAt = Date.now() / 1000;
 let refreshDone = Promise.resolve();
 const originalTitle = document.title;
@@ -45,7 +45,7 @@ const eyebrow = text => $("p", { class: "ava-eyebrow", text });
 const heading = (title, description) => $("div", { class: "ava-section-heading" }, $("h3", { text: title }), description && note(description));
 const metric = (label, value) => $("div", {}, $("dt", { text: label }), $("dd", { text: value }));
 // Live clocks update independently; they must not rebuild a playing video.
-const snapshot = () => JSON.stringify([state, scene], (key, value) => ["serverNow", "elapsedSeconds", "remainingSeconds", "estimatedCompletionAt", "etaKind"].includes(key) ? undefined : value);
+const snapshot = () => JSON.stringify([state, scene], (key, value) => key === "helper" && section !== "settings" || ["lastSeen", "serverNow", "elapsedSeconds", "remainingSeconds", "estimatedCompletionAt", "etaKind"].includes(key) ? undefined : value);
 
 function switchSection(value) {
   section = value; localStorage.setItem("ava-section", value);
@@ -160,7 +160,7 @@ async function action(command, values = {}) {
   } catch (error) {
     if (!error.transportFailure && !(error.status >= 500)) throw error;
     // The server may have accepted the work. Recover by reading; never resubmit.
-    message.textContent = "Checking whether Qwen accepted the request…";
+    message.textContent = "Checking whether Codex accepted the request…";
   }
   return waitForPlanning(scope, jobId);
 }
@@ -172,18 +172,18 @@ async function waitForPlanning(scope, jobId) {
     try { saved = await request(`/scene?${query}`); failures = 0; }
     catch (error) {
       if ((!error.transportFailure && !(error.status >= 500)) || ++failures >= 10) {
-        throw new Error(`${error.message} Qwen may still be running. Refresh the workspace to reconnect; this request was not resubmitted.`);
+        throw new Error(`${error.message} Codex may still be running. Refresh the workspace to reconnect; this request was not resubmitted.`);
       }
-      message.textContent = "Reconnecting to Qwen planning…";
+      message.textContent = "Reconnecting to Codex planning…";
       await new Promise(resolve => setTimeout(resolve, 2000));
       continue;
     }
     const job = saved.planning;
     if (!job || job.id !== jobId) throw new Error("The planning request could not be confirmed. Refresh the workspace and check its state before retrying.");
-    if (job.status === "failed") throw new Error(job.error || "Qwen planning failed. Check the ComfyUI server log.");
+    if (job.status === "failed") throw new Error(job.error || "Codex planning failed. Check the ComfyUI server log.");
     if (job.status === "complete") return { scene: saved };
     const elapsed = Math.max(0, Math.floor(Date.now() / 1000 - job.startedAt));
-    message.textContent = `Qwen is ${planningLabels[job.inputs?.action] || "working"}… ${elapsed}s elapsed. You can reload and reconnect to this task.`;
+    message.textContent = `Codex is ${planningLabels[job.inputs?.action] || "working"}… ${elapsed}s elapsed. You can reload and reconnect to this task.`;
     await new Promise(resolve => setTimeout(resolve, 2000));
   }
 }
@@ -239,13 +239,22 @@ async function refresh(force = false) {
 }
 
 function connection() {
-  const conf = state.qwen;
-  const model = input(conf.model);
-  const result = $("pre", { class: "ava-diagnostics", text: diagnostics || "Check the pod's models, nodes, media tools and Qwen connection." });
-  return card(heading("Qwen & RunPod setup", "Your planning model and pod connection."),
-    note(`Planner selection is saved for ${state.project.name}. All episodes use this project's Qwen model and reference library.`),
-    field("Qwen planner model filename", model),
-    button("Save Qwen model", () => action("qwenConfig", { config: { model: model.value } })),
+  const conf = state.planner;
+  const catalog = [{ id: "", name: "Use PC's default Codex model" }, ...(state.helper?.models || []).map(m => ({ id: m.id, name: m.name }))];
+  if (conf.model && !catalog.some(m => m.id === conf.model)) catalog.push({ id: conf.model, name: conf.model });
+  const model = select(catalog, conf.model);
+  const token = input(pairingToken || ""); token.readOnly = true;
+  const result = $("pre", { class: "ava-diagnostics", text: diagnostics || "Check the pod's models, nodes, media tools and Codex connection." });
+  return card(heading("Codex & RunPod setup", "Codex plans on your PC. H3 renders on this pod."),
+    note(state.helper?.connected ? "PC helper connected" : "PC helper offline — start it on your PC before planning."),
+    $("a", { text: "Download Windows helper", href: api.apiURL(`${prefix}/codex/helper.py`), download: "pc_helper.py" }),
+    note(`Run py pc_helper.py --url "${location.origin}" on your PC. Paste the pairing token when prompted. Later runs can use py pc_helper.py.`),
+    button("Create / replace pairing token", async () => { pairingToken = (await action("pairCodex")).token; }),
+    pairingToken && field("PC helper pairing token", token),
+    note("Creating a new token disconnects the previously paired helper. Your Codex ChatGPT login stays on your PC."),
+    note(`Model selection is saved for ${state.project.name}. The choices come from the connected PC's Codex installation.`),
+    field("Codex planner model", model),
+    button("Save Codex model", () => action("codexConfig", { config: { model: model.value } })),
     button("Check installation", async () => { diagnostics = JSON.stringify(await request(`/health?projectId=${encodeURIComponent(projectId)}`), null, 2); result.textContent = diagnostics; }), result,
     note(`Storage on pod: ${state.storage}. Use a RunPod persistent volume.`)
   );
@@ -369,11 +378,11 @@ function sceneEditor() {
   async function save() {
     await action("saveScene", sceneDraft());
   }
-  return card(eyebrow("01 / PLAN"), heading("Build your scene", "Start with your script. Qwen identifies references, then plans each clip."), field("Script / scene", script),
+  return card(eyebrow("01 / PLAN"), heading("Build your scene", "Start with your script. Codex identifies references, then plans each clip."), field("Script / scene", script),
     note(`FastH3 · ${scene.settings.aspectRatio} · ${scene.settings.megapixels} MP · ${scene.settings.steps} steps · configure in Settings`),
     row(button("Save scene", save), button("1 · Identify references", async () => { await save(); await action("identify"); })),
-    note(scene.summary || "Identify slots, supply your references, then let Qwen inspect them and plan clips."),
-    note("Qwen combines consecutive actions and dialogue into fewer clips, up to 15 seconds each, while preserving natural timing."),
+    note(scene.summary || "Identify slots, supply your references, then let Codex inspect them and plan clips."),
+    note("Codex combines consecutive actions and dialogue into fewer clips, up to 15 seconds each, while preserving natural timing."),
     button(scene.clips.length ? "Replan / optimize unsubmitted clips" : "2 · Understand references & plan clips", async () => { await save(); await action("plan"); }, "ava-primary"));
 }
 
@@ -417,11 +426,11 @@ function clipEditor(clip, index) {
     row(field(clip.takeId ? "Duration for next take" : "Duration", length), button("Save duration", () => action("setDuration", { clipId: clip.id, duration: Number(length.value) }))),
     clip.nextDuration !== undefined && note(`The submitted/saved take keeps ${clip.duration}s. Next take: ${clip.nextDuration}s.`),
     row(button("Save prompt & references", save), button(index ? "Plan prompt from last frame" : "Plan prompt", async () => {
-      // Save existing edits before Qwen sees the target. A blank outline prompt is planned directly.
+      // Save existing edits before Codex sees the target. A blank outline prompt is planned directly.
       await save();
       await action("planPrompt", { clipId: clip.id });
     })),
-    field("Revision comments", comments), button("Apply comments with Qwen", async () => { await save(); await action("revisePrompt", { clipId: clip.id, comments: comments.value }); }),
+    field("Revision comments", comments), button("Apply comments with Codex", async () => { await save(); await action("revisePrompt", { clipId: clip.id, comments: comments.value }); }),
     button(clip.takeId ? "Approve prompt & regenerate this clip" : "Approve prompt & generate this clip", async () => {
       await save();
       const savedScene = await request(`/scene?${scopeQuery()}&sceneId=${encodeURIComponent(sceneId)}`);
@@ -461,7 +470,7 @@ function render() {
   const detailsState = new Map([...workspace.querySelectorAll("details")].map((el, i) => [`${i}:${el.querySelector("summary")?.textContent}`, el.open]));
   message.classList.remove("ava-error");
   const agent = $("section", { id: "ava-panel-agent", role: "tabpanel", ariaLabel: "Agent" },
-    ...(scene ? [scene.planning?.status === "failed" && $("p", { class: "ava-error", text: scene.planning.error }), sceneEditor(), references(), studio(), scene.clips.length && heading("Review & render", `${scene.clips.filter(c => c.status === "complete").length} of ${scene.clips.length} clips complete · approve each take when ready`), ...scene.clips.map(clipEditor)].filter(Boolean) : [card(heading("Your next video starts here", "Create a project and scene above, then give Qwen your script."))]));
+    ...(scene ? [scene.planning?.status === "failed" && $("p", { class: "ava-error", text: scene.planning.error }), sceneEditor(), references(), studio(), scene.clips.length && heading("Review & render", `${scene.clips.filter(c => c.status === "complete").length} of ${scene.clips.length} clips complete · approve each take when ready`), ...scene.clips.map(clipEditor)].filter(Boolean) : [card(heading("Your next video starts here", "Create a project and scene above, then give Codex your script."))]));
   const libraryPanel = $("section", { id: "ava-panel-library", role: "tabpanel", ariaLabel: "Library" }, projectId ? library() : card(note("Create a project to build its reference library.")));
   const settingsPanel = $("section", { id: "ava-panel-settings", role: "tabpanel", ariaLabel: "Settings" }, ...(state.project ? [manageSelection(), connection()] : []), ...(scene ? [generationSettings()] : []),
     card(heading("Render timing", "Automatic tracking for every new take."), note("Elapsed time includes time spent in the queue. Estimated finish uses recent completed takes with matching duration, steps, resolution and reference size. The first render shows a sampling estimate once its rate is known. Completion time is recorded after the video is verified and saved. Times use your browser's local timezone.")));
@@ -491,9 +500,9 @@ function mount() {
   navigation.hidden = true;
   livePanel = $("div", { class: "ava-monitor" });
   workspace = $("div", { class: "ava-workspace" }, $("header", { class: "ava-header" },
-    $("div", { class: "ava-brand" }, $("span", { class: "ava-mark", text: "a", ariaHidden: "true" }), $("div", {}, $("h2", { text: "AI Video Agent" }), $("span", { class: "ava-subtitle", text: "Qwen plans. FastH3 creates." }))), row(
+    $("div", { class: "ava-brand" }, $("span", { class: "ava-mark", text: "a", ariaHidden: "true" }), $("div", {}, $("h2", { text: "AI Video Agent" }), $("span", { class: "ava-subtitle", text: "Codex plans. FastH3 creates." }))), row(
     button("Refresh", () => refresh(true)), openButton)), projectHost, navigation, message, livePanel, content,
-    $("footer", { text: "QWEN + FASTH3 / YOUR COMFYUI WORKSPACE" }));
+    $("footer", { text: "CODEX + FASTH3 / YOUR COMFYUI WORKSPACE" }));
   workspace.addEventListener("input", () => { dirty = true; });
   workspace.addEventListener("change", event => { if (event.target.tagName !== "SELECT" || event.target.closest("main")) dirty = true; });
   poller = setInterval(() => { if (!busy) refresh().catch(error => { message.textContent = error.message; }); }, 5000);
@@ -516,10 +525,10 @@ function openModal() {
 }
 
 app.registerExtension({
-  name: "AI.Video.Agent.Qwen",
+  name: "AI.Video.Agent.Codex",
   setup() {
     mount();
-    app.extensionManager.registerSidebarTab({ id: "ai-video-agent", icon: "pi pi-video", title: "AI Video Agent", tooltip: "Qwen video planning & reviewed generation", type: "custom", render(el) { sidebarHost = el; if (!modal?.open) el.append(workspace); } });
+    app.extensionManager.registerSidebarTab({ id: "ai-video-agent", icon: "pi pi-video", title: "AI Video Agent", tooltip: "Codex video planning & reviewed generation", type: "custom", render(el) { sidebarHost = el; if (!modal?.open) el.append(workspace); } });
   },
   beforeRegisterNodeDef(nodeType, nodeData) {
     if (!["AVAShowText", "AVAQueueReviewedClip"].includes(nodeData.name)) return;
