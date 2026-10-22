@@ -61,6 +61,12 @@ The workflow's lower row is muted initially. Enable it only for the specific rev
 
 Use **Check installation** to see missing H3/Qwen files and nodes before rendering. `AVA_COMFY_URL` can override the loopback URL when using HTTPS internally or a port other than 8188 for the canvas render node. `AVA_QWEN_MODEL` selects the initial planner filename. `FFMPEG_PATH` and `FFPROBE_PATH` override the media-tool executable paths.
 
+### RunPod proxy request errors
+
+Version 0.3.1 fixes a sidebar error reported as `Unexpected token 'U', "Use the wo"... is not valid JSON`. The browser's public ComfyUI URL can differ from the internal Host header after RunPod proxying. Same-origin browser requests now use browser Fetch Metadata, and rejected requests return JSON errors. The UI also displays plain-text proxy errors without trying to treat them as JSON.
+
+Update the custom-node folder with `git pull --ff-only`, restart ComfyUI, then hard-refresh the browser. If your proxy strips the browser's `Sec-Fetch-Site` header, set `AVA_PUBLIC_ORIGIN` to the exact public ComfyUI origin, for example `https://your-pod-8188.proxy.runpod.net`, and restart. Cross-origin browser requests remain blocked.
+
 ## Validation
 
 ```bash

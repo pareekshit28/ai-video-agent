@@ -27,6 +27,37 @@ qwen = importlib.import_module(namespace.__name__ + ".qwen")
 media = importlib.import_module(namespace.__name__ + ".media")
 engine_module = importlib.import_module(namespace.__name__ + ".engine")
 local_qwen = importlib.import_module(namespace.__name__ + ".local_qwen")
+http_contract = importlib.import_module(namespace.__name__ + ".http_contract")
+
+
+class OriginPolicyTests(unittest.TestCase):
+    def test_same_origin_browser_survives_reverse_proxy_host_rewrite(self):
+        headers = {"Origin": "https://example-8188.proxy.runpod.net", "Sec-Fetch-Site": "same-origin"}
+        self.assertTrue(http_contract.origin_is_allowed(headers, "127.0.0.1:8188"))
+
+    def test_other_site_is_rejected_even_when_the_host_or_config_matches(self):
+        for site in ("cross-site", "same-site"):
+            headers = {"Origin": "https://pod.example", "Sec-Fetch-Site": site}
+            self.assertFalse(http_contract.origin_is_allowed(headers, "pod.example", "https://pod.example"))
+
+    def test_direct_host_works_without_fetch_metadata(self):
+        self.assertTrue(http_contract.origin_is_allowed({"Origin": "http://127.0.0.1:8188"}, "127.0.0.1:8188"))
+
+    def test_proxy_without_metadata_requires_an_explicit_public_origin(self):
+        headers = {"Origin": "https://example-8188.proxy.runpod.net"}
+        self.assertFalse(http_contract.origin_is_allowed(headers, "localhost:8188"))
+        self.assertTrue(http_contract.origin_is_allowed(headers, "localhost:8188", "https://example-8188.proxy.runpod.net"))
+
+    def test_forwarded_headers_do_not_authorize_another_site(self):
+        headers = {"Origin": "https://unrelated.example", "X-Forwarded-Host": "unrelated.example"}
+        self.assertFalse(http_contract.origin_is_allowed(headers, "localhost:8188"))
+
+    def test_local_queue_clients_without_origin_still_work(self):
+        self.assertTrue(http_contract.origin_is_allowed({}, "127.0.0.1:8188"))
+
+    def test_invalid_or_opaque_origins_are_rejected(self):
+        for origin in ("null", "not a URL", "https://user@pod.example", "https://pod.example/path"):
+            self.assertFalse(http_contract.origin_is_allowed({"Origin": origin, "Sec-Fetch-Site": "same-origin"}, "pod.example"))
 
 
 class Fixture:

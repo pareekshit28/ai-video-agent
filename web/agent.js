@@ -28,11 +28,24 @@ let state, scene, busy = false, dirty = false, modal, poller, refreshing = false
 let renderedSnapshot = "";
 const originalTitle = document.title;
 
+async function readResponse(response) {
+  const raw = await response.text();
+  let data;
+  try { data = JSON.parse(raw); }
+  catch {
+    const detail = raw.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 400);
+    throw new Error(`ComfyUI request failed (HTTP ${response.status}). ${detail || "The server returned an empty or non-JSON response."}`);
+  }
+  if (!response.ok) {
+    const detail = typeof data?.error === "string" ? data.error : `ComfyUI returned HTTP ${response.status}.`;
+    throw new Error(detail);
+  }
+  return data;
+}
+
 async function request(path, body) {
   const response = await api.fetchApi(prefix + path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-  return data;
+  return readResponse(response);
 }
 function button(label, work, className = "") {
   return $("button", { text: label, class: className, disabled: busy, onclick: () => run(work) });
@@ -120,8 +133,7 @@ async function uploadFile(file, values = {}) {
   const form = new FormData(); form.append("file", file);
   const query = new URLSearchParams({ projectId, ...values });
   const response = await api.fetchApi(`${prefix}/upload?${query}`, { method: "POST", body: form });
-  const result = await response.json();
-  if (!response.ok) throw new Error(result.error);
+  await readResponse(response);
 }
 
 function uploadControl(values, label = "Add images / voices") {

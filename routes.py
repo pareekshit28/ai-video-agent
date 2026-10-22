@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-from urllib.parse import urlparse
 
 from aiohttp import web
 import folder_paths
@@ -13,6 +12,7 @@ from server import PromptServer
 
 from . import core, media, qwen, local_qwen
 from .engine import Engine
+from .http_contract import origin_is_allowed
 
 _engine = None
 
@@ -32,9 +32,8 @@ def base_url(request):
 
 
 def origin_guard(request):
-    origin = request.headers.get("Origin")
-    if origin and urlparse(origin).netloc != request.host:
-        raise web.HTTPForbidden(text="Use the workspace from the same ComfyUI origin")
+    if not origin_is_allowed(request.headers, request.host, os.getenv("AVA_PUBLIC_ORIGIN", "")):
+        raise web.HTTPForbidden(text="Request origin was rejected. Open the workspace from your ComfyUI URL. If the proxy removes browser origin metadata, set AVA_PUBLIC_ORIGIN to that public URL and restart ComfyUI.")
 
 
 def find_clip(scene, clip_id):
@@ -50,8 +49,10 @@ def errors(handler):
     async def wrapped(request):
         try:
             return await handler(request)
-        except web.HTTPException:
-            raise
+        except web.HTTPException as error:
+            if error.status < 400:
+                raise
+            return web.json_response({"error": error.text or error.reason}, status=error.status)
         except FileNotFoundError:
             return web.json_response({"error": "Saved project, scene or media file was not found"}, status=404)
         except (ValueError, KeyError, TypeError, StopIteration) as error:

@@ -89,7 +89,19 @@ async def agent_js(request): return web.FileResponse(PACKAGE / "web/agent.js")
 async def index(request):
     return web.Response(content_type="text/html", text='<title>ComfyUI fixture</title><div id="sidebar" style="height:100vh"></div><script type="module" src="/extensions/ava/agent.js"></script>')
 
-parser = argparse.ArgumentParser(); parser.add_argument("--port", type=int, default=8199); args = parser.parse_args()
-application = web.Application(client_max_size=32 * 1024 * 1024)
+parser = argparse.ArgumentParser()
+parser.add_argument("--port", type=int, default=8199)
+parser.add_argument("--proxy", action="store_true", help="Simulate RunPod rewriting the external Host before ComfyUI")
+args = parser.parse_args()
+
+@web.middleware
+async def simulate_reverse_proxy(request, handler):
+    if args.proxy:
+        headers = dict(request.headers)
+        headers["Host"] = "comfyui.internal:8188"
+        request = request.clone(headers=headers)
+    return await handler(request)
+
+application = web.Application(client_max_size=32 * 1024 * 1024, middlewares=[simulate_reverse_proxy])
 application.add_routes(routes)
 web.run_app(application, host="127.0.0.1", port=args.port)
