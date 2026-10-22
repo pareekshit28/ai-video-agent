@@ -29,6 +29,7 @@ media = importlib.import_module(namespace.__name__ + ".media")
 engine_module = importlib.import_module(namespace.__name__ + ".engine")
 local_qwen = importlib.import_module(namespace.__name__ + ".local_qwen")
 http_contract = importlib.import_module(namespace.__name__ + ".http_contract")
+timing = importlib.import_module(namespace.__name__ + ".timing")
 
 
 class OriginPolicyTests(unittest.TestCase):
@@ -325,6 +326,87 @@ class NativeProgressTests(unittest.TestCase):
         self.mm.throw_exception_if_processing_interrupted.assert_called_once()
 
 
+class TimingTests(Fixture, unittest.TestCase):
+    def setUp(self): self.setup_fixture()
+    def tearDown(self): self.teardown_fixture()
+
+    def test_estimates_use_median_of_matching_takes_and_exclude_queue_time(self):
+        sample = {**copy.deepcopy(self.clip), "status": "complete", "takeId": "prior", "submittedSettings": core.DEFAULTS.copy(),
+                  "timing": {"submittedAt": 1, "renderStartedAt": 100, "renderFinishedAt": 200, "completedAt": 210}}
+        self.clip["versions"] = [sample, {**copy.deepcopy(sample), "timing": {"renderStartedAt": 200, "renderFinishedAt": 400, "completedAt": 420}},
+                                 {**copy.deepcopy(sample), "duration": 10},
+                                 {**copy.deepcopy(sample), "submittedSettings": {**core.DEFAULTS, "steps": 40}},
+                                 {**copy.deepcopy(sample), "status": "failed"}]
+        self.store.save_scene(self.scene)
+        self.assertEqual({"expectedRenderSeconds": 150, "expectedSaveSeconds": 15, "estimateSamples": 2}, timing.estimate(self.store, self.scene, self.clip))
+        self.clip["nextDuration"] = 8
+        self.assertEqual({}, timing.estimate(self.store, self.scene, self.clip))
+
+    def test_regeneration_archives_timestamps_and_resets_current_clock(self):
+        self.clip.update(takeId="old", timing={"completedAt": 200})
+        core.archive_take(self.clip)
+        self.assertNotIn("timing", self.clip)
+        self.assertEqual(200, self.clip["versions"][0]["timing"]["completedAt"])
+
+    def test_history_provides_actual_execution_times(self):
+        self.clip["timing"] = {"renderStartedAt": 110}
+        timing.history_times(self.clip, {"status": {"messages": [["execution_start", {"timestamp": 100000}], ["execution_success", {"timestamp": 200000}]]}})
+        self.assertEqual({"renderStartedAt": 100, "renderFinishedAt": 200}, self.clip["timing"])
+
+    def test_queued_job_has_elapsed_and_no_guessed_finish(self):
+        self.clip.update(status="queued", timing={"submittedAt": 100, "expectedRenderSeconds": 200})
+        result = timing.public(self.clip, now=150)
+        self.assertEqual(50, result["elapsedSeconds"])
+        self.assertIsNone(result["estimatedCompletionAt"])
+
+    def test_render_eta_and_saving_eta_then_actual_completion(self):
+        self.clip.update(status="rendering", timing={"submittedAt": 50, "renderStartedAt": 100, "expectedRenderSeconds": 100, "expectedSaveSeconds": 10})
+        self.assertEqual(60, timing.public(self.clip, now=150)["remainingSeconds"])
+        self.clip.update(status="saving")
+        self.clip["timing"]["savingStartedAt"] = 200
+        self.assertEqual(5, timing.public(self.clip, now=205)["remainingSeconds"])
+        self.clip.update(status="complete")
+        self.clip["timing"]["completedAt"] = 215
+        result = timing.public(self.clip, now=999)
+        self.assertEqual(165, result["elapsedSeconds"])
+        self.assertIsNone(result["remainingSeconds"])
+        self.assertEqual(215, result["completedAt"])
+
+    def test_overdue_estimate_does_not_promise_zero_remaining(self):
+        self.clip.update(status="rendering", timing={"renderStartedAt": 100, "expectedRenderSeconds": 50})
+        result = timing.public(self.clip, now=200)
+        self.assertEqual("overdue", result["etaKind"])
+        self.assertIsNone(result["remainingSeconds"])
+
+    def test_first_render_uses_measured_sampler_rate_and_stale_rate_expires(self):
+        self.clip.update(status="rendering", timing={"sampling": {"firstValue": 1, "value": 3, "total": 8, "firstObservedAt": 100, "observedAt": 120}})
+        result = timing.public(self.clip, now=125)
+        self.assertEqual(45, result["remainingSeconds"])
+        self.assertEqual("sampling", result["etaKind"])
+        self.assertIsNone(result["estimatedCompletionAt"], "sampler rate must not promise a full-video finish")
+        self.assertIsNone(timing.public(self.clip, now=160)["remainingSeconds"])
+
+    def test_progress_from_another_job_is_ignored(self):
+        self.clip.update(jobId="ours", timing={})
+        registry = types.SimpleNamespace(prompt_id="other", nodes={"125": {"value": 3, "max": 8}})
+        modules = {"comfy_execution": types.ModuleType("comfy_execution"), "comfy_execution.progress": types.SimpleNamespace(get_progress_state=lambda: registry)}
+        with patch.dict(sys.modules, modules):
+            timing.observe_progress(self.clip, now=100)
+            self.assertEqual({}, self.clip["timing"])
+            registry.prompt_id = "ours"
+            timing.observe_progress(self.clip, now=100)
+            registry.nodes["125"]["value"] = 4
+            timing.observe_progress(self.clip, now=110)
+        self.assertEqual(3, self.clip["timing"]["sampling"]["firstValue"])
+        self.assertEqual(4, self.clip["timing"]["sampling"]["value"])
+
+    def test_legacy_completed_take_does_not_invent_timestamps(self):
+        self.clip["status"] = "complete"
+        result = timing.public(self.clip, now=100)
+        self.assertNotIn("completedAt", result)
+        self.assertIsNone(result["elapsedSeconds"])
+
+
 class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.setup_fixture()
@@ -367,6 +449,7 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
             await self.engine.submit(self.scene, self.clip, str(server.make_url("")).rstrip("/"))
         self.assertEqual(1, len(calls))
         self.assertEqual("queued", self.clip["status"])
+        self.assertLessEqual(self.clip["timing"]["submittedAt"], self.clip["timing"]["queuedAt"])
 
     async def test_failed_next_planning_keeps_completed_take(self):
         self.clip.update(status="queued", takeId="take", jobId="job", submittedSettings=core.DEFAULTS.copy())
@@ -425,6 +508,17 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual("complete", self.clip["status"])
         self.assertEqual(b"fixture-source", self.store.path(self.clip["source"]["path"]).read_bytes())
         finalize.assert_called_once()
+        self.assertLessEqual(self.clip["timing"]["renderFinishedAt"], self.clip["timing"]["completedAt"])
+
+    async def test_queue_position_and_render_start_are_persistable(self):
+        self.clip.update(jobId="job", submittedSettings=core.DEFAULTS.copy(), status="queued", timing={"submittedAt": 100})
+        self.engine.http = AsyncMock(side_effect=[{}, {"queue_running": [], "queue_pending": [[0, "ahead"], [1, "job"]]}, {}, {"queue_running": [[1, "job"]], "queue_pending": []}])
+        await self.engine.check(self.scene, self.clip, "http://unused")
+        self.assertEqual(2, self.clip["timing"]["queuePosition"])
+        await self.engine.check(self.scene, self.clip, "http://unused")
+        self.assertEqual("rendering", self.clip["status"])
+        self.assertNotIn("queuePosition", self.clip["timing"])
+        self.assertGreater(self.clip["timing"]["renderStartedAt"], 100)
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg tools required")

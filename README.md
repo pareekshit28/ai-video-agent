@@ -41,6 +41,8 @@ Model weights are not stored in this repository or downloaded automatically when
 
 Open **AI Video Agent** in ComfyUI's sidebar for the complete project flow:
 
+The workspace has three sections: **Agent** for scripts, scene references, prompt review and rendering; **Library** for reusable project references, saved videos and previous takes with download links; and **Settings** for the Qwen model, installation checks and scene render settings. Unsaved inputs stay in place when switching sections. **Open workspace** expands the same UI into a larger window.
+
 1. Create a project and scene; paste the script.
 2. **Identify references** creates slots only. Supply the actual images and voice samples, or copy entries from the project library.
 3. **Understand references & plan clips** inspects supplied images and plans 2–15 second H3 clips. The first prompt is ready for editing; later clips keep story outlines until their preceding clip finishes.
@@ -48,6 +50,14 @@ Open **AI Video Agent** in ComfyUI's sidebar for the complete project flow:
 5. The video is saved and verified at 24 FPS, trimmed to the requested duration, and its actual last decoded frame is extracted. Qwen inspects that frame to prepare the following prompt, then pauses for review.
 
 Direct continuations use `MiniMaxH3AddGuide` at frame zero. Cuts use the preceding frame only as story context. You can replace/restore the last frame, stage a new duration while retaining the current take, and regenerate individual clips without deleting previous takes. Lost submission responses stop for recovery; resuming never implicitly creates a replacement render. Projects, references, videos, frames and request audits persist in ComfyUI's output directory under `ai_video_agent` by default. Set `AVA_STORAGE_DIR` to a RunPod volume folder if needed.
+
+### Render status and timing
+
+Version 0.4.0 adds a render monitor visible in every section, plus timing on each clip. It shows **In queue → Rendering → Saving video → Complete**, queue position, sampler steps, elapsed time, estimated finish and the actual completion timestamp. Status polls every five seconds; clocks tick every second without replacing unsaved edits or restarting a playing video.
+
+Elapsed time includes queue waiting. Full-video ETA uses the median of up to ten completed takes from the same project with matching clip duration, steps, resolution, aspect ratio and reference size. On the first matching render, the UI learns the sampler's speed and labels its estimate **Sampling**; decoding and saving still follow, so a full-video finish time is unavailable until comparable timing exists. Model loading, cache hits and GPU contention can change runtime. An exceeded estimate is shown as taking longer, never as a false zero-second countdown.
+
+Submission, execution, saving and completion timestamps persist with each take and survive reloads. Completion is recorded only after video verification and final-frame extraction succeed. Regeneration archives the original take's clock and starts a new one. Older takes without timing show that completion time was not recorded. Displayed dates use the browser's local timezone. Render settings remain editable in **Settings** and apply to the next approved take.
 
 The single workflow also exposes standalone canvas nodes:
 

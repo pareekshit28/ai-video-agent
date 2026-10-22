@@ -260,8 +260,10 @@ async def action(request):
 
 
 def public_scene(eng, scene):
+    from . import timing
     result = copy.deepcopy(scene)
     for clip in result["clips"]:
+        clip["timing"] = timing.public(clip)
         try:
             core.ensure_ready(eng.store, scene, clip)
             clip["reviewKey"] = core.approval_key(eng.store, scene, clip)

@@ -4,11 +4,12 @@ import copy
 import json
 from pathlib import Path
 import shutil
+import time
 from urllib.parse import quote
 
 import aiohttp
 
-from . import core, media as video_media, qwen
+from . import core, media as video_media, qwen, timing
 
 
 class Engine:
@@ -93,9 +94,11 @@ class Engine:
             validation = await execution.validate_prompt(prompt_id, body, None)
             if not validation[0]:
                 raise ValueError("ComfyUI rejected workflow: " + json.dumps({"error": validation[1], "nodes": validation[3]}, ensure_ascii=False)[:3000])
+            learned = timing.estimate(self.store, scene, clip)
             core.archive_take(clip)
             clip.update(takeId=take_id, status="submitting", approvedKey=reviewed_key, submittedPrompt=core.final_prompt(scene, clip),
-                        submittedSettings=copy.deepcopy(scene["settings"]), submittedReferences=copy.deepcopy(core.selected(scene, clip)), jobId=prompt_id)
+                        submittedSettings=copy.deepcopy(scene["settings"]), submittedReferences=copy.deepcopy(core.selected(scene, clip)), jobId=prompt_id,
+                        timing={"submittedAt": time.time(), **learned})
             scene["paused"] = False
             self.store.save_scene(scene)  # Durable reservation BEFORE the only submit attempt.
             request_path = self.store.scene_dir(scene["projectId"], scene["id"]) + f"/requests/{take_id}.json"
@@ -105,12 +108,14 @@ class Engine:
                     async with session.post(base_url + "/prompt", json={"prompt": body, "prompt_id": prompt_id, "client_id": "ai-video-agent"}, allow_redirects=False) as response:
                         if 400 <= response.status < 500 and response.status != 408:
                             clip.update(status="failed", error=f"Submission rejected (HTTP {response.status}); no automatic retry.")
+                            clip["timing"]["failedAt"] = time.time()
                         elif response.status != 200:
                             clip.update(status="submission-unknown", error="Submission response uncertain. Recover the existing job; do not submit again.")
                         else:
                             result = await response.json()
                             job_id = result.get("prompt_id")
                             clip.update(jobId=core.identifier(job_id), status="queued")
+                            clip["timing"]["queuedAt"] = time.time()
             except Exception:
                 clip.update(status="submission-unknown", error="Submission response lost. Check the existing job ID or recover it before another render.")
             self.store.save_scene(scene)
@@ -181,9 +186,18 @@ class Engine:
                     record = {"outputs": {"92": {"videos": [{"filename": saved.name, "subfolder": str(saved.parent.relative_to(self.output_dir)), "type": "output"}]}}}
                 else:
                     clip["status"] = "rendering" if running else "queued"
+                    clock = clip.setdefault("timing", {})
+                    if running:
+                        clock.setdefault("renderStartedAt", time.time())
+                        clock.pop("queuePosition", None)
+                        timing.observe_progress(clip)
+                    else:
+                        clock["queuePosition"] = next(i + 1 for i, row in enumerate(queue.get("queue_pending", [])) if row[1] == job_id)
                     return
+            timing.history_times(clip, record)
             if record.get("status", {}).get("status_str") == "error":
                 clip.update(status="failed", error="ComfyUI execution failed. Inspect its queue error, then explicitly regenerate.")
+                clip.setdefault("timing", {})["failedAt"] = time.time()
                 return
             files = []
             for output in record.get("outputs", {}).values():
@@ -202,6 +216,11 @@ class Engine:
             await asyncio.to_thread(shutil.copyfile, source, self.store.path(relative))
             clip["source"] = {"path": relative, "name": source.name}
         clip["status"] = "saving"
+        clock = clip.setdefault("timing", {})
+        clock.setdefault("renderFinishedAt", time.time())
+        clock.setdefault("savingStartedAt", time.time())
+        clock.pop("queuePosition", None)
         self.store.save_scene(scene)
         clip.update(await asyncio.to_thread(video_media.finalize, self.store, scene, clip))
+        clock["completedAt"] = time.time()
         clip.pop("error", None)

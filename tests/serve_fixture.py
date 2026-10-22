@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 import types
 
 from aiohttp import web
@@ -65,6 +66,31 @@ async def post_prompt(request):
     return web.json_response({"prompt_id": body["prompt_id"]})
 @routes.get("/test/submissions")
 async def get_submissions(request): return web.json_response(submissions)
+@routes.post("/test/phase")
+async def render_phase(request):
+    body = await request.json()
+    project = eng.store.projects()[0]
+    scene = eng.store.scenes(project["id"])[0]
+    clip = scene["clips"][0]
+    now = time.time()
+    clock = clip.setdefault("timing", {})
+    if body["phase"] == "rendering":
+        scene["paused"] = False
+        clip["status"] = "rendering"
+        clock.update(renderStartedAt=now - 30, expectedRenderSeconds=180, expectedSaveSeconds=45, estimateSamples=2,
+                     sampling={"value": 3, "total": 8, "firstValue": 1, "firstObservedAt": now - 20, "observedAt": now})
+    elif body["phase"] == "saving":
+        clip["status"] = "saving"
+        clock.update(renderFinishedAt=now, savingStartedAt=now)
+    elif body["phase"] == "complete":
+        relative = eng.store.scene_dir(project["id"], scene["id"]) + "/fixture-source.mp4"
+        await asyncio.to_thread(package.media.command, ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"testsrc2=size=256x256:rate=24:duration={clip['duration']}", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(eng.store.path(relative))])
+        clip["source"] = {"path": relative, "name": "fixture-source.mp4"}
+        await eng.check(scene, clip, "http://unused")
+        scene["paused"] = True
+        queue.clear()
+    eng.store.save_scene(scene)
+    return web.json_response({"ok": True})
 @routes.post("/test/reset")
 async def reset_fixture(request):
     queue.clear()
@@ -85,6 +111,8 @@ async def api_js(request):
     return web.Response(content_type="application/javascript", text="export const api={fetchApi:(path,options)=>fetch(path,options),apiURL:path=>path};")
 @routes.get("/extensions/ava/agent.js")
 async def agent_js(request): return web.FileResponse(PACKAGE / "web/agent.js")
+@routes.get("/extensions/ava/agent.css")
+async def agent_css(request): return web.FileResponse(PACKAGE / "web/agent.css")
 @routes.get("/")
 async def index(request):
     return web.Response(content_type="text/html", text='<title>ComfyUI fixture</title><div id="sidebar" style="height:100vh"></div><script type="module" src="/extensions/ava/agent.js"></script>')
