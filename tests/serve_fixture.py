@@ -43,15 +43,10 @@ planning_fixture = {"delay": 0, "fail": False, "calls": 0}
 
 
 def styled_prompt(refs, action):
-    description = "Live-action, warm sunrise light. [Shot 1] Static shot, camera locked off; no camera movement. " + action + " No dialogue."
-    if refs:
-        prompt = ("subject_definitions: " + "\n".join(f"{r['name']} {r.get('subjectLabel') or ''} follows the supplied reference." for r in refs) +
-                  "\nsummary: [reference generation] Woman opens the window and watches the sunrise.\n" +
-                  "retention_analysis: " + "\n".join(f"{r.get('subjectLabel') or r['name']}: fully_preserved - supplied visual identity." for r in refs) +
-                  "\ndetailed_description: " + description)
-    else:
-        prompt = "integrated_multimodal_description: " + description
-    prompt += "\noverall_soundscape: A window latch clicks over soft room ambience.\nnon_diegetic_music: N/A"
+    prompt = " ".join(f"{r['name']} {r.get('subjectLabel') or ''} follows the supplied reference." for r in refs)
+    prompt += " Live-action, warm sunrise light. Static shot, camera locked off; no camera movement. " + action
+    prompt += " A window latch clicks over soft room ambience. No dialogue or music."
+    prompt = prompt.strip()
     return package.qwen.h3_prompt.validate(prompt, refs, 15)
 
 

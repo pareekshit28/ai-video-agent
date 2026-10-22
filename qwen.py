@@ -38,20 +38,20 @@ Only the first clip has transition 'first'. Write a final video prompt ONLY for 
 prompt field is a story outline with full dialogue; its generation prompt must wait for the actual prior
 frame. Use 'continue' only for continuous action, otherwise respect the required cut or scene change.
 Fit every clip's action and dialogue into its planned duration. At most 40 clips. For the first clip,
-apply the H3 prompt contract: return ONE prompt string containing the six Ref2VA headings if its
-referenceIds select supplied references, otherwise the three T2VA headings. Fill every section inside
-that string. Other prompt fields stay concise story outline strings, not final H3 prompts.
+return ONE complete natural-language generation prompt with no required headings or tags. Describe
+the scene and action using selected references' names. Other prompt fields stay concise story outline
+strings, not final H3 prompts.
 Split lengthy speech at sentence boundaries, allowing natural pauses and reactions."""
 
 PROMPT = """Write only the target clip's generation prompt. Return {"prompt":string}, with ONE complete
-prompt containing all H3 headings for h3Prompting.mode inside the string. Inspect the final
+natural-language prompt. No section headings, shot labels or dialogue tags are required. Inspect the final
 attachment when previousFrameAttachment is provided. Adapt to observed positions, poses, held objects,
 lighting, facing and composition, and to the preceding submitted prompt and actual duration. Do not repeat
 completed story beats. If continuation is true begin seamlessly from this frame; otherwise respect the
 deliberate cut/scene change and use it as story context only. Preserve target duration and references.
 Apply comments to the editable prompt, preserving exact scripted dialogue unless explicitly changed.
 Do not invent references. A still image is not evidence of events or words elsewhere in the prior clip.
-Fit action and dialogue into the target duration. Follow the H3 prompt contract for the complete revised
+Fit action and dialogue into the target duration. Follow the H3 prompt guidance for the complete revised
 prompt even if the existing draft uses an older format. Keep its requested content, not its old layout."""
 
 
@@ -107,14 +107,12 @@ async def ask(store, instruction, payload, images=(), model_file=None):
                 "preserveDialogueAndActions": True}
     system = DIRECTOR + "\n" + instruction + ("\n" + h3_prompt.RULES if styled else "")
     for attempt in range(2 if styled else 1):
-        required_fields = None if instruction == PLAN else (h3_prompt.REF_FIELDS if references else h3_prompt.BASE_FIELDS)
         generated = await asyncio.to_thread(local_qwen.generate, conf["model"], system, json.dumps(request_payload, ensure_ascii=False), images)
         try:
             result = parse_json(generated)
             if instruction == PLAN:
                 first = result["clips"][0]
                 selected = [r for r in references if r["id"] in first["referenceIds"]]
-                required_fields = h3_prompt.REF_FIELDS if selected else h3_prompt.BASE_FIELDS
                 first["prompt"] = h3_prompt.normalize(first["prompt"], selected, first["duration"])
             elif instruction == PROMPT:
                 target = payload.get("target", {})
@@ -126,9 +124,7 @@ async def ask(store, instruction, payload, images=(), model_file=None):
             if attempt:
                 raise ValueError(f"Qwen could not produce a valid H3 prompt: {error}. Retry Plan prompt or revise the draft.") from error
             request_payload["formatRepair"] = {"error": str(error), "previousResponse": generated[:16000],
-                "instruction": "Return corrected JSON with ONE complete prompt string. Include requiredPromptFields as headings inside the string when supplied, otherwise choose headings from promptFieldsByMode using the first clip's selected referenceIds. Fill each section. Fix the reported section/shot/dialogue issue. Preserve script, selected references, duration, later outlines and exact dialogue; add no new story content."}
-            if required_fields is not None:
-                request_payload["formatRepair"]["requiredPromptFields"] = list(required_fields)
+                "instruction": "Return corrected JSON with ONE complete natural-language prompt string. Fix only the reported JSON, empty-text, length or reference-binding issue. No section headings, shot labels, speaker IDs or dialogue tags are required. Preserve script, selected references, duration, later outlines and exact dialogue; add no new story content."}
 
 
 def reference_context(store, scene, refs=None):
