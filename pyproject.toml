@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-ai-video-agent"
-version = "0.7.0"
+version = "0.7.1"
 description = "Native ComfyUI Qwen-VL planning and reviewed sequential H3 video production"
 requires-python = ">=3.10"
 dependencies = ["aiohttp>=3.10,<4", "Pillow>=10", "numpy>=1.26"]

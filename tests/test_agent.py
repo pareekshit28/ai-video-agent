@@ -41,6 +41,8 @@ REF_PROMPT = ("subject_definitions: Actor <Subject 1> follows the supplied appea
               "detailed_description: Live-action. [Shot 1] Static medium shot of Actor <Subject 1> opening a door. "
               "Actor (S1) says with synchronized lips: <d>[English] Hello.</d>\n"
               "overall_soundscape: The latch clicks over quiet room ambience.\nnon_diegetic_music: N/A")
+REF_SECTIONS = dict(line.split(": ", 1) for line in REF_PROMPT.splitlines())
+BASE_SECTIONS = dict(line.split(": ", 1) for line in BASE_PROMPT.splitlines())
 
 
 class OriginPolicyTests(unittest.TestCase):
@@ -107,6 +109,38 @@ class H3PromptTests(Fixture, unittest.TestCase):
         self.assertEqual(hindi, h3_prompt.validate(hindi, refs, 15))
         with self.assertRaisesRegex(ValueError, "sections"):
             h3_prompt.validate(BASE_PROMPT, refs, 15)
+
+    def test_normalizes_complete_section_objects_and_formatted_text_without_changing_content(self):
+        refs, _ = qwen.reference_context(self.store, self.scene)
+        for prompt, sections, selected in ((BASE_PROMPT, BASE_SECTIONS, []), (REF_PROMPT, REF_SECTIONS, refs)):
+            variants = [dict(reversed(list(sections.items())))]
+            for template in ("### {field}: {body}", "**{field}:** {body}", "**{field}**: {body}",
+                             "{field}\n{body}", "## {field}\n{body}"):
+                variants.append("```text\n" + "\n".join(template.format(field=field.replace("_", " ").title(), body=body)
+                                for field, body in reversed(list(sections.items()))) + "\n```")
+            for value in variants:
+                with self.subTest(value=value):
+                    self.assertEqual(prompt, h3_prompt.normalize(value, selected, 15))
+
+    def test_normalization_rejects_missing_duplicate_foreign_and_empty_sections(self):
+        refs, _ = qwen.reference_context(self.store, self.scene)
+        invalid = [(REF_PROMPT.replace("retention_analysis:", "retention_notes:"), "missing: retention_analysis"),
+                   (REF_PROMPT + "\nsummary: Another summary.", "duplicate: summary"),
+                   (BASE_SECTIONS, "missing: subject_definitions"),
+                   ({**REF_SECTIONS, "non_diegetic_music": ""}, "Fill every"),
+                   ({**REF_SECTIONS, "non_diegetic_music": ["N/A"]}, "string"),
+                   ({**REF_SECTIONS, "extra": "discarding this could lose story content"}, "unexpected: extra"),
+                   ("Here is the prompt:\n" + REF_PROMPT, "before the first"),
+                   ({**REF_SECTIONS, "detailed_description": REF_SECTIONS["detailed_description"].replace("<Subject 1>", "<Subject 2>")}, "Subject labels")]
+        for value, message in invalid:
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, message):
+                h3_prompt.normalize(value, refs, 15)
+
+    def test_normalization_preserves_markdown_dialogue_and_soundscape_content(self):
+        refs, _ = qwen.reference_context(self.store, self.scene)
+        prompt = REF_PROMPT.replace("[English] Hello.", "[Hindi] **दरवाज़ा खुला है।**").replace("overall_soundscape: The", "overall_soundscape: **Soft** sounds. The")
+        decorated = "\n".join("**" + line.replace(":", ":**", 1) for line in prompt.splitlines())
+        self.assertEqual(prompt, h3_prompt.normalize(decorated, refs, 15))
 
     def test_reordered_reference_inputs_keep_subject_identity_and_bind_real_media(self):
         self.scene["references"].insert(0, {"id": "room", "name": "Room", "kind": "location", "description": "Room", "assets": [self.asset]})
@@ -692,12 +726,13 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
     async def test_planning_minimizes_clips_and_validates_only_selected_reference_mode(self):
         refs, _ = qwen.reference_context(self.store, self.scene)
         plan = {"clips": [{"id": "single", "title": "Complete scene", "duration": 15,
-                           "referenceIds": [], "transition": "first", "prompt": BASE_PROMPT}]}
+                           "referenceIds": [], "transition": "first", "prompt": BASE_SECTIONS}]}
         payload = {"script": "Actor opens a door and says Hello.", "suppliedReferences": refs}
         with patch.object(local_qwen, "generate", return_value=json.dumps(plan)) as generate:
             result = await qwen.ask(self.store, qwen.PLAN, payload)
         clean = core.validate_plan(self.scene, result)
         self.assertEqual(1, len(clean))
+        self.assertEqual(BASE_PROMPT, clean[0]["prompt"])
         self.assertEqual(15, clean[0]["duration"])
         sent = json.loads(generate.call_args.args[2])
         policy = sent["h3Prompting"]["clipPlanning"]
@@ -715,6 +750,21 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(plan, await qwen.ask(self.store, qwen.PLAN, {"suppliedReferences": refs}))
         generate.assert_called_once()
 
+    async def test_structured_plan_and_prompt_are_assembled_before_saving(self):
+        refs, paths = qwen.reference_context(self.store, self.scene)
+        plan = {"clips": [{"id": "first", "duration": 15, "referenceIds": ["actor"], "prompt": dict(reversed(list(REF_SECTIONS.items())))},
+                          {"id": "later", "duration": 6, "referenceIds": ["actor"], "prompt": "Unchanged later outline."}]}
+        with patch.object(local_qwen, "generate", return_value=json.dumps(plan)) as generate:
+            result = await qwen.ask(self.store, qwen.PLAN, {"suppliedReferences": refs}, paths)
+        self.assertEqual(REF_PROMPT, result["clips"][0]["prompt"])
+        self.assertEqual(plan["clips"][1], result["clips"][1])
+        generate.assert_called_once()
+        for sections, selected, expected in ((BASE_SECTIONS, [], BASE_PROMPT), (REF_SECTIONS, refs, REF_PROMPT)):
+            with patch.object(local_qwen, "generate", return_value=json.dumps({"prompt": sections})) as generate:
+                result = await qwen.ask(self.store, qwen.PROMPT, {"references": selected, "target": {"duration": 15}})
+            self.assertEqual(expected, result["prompt"])
+            generate.assert_called_once()
+
     async def test_h3_format_repair_once_preserves_source_payload_and_reference_binding(self):
         refs, _ = qwen.reference_context(self.store, self.scene)
         payload = {"script": "Actor says Hello.", "references": refs, "frameGuideEnabled": True, "target": {"duration": 15}}
@@ -730,6 +780,31 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn("Old unstructured draft", sent["formatRepair"]["previousResponse"])
         self.assertNotIn("formatRepair", payload)
         self.assertEqual(2, generate.call_count)
+
+    async def test_missing_section_repair_supplies_exact_fields_and_specific_diagnostic(self):
+        refs, _ = qwen.reference_context(self.store, self.scene)
+        incomplete = {key: value for key, value in REF_SECTIONS.items() if key != "retention_analysis"}
+        payload = {"script": "Actor says Hello.", "references": refs, "target": {"duration": 15}}
+        with patch.object(local_qwen, "generate", side_effect=[json.dumps({"prompt": incomplete}), json.dumps({"prompt": REF_SECTIONS})]) as generate:
+            result = await qwen.ask(self.store, qwen.PROMPT, payload)
+        self.assertEqual(REF_PROMPT, result["prompt"])
+        repaired = json.loads(generate.call_args.args[2])["formatRepair"]
+        self.assertIn("missing: retention_analysis", repaired["error"])
+        self.assertEqual(list(h3_prompt.REF_FIELDS), repaired["requiredPromptFields"])
+        self.assertNotIn("formatRepair", payload)
+        self.assertEqual(2, generate.call_count)
+
+    async def test_plan_repair_uses_first_selected_mode_even_with_other_available_references(self):
+        refs, _ = qwen.reference_context(self.store, self.scene)
+        for selected, sections, fields in (([], BASE_SECTIONS, h3_prompt.BASE_FIELDS), (["actor"], REF_SECTIONS, h3_prompt.REF_FIELDS)):
+            incomplete = {key: value for key, value in sections.items() if key != "overall_soundscape"}
+            clip = {"id": "first", "duration": 15, "referenceIds": selected}
+            with patch.object(local_qwen, "generate", side_effect=[json.dumps({"clips": [{**clip, "prompt": incomplete}]}),
+                                                                       json.dumps({"clips": [{**clip, "prompt": sections}]})]) as generate:
+                await qwen.ask(self.store, qwen.PLAN, {"suppliedReferences": refs})
+            repaired = json.loads(generate.call_args.args[2])["formatRepair"]
+            self.assertEqual(list(fields), repaired["requiredPromptFields"])
+            self.assertIn("missing: overall_soundscape", repaired["error"])
 
     async def test_repeated_bad_format_stops_with_actionable_error(self):
         with patch.object(local_qwen, "generate", return_value="Use the workflow") as generate:

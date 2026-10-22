@@ -1,22 +1,30 @@
 """H3 prompt-writing contract, adapted to this node pack's actual media binding."""
 import re
 
-VERSION = "h3-official-2026-10-22"
+VERSION = "h3-official-2026-10-22.1"
 BASE_FIELDS = ("integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
 REF_FIELDS = ("subject_definitions", "summary", "retention_analysis", "detailed_description", "overall_soundscape", "non_diegetic_music")
 FIELDS = re.compile(r"(?m)^\s*(" + "|".join(dict.fromkeys(BASE_FIELDS + REF_FIELDS)) + r")\s*:\s*")
+FIELD_NAMES = "|".join(field.replace("_", r"[ _-]+") for field in dict.fromkeys(BASE_FIELDS + REF_FIELDS))
+FORMATTED_FIELDS = re.compile(
+    r"(?mi)^[ \t]*(?:#{1,6}[ \t]+)?(?:"
+    r"(?P<mark>\*\*|__|`)(?P<marked>" + FIELD_NAMES + r")[ \t]*"
+    r"(?::(?P=mark)|(?P=mark)[ \t]*(?::|(?=\r?$)))"
+    r"|(?P<plain>" + FIELD_NAMES + r")[ \t]*(?::|(?=\r?$)))")
 SUBJECT = re.compile(r"<Subject\s+(\d+)>")
 ASSET = re.compile(r"<(?:Picture|Audio|Video)\s*\d+>", re.I)
 SHOT = re.compile(r"\[Shot\s+(\d+)\]")
 CUT = re.compile(r"^\s*At\s+(\d{2}):([0-5]\d)\.(\d{3}),")
 
 RULES = """H3 PROMPT CONTRACT (apply to final prompts, not reference discovery or later-clip outlines):
-The outer response is still the requested JSON object. Each prompt value contains plain text, with
-newlines escaped correctly in JSON. Write descriptions in English; preserve the original language of
+The outer response is still the requested JSON object. For each final prompt, return its prompt value
+as a JSON object with the section names below as keys and nonempty text as their values. The host
+assembles the headings in H3 order; do not put headings or Markdown fences inside the values. Escape
+newlines correctly in JSON. Later-clip outlines remain strings. Write descriptions in English; preserve the original language of
 dialogue, lyrics and visible text. Use h3Prompting.mode and the reference manifest. For planning,
 choose the first prompt's mode from that clip's selected referenceIds, not all available references.
 
-REF2VA: Write these six headings, once each, in this order:
+REF2VA: Use these six section keys, once each. The host writes the headings in this order:
 subject_definitions: define selected named references, their supplied subjectLabel when present,
 and the visible characteristics actually supported by the images. A subjectLabel is a reusable
 person/place/prop, not a frame anchor. For voice-only inputs describe the named vocal source without
@@ -79,7 +87,44 @@ def subject_labels(scene):
 
 def context(references, frame_guide=False):
     return {"version": VERSION, "mode": "ref2va" if references else "t2va", "frameGuide": bool(frame_guide),
+            "promptFieldsByMode": {"ref2va": list(REF_FIELDS), "t2va": list(BASE_FIELDS)},
             "assetBinding": "Host assigns actual Picture/Audio indices in Reference; never guess them."}
+
+
+def check_fields(names, expected):
+    missing = [field for field in expected if field not in names]
+    duplicate = [field for field in dict.fromkeys(names) if names.count(field) > 1]
+    unexpected = [field for field in dict.fromkeys(names) if field not in expected]
+    issues = [label + ": " + ", ".join(values) for label, values in
+              (("missing", missing), ("duplicate", duplicate), ("unexpected", unexpected)) if values]
+    if issues:
+        raise ValueError("H3 sections: " + "; ".join(issues) + ". Required: " + ", ".join(expected))
+
+
+def normalize(prompt, references, duration=None):
+    """Assemble complete sections without inventing content or rewriting dialogue."""
+    expected = REF_FIELDS if references else BASE_FIELDS
+    if isinstance(prompt, dict):
+        check_fields(list(prompt), expected)
+        if any(not isinstance(value, str) for value in prompt.values()):
+            raise ValueError("Each H3 section must contain a string")
+        parts = prompt
+    elif isinstance(prompt, str):
+        prompt = prompt.strip()
+        # Only remove a fence enclosing the entire prompt, never section content.
+        fence = re.fullmatch(r"```(?:text|plaintext|markdown|yaml)?[ \t]*\r?\n(.*?)\r?\n```", prompt, re.S | re.I)
+        if fence:
+            prompt = fence[1]
+        matches = list(FORMATTED_FIELDS.finditer(prompt))
+        names = [re.sub(r"[ _-]+", "_", m["marked"] or m["plain"]).lower() for m in matches]
+        check_fields(names, expected)
+        if prompt[:matches[0].start()].strip():
+            raise ValueError("Leave commentary out of the H3 prompt before the first section")
+        parts = {name: prompt[m.end():matches[i + 1].start() if i + 1 < len(matches) else len(prompt)]
+                 for i, (name, m) in enumerate(zip(names, matches))}
+    else:
+        raise ValueError("H3 prompt must be section text or an object of section strings")
+    return validate("\n".join(field + ": " + parts[field].strip() for field in expected), references, duration)
 
 
 def validate(prompt, references, duration=None):
@@ -90,6 +135,7 @@ def validate(prompt, references, duration=None):
         raise ValueError("Leave media indices and Reference to the host")
     matches = list(FIELDS.finditer(prompt))
     expected = REF_FIELDS if references else BASE_FIELDS
+    check_fields([m.group(1) for m in matches], expected)
     if tuple(m.group(1) for m in matches) != expected or prompt[:matches[0].start()].strip():
         raise ValueError("Use H3 sections in this order: " + ", ".join(expected))
     parts = {m.group(1): prompt[m.end():matches[i + 1].start() if i + 1 < len(matches) else len(prompt)].strip() for i, m in enumerate(matches)}

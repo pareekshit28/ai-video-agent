@@ -55,6 +55,8 @@ Direct continuations use `MiniMaxH3AddGuide` at frame zero. Cuts use the precedi
 
 Version 0.7.0 follows MiniMax's current H3 prompt guides: six sections for reference-based generation, three without references, explicit shot cuts and speaker/language tags, and separate ambience/music fields. Exact scripted dialogue, named references and frame continuity remain part of the contract. Qwen aims to fit a scene into one clip when practical, otherwise groups beats into fewer clips up to 15 seconds without rushing or dropping content. The app checks prompt structure and attempts one formatting repair before reporting an error.
 
+Version 0.7.1 fixes false section-order failures: Qwen supplies named section values and the host assembles the required headings. Complete text drafts also accept Markdown headings, title case, spaces/hyphens and reordered sections. Missing or duplicate sections still fail with specific diagnostics; a retry receives the exact required fields. Section content and dialogue are preserved. Replace the node pack, restart ComfyUI, then retry **Plan prompt** or **Apply comments with Qwen** on the affected draft.
+
 Use **Replan / optimize unsubmitted clips** to apply the fewer-clip policy before any takes are submitted. Existing rendered plans stay preserved; use a new scene to replan them. **Plan prompt** or **Apply comments with Qwen** applies the new H3 format to one draft. See [H3 prompting notes and official sources](docs/H3_PROMPTING.md) for reference binding, examples and validation limits.
 
 ### Projects, episodes and scenes
