@@ -31,7 +31,7 @@ class Engine:
             self.store.save_scene(scene)
         return job
 
-    def start_planning(self, scene, command, base, clip_id=None, comments="", request_id=None):
+    def start_planning(self, scene, command, base, clip_id=None, comments="", request_id=None, automatic=False):
         """Called under the scene lock. Persist acceptance before returning HTTP 202."""
         if command not in ("identify", "plan", "planPrompt", "revisePrompt"):
             raise ValueError("Unknown planning action")
@@ -52,7 +52,7 @@ class Engine:
                 raise ValueError("Complete the preceding clip first; its real final frame is required")
         if any(c["status"] in core.ACTIVE for c in scene["clips"]):
             raise ValueError("Finish or recover this scene's active render before Codex planning")
-        job = {"id": request_id, "status": "running", "startedAt": time.time(), "inputs": inputs}
+        job = {"id": request_id, "status": "running", "startedAt": time.time(), "inputs": inputs, "automatic": automatic}
         scene["planning"] = job
         self.store.save_scene(scene)
         self.planning_tasks[scene["id"]] = asyncio.create_task(self._run_planning(copy.deepcopy(scene), base))
@@ -69,6 +69,8 @@ class Engine:
             else:
                 clip = next(c for c in scene["clips"] if c["id"] == inputs["clipId"])
                 await self.plan_prompt(scene, clip, base, inputs["comments"])
+                if clip.get("error", "").startswith("Prompt planning needs retry:"):
+                    clip.pop("error", None)
             job["status"] = "complete"
         except asyncio.CancelledError:
             job.update(status="failed", error="Codex planning was interrupted. Restart ComfyUI before retrying.")
@@ -90,6 +92,9 @@ class Engine:
                             self.store.save_scene(scene)
                         else:
                             saved["planning"] = job
+                            if job.get("automatic") and job["inputs"].get("clipId"):
+                                following = next(c for c in saved["clips"] if c["id"] == job["inputs"]["clipId"])
+                                following["error"] = "Prompt planning needs retry: " + job["error"]
                             self.store.save_scene(saved)
             finally:
                 self.planning_tasks.pop(scene["id"], None)
@@ -142,7 +147,20 @@ class Engine:
         if core.TAGS.search(prompt):
             raise ValueError("Codex returned numbered media tags; retry prompt planning")
         clip.update(prompt=prompt, promptContext=core.prompt_context(self.store, scene, clip))
+        clip.pop("frameAnalysis", None)
+        if prior and isinstance(result.get("frameAnalysis"), str) and result["frameAnalysis"].strip():
+            clip["frameAnalysis"] = core.text(result["frameAnalysis"][:4000], 4000)
         clip.pop("approvedKey", None)
+
+    def prepare_following(self, scene, clip, base_url):
+        """Persist the finished take, then inspect its frame in a separate planning task."""
+        core.invalidate_following(scene, clip)
+        self.store.save_scene(scene)
+        index = scene["clips"].index(clip)
+        if index + 1 < len(scene["clips"]) and not any(c["status"] in core.ACTIVE for c in scene["clips"]):
+            following = scene["clips"][index + 1]
+            if not following.get("takeId"):
+                self.start_planning(scene, "planPrompt", base_url, following["id"], automatic=True)
 
     async def submit(self, scene, clip, base_url):
         async with self.submit_lock:
@@ -162,11 +180,10 @@ class Engine:
             validation = await execution.validate_prompt(prompt_id, body, None)
             if not validation[0]:
                 raise ValueError("ComfyUI rejected workflow: " + json.dumps({"error": validation[1], "nodes": validation[3]}, ensure_ascii=False)[:3000])
-            learned = timing.estimate(self.store, scene, clip)
             core.archive_take(clip)
             clip.update(takeId=take_id, status="submitting", approvedKey=reviewed_key, submittedPrompt=core.final_prompt(scene, clip),
                         submittedSettings=copy.deepcopy(scene["settings"]), submittedReferences=copy.deepcopy(core.selected(scene, clip)), jobId=prompt_id,
-                        timing={"submittedAt": time.time(), **learned})
+                        timing={"submittedAt": time.time()})
             scene["paused"] = False
             self.store.save_scene(scene)  # Durable reservation BEFORE the only submit attempt.
             request_path = self.store.scene_dir(scene["projectId"], scene["id"]) + f"/requests/{take_id}.json"
@@ -212,19 +229,8 @@ class Engine:
                         self.store.save_scene(scene)
                         return
                     if clip["status"] == "complete":
-                        core.invalidate_following(scene, clip)
                         scene["paused"] = True
-                        self.store.save_scene(scene)
-                        index = scene["clips"].index(clip)
-                        if index + 1 < len(scene["clips"]):
-                            following = scene["clips"][index + 1]
-                            if not following.get("takeId"):
-                                try:
-                                    await self.plan_prompt(scene, following, base_url)
-                                    following.pop("error", None)
-                                except Exception as error:
-                                    following["error"] = "Prompt planning needs retry: " + str(error)
-                                self.store.save_scene(scene)
+                        self.prepare_following(scene, clip, base_url)
                         return  # Never implicitly approve another clip.
                     if clip["status"] == "failed":
                         return

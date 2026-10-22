@@ -449,17 +449,13 @@ class TimingTests(Fixture, unittest.TestCase):
     def setUp(self): self.setup_fixture()
     def tearDown(self): self.teardown_fixture()
 
-    def test_estimates_use_median_of_matching_takes_and_exclude_queue_time(self):
-        sample = {**copy.deepcopy(self.clip), "status": "complete", "takeId": "prior", "submittedSettings": core.DEFAULTS.copy(),
-                  "timing": {"submittedAt": 1, "renderStartedAt": 100, "renderFinishedAt": 200, "completedAt": 210}}
-        self.clip["versions"] = [sample, {**copy.deepcopy(sample), "timing": {"renderStartedAt": 200, "renderFinishedAt": 400, "completedAt": 420}},
-                                 {**copy.deepcopy(sample), "duration": 10},
-                                 {**copy.deepcopy(sample), "submittedSettings": {**core.DEFAULTS, "steps": 40}},
-                                 {**copy.deepcopy(sample), "status": "failed"}]
-        self.store.save_scene(self.scene)
-        self.assertEqual({"expectedRenderSeconds": 150, "expectedSaveSeconds": 15, "estimateSamples": 2}, timing.estimate(self.store, self.scene, self.clip))
-        self.clip["nextDuration"] = 8
-        self.assertEqual({}, timing.estimate(self.store, self.scene, self.clip))
+    def test_sampling_eta_overrides_legacy_full_render_and_saving_estimates(self):
+        self.clip.update(status="rendering", timing={"renderStartedAt": 50, "expectedRenderSeconds": 500, "expectedSaveSeconds": 100,
+            "sampling": {"firstValue": 1, "value": 3, "total": 8, "firstObservedAt": 100, "observedAt": 120}})
+        result = timing.public(self.clip, now=125)
+        self.assertEqual(45, result["remainingSeconds"])
+        self.assertEqual("sampling", result["etaKind"])
+        self.assertIsNone(result["estimatedCompletionAt"])
 
     def test_regeneration_archives_timestamps_and_resets_current_clock(self):
         self.clip.update(takeId="old", timing={"completedAt": 200})
@@ -478,12 +474,13 @@ class TimingTests(Fixture, unittest.TestCase):
         self.assertEqual(50, result["elapsedSeconds"])
         self.assertIsNone(result["estimatedCompletionAt"])
 
-    def test_render_eta_and_saving_eta_then_actual_completion(self):
+    def test_loading_and_saving_have_no_eta_then_actual_completion_is_recorded(self):
         self.clip.update(status="rendering", timing={"submittedAt": 50, "renderStartedAt": 100, "expectedRenderSeconds": 100, "expectedSaveSeconds": 10})
-        self.assertEqual(60, timing.public(self.clip, now=150)["remainingSeconds"])
+        self.assertIsNone(timing.public(self.clip, now=150)["remainingSeconds"])
         self.clip.update(status="saving")
         self.clip["timing"]["savingStartedAt"] = 200
-        self.assertEqual(5, timing.public(self.clip, now=205)["remainingSeconds"])
+        self.assertIsNone(timing.public(self.clip, now=205)["remainingSeconds"])
+        self.assertIsNone(timing.public(self.clip, now=205)["estimatedCompletionAt"])
         self.clip.update(status="complete")
         self.clip["timing"]["completedAt"] = 215
         result = timing.public(self.clip, now=999)
@@ -492,9 +489,9 @@ class TimingTests(Fixture, unittest.TestCase):
         self.assertEqual(215, result["completedAt"])
 
     def test_overdue_estimate_does_not_promise_zero_remaining(self):
-        self.clip.update(status="rendering", timing={"renderStartedAt": 100, "expectedRenderSeconds": 50})
-        result = timing.public(self.clip, now=200)
-        self.assertEqual("overdue", result["etaKind"])
+        self.clip.update(status="rendering", timing={"sampling": {"firstValue": 1, "value": 3, "total": 4, "firstObservedAt": 100, "observedAt": 120}})
+        result = timing.public(self.clip, now=135)
+        self.assertIsNone(result["etaKind"])
         self.assertIsNone(result["remainingSeconds"])
 
     def test_first_render_uses_measured_sampler_rate_and_stale_rate_expires(self):
@@ -504,6 +501,8 @@ class TimingTests(Fixture, unittest.TestCase):
         self.assertEqual("sampling", result["etaKind"])
         self.assertIsNone(result["estimatedCompletionAt"], "sampler rate must not promise a full-video finish")
         self.assertIsNone(timing.public(self.clip, now=160)["remainingSeconds"])
+        self.clip["timing"]["sampling"]["value"] = 8
+        self.assertIsNone(timing.public(self.clip, now=125)["remainingSeconds"], "decoding must not inherit a sampling ETA")
 
     def test_progress_from_another_job_is_ignored(self):
         self.clip.update(jobId="ours", timing={})
@@ -579,10 +578,53 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.engine.check = complete
         self.engine.plan_prompt = AsyncMock(side_effect=ValueError("Codex unavailable"))
         await self.engine.monitor(self.project["id"], self.scene["id"], "http://unused")
+        await self.engine.planning_tasks[self.scene["id"]]
         saved = self.store.scene(self.project["id"], self.scene["id"])
         self.assertEqual("complete", saved["clips"][0]["status"])
         self.assertEqual("saved.mp4", saved["clips"][0]["video"]["path"])
         self.assertIn("Codex unavailable", saved["clips"][1]["error"])
+
+    async def test_completed_clip_optimizes_next_prompt_from_actual_frame_without_holding_scene_lock(self):
+        path = self.store.path(f"projects/{self.project['id']}/actual-last-frame.png")
+        Image.new("RGB", (256,256), "blue").save(path)
+        frame = {"path": str(path.relative_to(self.store.root)), "kind":"image", "name":path.name}
+        self.clip.update(status="queued", takeId="take", jobId="job", submittedSettings=core.DEFAULTS.copy(), submittedPrompt="Actor opens the door.")
+        self.scene["paused"] = False
+        self.store.save_scene(self.scene)
+        async def complete(scene, clip, base):
+            clip.update(status="complete", frame=frame, video={"path":"saved.mp4"}, actualDuration=5)
+        self.engine.check = complete
+        started, finish = asyncio.Event(), asyncio.Event()
+        async def inspect(base, instruction, payload, images, project_id=None):
+            self.assertFalse(self.engine.lock(self.scene["id"]).locked())
+            self.assertEqual([self.store.path(self.asset["path"]), path], images)
+            self.assertEqual(2, payload["previousFrameAttachment"])
+            self.assertEqual("Actor opens the door.", payload["previous"]["prompt"])
+            started.set()
+            await finish.wait()
+            return {"frameAnalysis":"Actor is already at the open door; continue from that position.", "prompt":"Actor stays at the open door and says Hello."}
+        self.engine.ask = inspect
+        self.engine.submit = AsyncMock()
+        await self.engine.monitor(self.project["id"], self.scene["id"], "http://unused")
+        task = self.engine.planning_tasks[self.scene["id"]]
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            saved = self.store.scene(self.project["id"], self.scene["id"])
+            self.assertTrue(saved["planning"]["automatic"])
+            self.assertEqual("running", saved["planning"]["status"])
+            self.assertEqual("saved.mp4", saved["clips"][0]["video"]["path"])
+            self.assertEqual("", saved["clips"][1]["prompt"])
+            finish.set()
+            await task
+            saved = self.store.scene(self.project["id"], self.scene["id"])
+            self.assertEqual("complete", saved["planning"]["status"])
+            self.assertEqual("awaiting-approval", saved["clips"][1]["status"])
+            self.assertIn("open door", saved["clips"][1]["frameAnalysis"])
+            self.assertEqual(core.prompt_context(self.store,saved,saved["clips"][1]), saved["clips"][1]["promptContext"])
+            self.engine.submit.assert_not_awaited()
+        finally:
+            finish.set()
+            await task
 
     async def test_codex_json_uses_selected_model_and_images_through_bridge(self):
         paths = [self.store.path(self.asset["path"])]

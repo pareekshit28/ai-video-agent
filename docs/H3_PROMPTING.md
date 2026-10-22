@@ -1,6 +1,6 @@
 # Codex prompt writing for FastH3
 
-Version 0.9.0 uses one natural-language prompt per clip. H3 writing guides inform descriptive quality, while the app's actual media bindings determine which reference names and labels can be used. The app does not enforce the guides' section layout.
+Version 0.9.1 uses one natural-language prompt per clip. H3 writing guides inform descriptive quality, while the app's actual media bindings determine which reference names and labels can be used. The app does not enforce the guides' section layout.
 
 Reference guides:
 
@@ -17,6 +17,8 @@ Codex receives the complete script and the supplied reference manifest/images. I
 The clip count is the length of Codex's returned `clips` array. Durations are model estimates, not measurements from generated speech. The app validates 1–40 clips, duration limits, unique IDs, supplied references and transitions. It does not independently calculate spoken timing or prove script coverage. Users review the plan and can edit each duration before approval.
 
 Only the first clip receives a final generation prompt during planning. Later clips retain story outlines until their actual preceding saved frame is available.
+
+Once a take is saved, the next unsubmitted clip's prompt is optimized asynchronously from that take's actual final-frame attachment. Codex must inspect the visible subjects, positions, poses, objects and lighting before adapting the pending action, avoiding repeated setup while preserving exact pending dialogue and duration. An optional `frameAnalysis` string records the observed state and the resulting changes for review. The source frame is bound into the prompt context, so replacing it invalidates that prepared prompt. No subsequent render is implicitly approved.
 
 ## One editable prompt
 

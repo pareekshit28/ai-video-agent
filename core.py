@@ -365,5 +365,6 @@ def invalidate_following(scene, clip):
     for following in scene["clips"][index + 1:]:
         following.pop("approvedKey", None)
         following.pop("promptContext", None)
+        following.pop("frameAnalysis", None)
         if following["status"] == "complete":
             following["continuityOutdated"] = True

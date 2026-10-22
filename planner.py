@@ -47,6 +47,13 @@ attachment when previousFrameAttachment is provided. Adapt to observed positions
 lighting, facing and composition, and to the preceding submitted prompt and actual duration. Do not repeat
 completed story beats. If continuation is true begin seamlessly from this frame; otherwise respect the
 deliberate cut/scene change and use it as story context only. Preserve target duration and references.
+For a following clip, FIRST understand the actual final-frame attachment: identify visible subjects,
+positions, posture, gaze, objects, lighting and the current physical state. Then optimize the target
+prompt around that observed state, removing repeated setup/actions, resolving visual mismatches and
+making the remaining scripted action fit naturally. Preserve exact pending dialogue and events; the
+still image cannot prove which words were spoken. Include a concise "frameAnalysis" string alongside
+"prompt", describing the observed state and how the next prompt adapts. Keep later clips as outlines
+until their own preceding final frame exists; do not guess future frames or render another clip.
 Apply comments to the editable prompt, preserving exact scripted dialogue unless explicitly changed.
 Do not invent references. A still image is not evidence of events or words elsewhere in the prior clip.
 Fit action and dialogue into the target duration. Follow the H3 prompt guidance for the complete revised

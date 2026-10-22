@@ -11,6 +11,7 @@ const $ = (tag, props = {}, ...children) => {
     if (key.startsWith("on")) el.addEventListener(key.slice(2).toLowerCase(), value);
     else if (key === "class") el.className = value;
     else if (key === "text") el.textContent = value;
+    else if (key === "src" && /^(video|audio)$/.test(tag)) el.dataset.avaMediaSrc = value;
     else if (value !== undefined) el[key] = value;
   }
   el.append(...children.filter(Boolean));
@@ -45,7 +46,45 @@ const eyebrow = text => $("p", { class: "ava-eyebrow", text });
 const heading = (title, description) => $("div", { class: "ava-section-heading" }, $("h3", { text: title }), description && note(description));
 const metric = (label, value) => $("div", {}, $("dt", { text: label }), $("dd", { text: value }));
 // Live clocks update independently; they must not rebuild a playing video.
-const snapshot = () => JSON.stringify([state, scene], (key, value) => key === "helper" && section !== "settings" || ["lastSeen", "serverNow", "elapsedSeconds", "remainingSeconds", "estimatedCompletionAt", "etaKind"].includes(key) ? undefined : value);
+const snapshot = () => JSON.stringify([state, scene], (key, value) => key === "timing" || key === "helper" && section !== "settings" || key === "lastSeen" ? undefined : value);
+
+const mediaSource = node => node.dataset.avaMediaSrc || node.getAttribute("src");
+const nodeKey = node => node.nodeType === Node.ELEMENT_NODE ? node.dataset.avaKey || node.id || (/^(VIDEO|AUDIO|IMG)$/.test(node.tagName) ? `${node.tagName}:${mediaSource(node)}` : null) : null;
+function activateMedia(node) {
+  if (node.nodeType !== Node.ELEMENT_NODE) return;
+  for (const media of [node, ...node.querySelectorAll("[data-ava-media-src]")]) {
+    if (media.dataset.avaMediaSrc && media.getAttribute("src") !== media.dataset.avaMediaSrc) media.setAttribute("src", media.dataset.avaMediaSrc);
+  }
+}
+function patchChildren(parent, desired) {
+  const keyed = new Map([...parent.childNodes].map(node => [nodeKey(node), node]).filter(([key]) => key));
+  const desiredKeys = new Set(desired.map(nodeKey).filter(Boolean));
+  let cursor = parent.firstChild;
+  for (const source of desired) {
+    const key = nodeKey(source);
+    let target = key ? keyed.get(key) : nodeKey(cursor || {}) ? null : cursor;
+    if (!target || target.nodeType !== source.nodeType || target.nodeName !== source.nodeName) target = null;
+    // Fresh controls retain callbacks bound to their newly created form inputs.
+    if (target?.nodeType === Node.ELEMENT_NODE && /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(target.tagName)) target = null;
+    if (!target) { parent.insertBefore(source, cursor); activateMedia(source); cursor = source.nextSibling; continue; }
+    // Remove obsolete siblings before a keyed player rather than moving the player itself.
+    if (key) while (cursor && cursor !== target && !desiredKeys.has(nodeKey(cursor))) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
+    if (target !== cursor) parent.insertBefore(target, cursor);
+    if (source.nodeType === Node.TEXT_NODE) {
+      if (target.data !== source.data) target.data = source.data;
+    } else if (source.nodeType === Node.ELEMENT_NODE) {
+      // Never detach/reassign an unchanged media element: that restarts playback.
+      const keepMedia = /^(VIDEO|AUDIO|IMG)$/.test(source.tagName) && mediaSource(target) === mediaSource(source);
+      if (!keepMedia) {
+        for (const name of target.getAttributeNames()) if (!source.hasAttribute(name)) target.removeAttribute(name);
+        for (const name of source.getAttributeNames()) if (target.getAttribute(name) !== source.getAttribute(name)) target.setAttribute(name, source.getAttribute(name));
+        patchChildren(target, [...source.childNodes]);
+      }
+    }
+    cursor = target.nextSibling;
+  }
+  while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
+}
 
 function switchSection(value) {
   section = value; localStorage.setItem("ava-section", value);
@@ -57,6 +96,7 @@ function statusPanel(clip, compact = false) {
   const panel = $("section", { class: compact ? "ava-take-status" : "ava-live-status", ariaLabel: compact ? "Clip render status" : "Current render status" });
   panel.dataset.clipId = clip.id;
   panel.dataset.compact = String(compact);
+  panel.dataset.avaKey = `status:${clip.id}:${compact}`;
   fillStatus(panel, clip);
   return panel;
 }
@@ -69,33 +109,61 @@ function fillStatus(panel, clip) {
   const remaining = Number.isFinite(clock.remainingSeconds) ? Math.max(0, clock.remainingSeconds - drift) : null;
   const sampling = clock.sampling;
   const compact = panel.dataset.compact === "true";
-  let eta = "Learning from first render", finish = "Not available yet";
-  if (["recoverable", "submission-unknown"].includes(clip.status) || scene?.paused && active.has(clip.status)) { eta = "Monitoring paused"; finish = "Resume monitoring"; }
-  else if (clip.status === "queued") { eta = "Waiting for GPU"; finish = "After queue starts"; }
-  else if (clip.status === "complete") { eta = "Finished"; finish = timeText(clock.completedAt) === "—" ? "Not recorded for this older take" : timeText(clock.completedAt); }
-  else if (clip.status === "failed") { eta = "Stopped"; finish = timeText(clock.failedAt); }
-  else if (!active.has(clip.status)) { eta = "After approval"; finish = "Not started"; }
-  else if (clock.etaKind === "history" && remaining > 0) { eta = `~${durationText(remaining)} remaining`; finish = timeText(clock.estimatedCompletionAt); }
-  else if (clock.etaKind === "sampling" && remaining > 0) { eta = `Sampling: ~${durationText(remaining)} left`; finish = "Decode & saving follow"; }
-  else if (clock.etaKind === "overdue" || remaining === 0) { eta = "Taking longer than estimated"; finish = "Updating estimate…"; }
-  const badge = $("span", { class: `ava-badge ava-status-${clip.status}`, text: statusLabels[clip.status] || clip.status });
-  const title = compact ? null : $("div", {}, eyebrow("RENDER MONITOR"), $("h3", { text: clip.title }));
-  const progress = $("progress", { max: 100, ariaLabel: "Sampling progress" });
+  let eta = "Waiting for sampling";
+  if (["recoverable", "submission-unknown"].includes(clip.status) || scene?.paused && active.has(clip.status)) eta = "Monitoring paused";
+  else if (clip.status === "queued") eta = "Waiting for GPU";
+  else if (clip.status === "complete") eta = "Finished";
+  else if (clip.status === "failed") eta = "Stopped";
+  else if (!active.has(clip.status)) eta = "After approval";
+  else if (clip.status === "saving" || sampling?.value >= sampling?.total) eta = "Sampling finished";
+  else if (clock.etaKind === "sampling" && remaining > 0) eta = `~${durationText(remaining)} remaining`;
+  else if (clip.status === "rendering" && sampling?.total > 1) eta = "Measuring sampling rate…";
+  if (!panel.statusUI) {
+    const badge = $("span"), title = compact ? null : $("h3");
+    const progress = $("progress", { max: 100, ariaLabel: "Sampling progress" }), label = $("span");
+    const elapsedMetric = metric("Elapsed", ""), etaMetric = metric("Sampling ETA", ""), stampMetric = metric("Started at", "");
+    panel.replaceChildren(row(compact ? null : $("div", {}, eyebrow("RENDER MONITOR"), title), badge),
+      $("div", { class: "ava-progress" }, progress, label), $("dl", { class: "ava-metrics" }, elapsedMetric, etaMetric, stampMetric),
+      !compact && note("ETA covers sampling steps only. Decoding, saving and final-frame extraction follow."));
+    panel.statusUI = { badge, title, progress, label, elapsed: elapsedMetric.lastChild, eta: etaMetric.lastChild,
+      stampLabel: stampMetric.firstChild, stamp: stampMetric.lastChild };
+  }
+  const ui = panel.statusUI;
+  const setText = (node, text) => { if (node && node.textContent !== text) node.textContent = text; };
+  if (ui.badge.className !== `ava-badge ava-status-${clip.status}`) ui.badge.className = `ava-badge ava-status-${clip.status}`;
+  setText(ui.badge, statusLabels[clip.status] || clip.status);
+  setText(ui.title, clip.title);
   let progressLabel = "Waiting for approval";
-  if (clip.status === "complete") { progress.value = 100; progressLabel = "Video saved and ready to play"; }
-  else if (clip.status === "rendering" && sampling?.total > 1) { progress.value = sampling.value / sampling.total * 100; progressLabel = `Sampling · ${sampling.value} / ${sampling.total} steps${sampling.value >= sampling.total ? " · decoding video" : ""}`; }
+  let progressValue = null;
+  if (clip.status === "complete") { progressValue = 100; progressLabel = "Video saved and ready to play"; }
+  else if (clip.status === "rendering" && sampling?.total > 1) { progressValue = sampling.value / sampling.total * 100; progressLabel = `Sampling · ${sampling.value} / ${sampling.total} steps${sampling.value >= sampling.total ? " · decoding video" : ""}`; }
   else if (clip.status === "queued") progressLabel = clock.queuePosition ? `Queue position ${clock.queuePosition}` : "Waiting in the ComfyUI queue";
   else if (clip.status === "saving") progressLabel = "Verifying video & extracting the final frame";
   else if (clip.status === "rendering") progressLabel = "Loading models / preparing references";
   else if (clip.status === "failed" || clip.status === "recoverable") progressLabel = "Open the clip below for details";
-  if (!active.has(clip.status) && clip.status !== "complete") progress.value = 0;
-  panel.replaceChildren(row(title, badge),
-    $("div", { class: "ava-progress" }, progress, $("span", { text: progressLabel })),
-    $("dl", { class: "ava-metrics" }, metric("Elapsed", durationText(elapsed)), metric("ETA", eta), metric(clip.status === "failed" ? "Failed at" : terminal ? "Completed at" : "Estimated finish", finish)),
-    !compact && note(clock.etaKind === "history" ? `Estimate based on ${clock.estimateSamples} comparable completed take${clock.estimateSamples === 1 ? "" : "s"}. Times shown in your local timezone.` : "Finish estimates learn from matching duration and render settings. Sampler progress covers sampling only."));
+  if (!active.has(clip.status) && clip.status !== "complete") progressValue = 0;
+  if (progressValue === null) { if (ui.progress.hasAttribute("value")) ui.progress.removeAttribute("value"); }
+  else if (!ui.progress.hasAttribute("value") || ui.progress.value !== progressValue) ui.progress.value = progressValue;
+  setText(ui.label, progressLabel);
+  setText(ui.elapsed, durationText(elapsed));
+  setText(ui.eta, eta);
+  setText(ui.stampLabel, clip.status === "failed" ? "Failed at" : terminal ? "Completed at" : "Started at");
+  setText(ui.stamp, timeText(clip.status === "failed" ? clock.failedAt : terminal ? clock.completedAt : clock.renderStartedAt));
 }
 
 function updateStatus() {
+  const planning = scene?.planning;
+  if (!busy && planning?.automatic) {
+    if (planning.status === "running") {
+      message.dataset.automaticPlanning = planning.id;
+      message.classList.remove("ava-error");
+      message.textContent = `Codex is understanding the last frame and optimizing the next prompt… ${Math.max(0, Math.floor(Date.now() / 1000 - planning.startedAt))}s`;
+    } else if (message.dataset.automaticPlanning === planning.id) {
+      message.textContent = planning.status === "failed" ? planning.error : "Next prompt optimized from the previous clip's last frame. Review it before generating.";
+      message.classList.toggle("ava-error", planning.status === "failed");
+      delete message.dataset.automaticPlanning;
+    }
+  }
   if (!scene?.clips.length) { livePanel.replaceChildren(); return; }
   const lastActivity = clip => Math.max(clip.timing?.completedAt || 0, clip.timing?.failedAt || 0, clip.timing?.submittedAt || 0);
   const current = scene.clips.find(c => active.has(c.status)) || [...scene.clips].sort((a, b) => lastActivity(b) - lastActivity(a))[0];
@@ -231,7 +299,7 @@ async function refresh(force = false) {
     updateStatus();
     // Preserve unsaved prompt, script, selection and comments during background checks.
     if (force || (snapshot() !== renderedSnapshot && !dirty && !busy && !workspace.contains(document.activeElement?.closest("input,textarea,select")))) render();
-    if (!busy && scene?.planning?.status === "running") {
+    if (!busy && scene?.planning?.status === "running" && !scene.planning.automatic) {
       const scope = { projectId, episodeId, sceneId }, jobId = scene.planning.id;
       void run(() => waitForPlanning(scope, jobId));
     }
@@ -419,6 +487,7 @@ function clipEditor(clip, index) {
     clip.continuityOutdated && note("An earlier take or frame changed. This completed take is retained; review continuity before regenerating."),
     clip.error && $("p", { class: "ava-error", text: clip.error }),
     clip.video && $("video", { src: mediaUrl(clip.video), controls: true, preload: "metadata" }),
+    clip.frameAnalysis && $("details", {}, $("summary", { text: "Last-frame analysis & prompt optimization" }), note(clip.frameAnalysis)),
     note(`Outline: ${clip.outline}`), field("Editable video prompt", prompt),
     $("div", { class: "ava-checks" }, ...checks.map(({ ref, box }) => $("label", {}, box, document.createTextNode(ref.name)))),
     field("Frame continuity", continuity),
@@ -453,6 +522,7 @@ function clipEditor(clip, index) {
       const link = $("a", { href: url, download: `${scene.name}-${clip.id}-api.json` }); link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
     }));
   editor.classList.add("ava-clip");
+  editor.dataset.avaKey = `clip:${scene.id}:${clip.id}`;
   return editor;
 }
 
@@ -467,15 +537,14 @@ function studio() {
 function render() {
   if (!state.project) section = "agent";
   const detailsState = new Map([...workspace.querySelectorAll("details")].map((el, i) => [`${i}:${el.querySelector("summary")?.textContent}`, el.open]));
-  message.classList.remove("ava-error");
   const agent = $("section", { id: "ava-panel-agent", role: "tabpanel", ariaLabel: "Agent" },
     ...(scene ? [scene.planning?.status === "failed" && $("p", { class: "ava-error", text: scene.planning.error }), sceneEditor(), references(), studio(), scene.clips.length && heading("Review & render", `${scene.clips.filter(c => c.status === "complete").length} of ${scene.clips.length} clips complete · approve each take when ready`), ...scene.clips.map(clipEditor)].filter(Boolean) : [card(heading("Your next video starts here", "Create a project and scene above, then give Codex your script."))]));
   const libraryPanel = $("section", { id: "ava-panel-library", role: "tabpanel", ariaLabel: "Library" }, projectId ? library() : card(note("Create a project to build its reference library.")));
   const settingsPanel = $("section", { id: "ava-panel-settings", role: "tabpanel", ariaLabel: "Settings" }, ...(state.project ? [manageSelection(), connection()] : []), ...(scene ? [generationSettings()] : []),
-    card(heading("Render timing", "Automatic tracking for every new take."), note("Elapsed time includes time spent in the queue. Estimated finish uses recent completed takes with matching duration, steps, resolution and reference size. The first render shows a sampling estimate once its rate is known. Completion time is recorded after the video is verified and saved. Times use your browser's local timezone.")));
-  projectHost.replaceChildren(projectControls());
+    card(heading("Render timing", "Sampling ETA and actual take timestamps."), note("ETA covers only measured sampling steps. It is unavailable until a sampling rate can be measured, and stops when sampling finishes. Decoding and saving have no ETA. Elapsed time includes queue waiting; completion is recorded after video verification and final-frame extraction. Times use your browser's local timezone.")));
+  patchChildren(projectHost, [projectControls()]);
   navigation.hidden = !state.project;
-  content.replaceChildren(agent, libraryPanel, settingsPanel);
+  patchChildren(content, [agent, libraryPanel, settingsPanel]);
   switchSection(section);
   [...workspace.querySelectorAll("details")].forEach((el, i) => { const key = `${i}:${el.querySelector("summary")?.textContent}`; if (detailsState.has(key)) el.open = detailsState.get(key); });
   renderedSnapshot = snapshot();

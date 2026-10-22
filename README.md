@@ -80,11 +80,13 @@ Existing projects and scenes appear under **Episode 1** automatically. This comp
 
 ### Render status and timing
 
-Version 0.4.0 adds a render monitor visible in every section, plus timing on each clip. It shows **In queue → Rendering → Saving video → Complete**, queue position, sampler steps, elapsed time, estimated finish and the actual completion timestamp. Status polls every five seconds; clocks tick every second without replacing unsaved edits or restarting a playing video.
+Version 0.9.1 shows a render monitor in every section, plus timing on each clip. It shows **In queue → Rendering → Saving video → Complete**, queue position, sampler steps, elapsed time, **Sampling ETA** and actual take timestamps. Status polls every five seconds; clocks and progress update in place. Structural updates also preserve unchanged media players, so another clip's progress, completion or prompt optimization does not reload a playing video.
 
-Elapsed time includes queue waiting. Full-video ETA uses the median of up to ten completed takes from the same project with matching clip duration, steps, resolution, aspect ratio and reference size. On the first matching render, the UI learns the sampler's speed and labels its estimate **Sampling**; decoding and saving still follow, so a full-video finish time is unavailable until comparable timing exists. Model loading, cache hits and GPU contention can change runtime. An exceeded estimate is shown as taking longer, never as a false zero-second countdown.
+ETA uses only the current sampler's measured steps and rate. It is unavailable during queue waiting, model loading, decoding and saving; previous full-render/save estimates are ignored. When sampling completes or its progress becomes stale, the countdown disappears. Elapsed time still includes queue waiting. Actual completion is recorded after saving and final-frame extraction succeed.
 
 Submission, execution, saving and completion timestamps persist with each take and survive reloads. Completion is recorded only after video verification and final-frame extraction succeed. Regeneration archives the original take's clock and starts a new one. Older takes without timing show that completion time was not recorded. Displayed dates use the browser's local timezone. Render settings remain editable in **Settings** and apply to the next approved take.
+
+After a clip finishes, the next unsubmitted clip is optimized in a persisted background task. Codex first inspects the actual saved final frame, then adapts the next prompt to visible positions, posture, objects, lighting and scene state while preserving its planned duration and scripted dialogue. The completed clip remains playable during this work. **Last-frame analysis & prompt optimization** records the model's explanation when supplied. Each next clip still waits for explicit approval; later clips remain outlines until their own preceding frame exists. Failed optimization retains the completed take and prior draft and exposes a retry.
 
 The single workflow also exposes standalone canvas nodes:
 
@@ -111,6 +113,8 @@ Update the custom-node folder with `git pull --ff-only`, restart ComfyUI, then h
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+The optional browser-only regression uses Node.js, `@playwright/test` and FFmpeg: `node tests/test_polling.mjs`. It mocks HTTP responses and checks that timing, lifecycle and next-prompt updates preserve a playing video without starting another media request. It does not connect to ComfyUI or a GPU.
 
 Tests exercise URL-only connections, serial pod switching, request ownership, native H3 rendering calls with stubbed execution, reference/image ordering, approval and duration rules, H3 graph wiring, submission recovery, workflow metadata and real FFmpeg finalization. Browser integration exercises the real UI/routes/store with mocked Codex and Comfy execution. Desktop builds receive a UI startup check on each target platform. A live Codex request and a live GPU render are separate checks; H3 inference and ComfyUI's automatic model-download dialog still require target-pod validation. Direct download links and terminal commands are provided in the workflow independently of that dialog.
 
