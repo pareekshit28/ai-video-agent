@@ -23,6 +23,14 @@ def uid():
     return uuid.uuid4().hex
 
 
+def next_name(prefix, existing):
+    names = {item["name"] for item in existing}
+    index = 1
+    while f"{prefix} {index}" in names:
+        index += 1
+    return f"{prefix} {index}"
+
+
 def identifier(value):
     if not isinstance(value, str) or not ID.fullmatch(value):
         raise ValueError("Invalid ID")
@@ -118,26 +126,31 @@ class Store:
         scenes = [self.scene(project_id, p.parent.name) for p in self.path(f"projects/{identifier(project_id)}/scenes").glob("*/scene.json")]
         return sorted([s for s in scenes if episode_id is None or s["episodeId"] == episode_id], key=lambda s: s.get("createdAt", 0))
 
-    def create_project(self, name):
+    def create_project(self, name=None):
+        name = next_name("Project", self.projects()) if name is None else name
         project = {"id": uid(), "name": text(name, 120), "createdAt": time.time(), "library": []}
         project["episodes"] = [{"id": DEFAULT_EPISODE, "name": "Episode 1", "createdAt": project["createdAt"]}]
         self.write(f"projects/{project['id']}/project.json", project)
         return project
 
-    def create_episode(self, project_id, name):
+    def create_episode(self, project_id, name=None):
         project = self.project(project_id)
+        name = next_name("Episode", project["episodes"]) if name is None else name
         episode = {"id": uid(), "name": text(name, 150), "createdAt": time.time()}
         project["episodes"].append(episode)
         self.write(f"projects/{project_id}/project.json", project)
         return episode
 
-    def create_scene(self, project_id, name, script="", episode_id=None):
+    def create_scene(self, project_id, name=None, script="", episode_id=None):
         self.project(project_id)
-        episode_id = episode_id or DEFAULT_EPISODE
+        if not episode_id:
+            raise ValueError("Select an episode before creating a scene")
         self.episode(project_id, episode_id)
+        auto_name = name is None
+        name = next_name("Scene", self.scenes(project_id, episode_id)) if auto_name else name
         scene = {"id": uid(), "projectId": project_id, "episodeId": episode_id, "name": text(name, 150), "script": script,
                  "summary": "", "references": [], "clips": [], "settings": DEFAULTS.copy(),
-                 "createdAt": time.time(), "paused": True, "reviewAfterEachClip": True}
+                 "createdAt": time.time(), "paused": True, "reviewAfterEachClip": True, "autoName": auto_name}
         self.save_scene(scene)
         return scene
 
@@ -147,6 +160,37 @@ class Store:
         destination = self.path(f".trash/{project_id}-{uid()}")
         destination.parent.mkdir(exist_ok=True)
         shutil.move(str(self.path(f"projects/{project_id}")), str(destination))
+
+    def trash_scene(self, project_id, scene_id, episode_id):
+        scene = self.scene(project_id, scene_id, episode_id)
+        if any(c["status"] in ACTIVE for c in scene["clips"]):
+            raise ValueError("Resolve active or uncertain jobs before deleting this scene")
+        source = self.path(self.scene_dir(project_id, scene_id))
+        destination = self.path(f".trash/scenes/{scene_id}-{uid()}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(destination))
+
+    def trash_episode(self, project_id, episode_id):
+        project = self.project(project_id)
+        episode = self.episode(project_id, episode_id)
+        scenes = self.scenes(project_id, episode_id)
+        if any(c["status"] in ACTIVE for scene in scenes for c in scene["clips"]):
+            raise ValueError("Resolve active or uncertain jobs before deleting this episode")
+        relative = f".trash/episodes/{episode_id}-{uid()}"
+        self.write(relative + "/episode.json", {"projectId": project_id, "episode": episode, "sceneIds": [s["id"] for s in scenes]})
+        moved = []
+        try:
+            for scene in scenes:
+                source = self.path(self.scene_dir(project_id, scene["id"]))
+                destination = self.path(relative + "/" + scene["id"])
+                shutil.move(str(source), str(destination))
+                moved.append((source, destination))
+            project["episodes"] = [e for e in project["episodes"] if e["id"] != episode_id]
+            self.write(f"projects/{project_id}/project.json", project)
+        except Exception:
+            for source, destination in reversed(moved):
+                shutil.move(str(destination), str(source))
+            raise
 
 
 def selected(scene, clip):

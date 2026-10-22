@@ -68,7 +68,7 @@ class Fixture:
         self.root = Path(self.temp.name)
         self.store = core.Store(self.root / "state")
         self.project = self.store.create_project("Film")
-        self.scene = self.store.create_scene(self.project["id"], "Scene", "A character opens a door, then says hello.")
+        self.scene = self.store.create_scene(self.project["id"], "Scene", "A character opens a door, then says hello.", episode_id=core.DEFAULT_EPISODE)
         path = f"projects/{self.project['id']}/reference.png"
         self.store.path(path).parent.mkdir(parents=True, exist_ok=True)
         Image.new("RGB", (256, 256), "red").save(self.store.path(path))
@@ -273,6 +273,73 @@ class HierarchyTests(Fixture, unittest.TestCase):
         self.store.write(f"projects/{self.project['id']}/qwen.json", qwen.validate_config({"model": local_qwen.DEFAULT_MODEL}))
         self.assertEqual(local_qwen.DEFAULT_MODEL, qwen.config(self.store, self.project["id"])["model"])
         self.assertEqual(chosen, qwen.config(self.store)["model"])
+
+    def test_creation_requires_parents_and_names_scenes_automatically(self):
+        with self.assertRaisesRegex(ValueError, "Select an episode"):
+            self.store.create_scene(self.project["id"])
+        with self.assertRaises(ValueError):
+            self.store.create_episode(None)
+        one = self.store.create_scene(self.project["id"], episode_id=core.DEFAULT_EPISODE)
+        two = self.store.create_scene(self.project["id"], episode_id=core.DEFAULT_EPISODE)
+        self.assertEqual(("Scene 1", "Scene 2"), (one["name"], two["name"]))
+        self.assertNotEqual(one["id"], two["id"])
+        self.assertTrue(one["autoName"])
+
+    def test_scene_deletion_moves_only_that_scene_to_recovery_trash(self):
+        sibling = self.store.create_scene(self.project["id"], episode_id=core.DEFAULT_EPISODE)
+        self.store.trash_scene(self.project["id"], self.scene["id"], core.DEFAULT_EPISODE)
+        self.assertEqual([sibling["id"]], [s["id"] for s in self.store.scenes(self.project["id"])])
+        archived = next(self.store.path(".trash/scenes").glob("*/scene.json"))
+        self.assertEqual(self.scene["clips"], json.loads(archived.read_text())["clips"])
+        self.assertTrue(self.store.project(self.project["id"])["episodes"])
+
+    def test_episode_deletion_preserves_sibling_scenes_and_project_library(self):
+        project = self.store.project(self.project["id"])
+        project["library"] = [{"id": "shared", "assets": [self.asset]}]
+        self.store.write(f"projects/{project['id']}/project.json", project)
+        episode = self.store.create_episode(project["id"], "Other episode")
+        sibling = self.store.create_scene(project["id"], episode_id=episode["id"])
+        self.store.trash_episode(project["id"], core.DEFAULT_EPISODE)
+        self.assertEqual([episode], self.store.project(project["id"])["episodes"])
+        self.assertEqual([sibling["id"]], [s["id"] for s in self.store.scenes(project["id"])])
+        self.assertEqual(project["library"], self.store.project(project["id"])["library"])
+        self.assertTrue(list(self.store.path(".trash/episodes").glob("*/episode.json")))
+
+    def test_deleting_last_episode_keeps_project_with_no_episodes(self):
+        self.store.trash_episode(self.project["id"], core.DEFAULT_EPISODE)
+        self.assertEqual([], self.store.project(self.project["id"])["episodes"])
+        self.assertEqual([], self.store.scenes(self.project["id"]))
+        created = self.store.create_episode(self.project["id"], "Replacement")
+        self.assertEqual([created], self.store.project(self.project["id"])["episodes"])
+
+    def test_active_jobs_block_scene_episode_and_project_deletion(self):
+        self.clip["status"] = "recoverable"
+        self.store.save_scene(self.scene)
+        for operation in (lambda: self.store.trash_scene(self.project["id"], self.scene["id"], core.DEFAULT_EPISODE),
+                          lambda: self.store.trash_episode(self.project["id"], core.DEFAULT_EPISODE),
+                          lambda: self.store.trash_project(self.project["id"])):
+            with self.assertRaisesRegex(ValueError, "active or uncertain"):
+                operation()
+        self.assertEqual("recoverable", self.store.scene(self.project["id"], self.scene["id"])["clips"][0]["status"])
+
+    def test_episode_archive_failure_restores_moved_scene_directories(self):
+        sibling = self.store.create_scene(self.project["id"], episode_id=core.DEFAULT_EPISODE)
+        original = self.store.write
+        def fail_project_write(relative, value):
+            if relative.endswith("/project.json"):
+                raise OSError("storage unavailable")
+            return original(relative, value)
+        with patch.object(self.store, "write", side_effect=fail_project_write):
+            with self.assertRaisesRegex(OSError, "storage unavailable"):
+                self.store.trash_episode(self.project["id"], core.DEFAULT_EPISODE)
+        self.assertEqual({self.scene["id"], sibling["id"]}, {s["id"] for s in self.store.scenes(self.project["id"])})
+        self.assertEqual(core.DEFAULT_EPISODE, self.store.project(self.project["id"])["episodes"][0]["id"])
+
+    def test_scene_deletion_rejects_another_episode_before_moving_files(self):
+        episode = self.store.create_episode(self.project["id"], "Other")
+        with self.assertRaisesRegex(ValueError, "selected episode"):
+            self.store.trash_scene(self.project["id"], self.scene["id"], episode["id"])
+        self.assertEqual(self.scene["id"], self.store.scene(self.project["id"], self.scene["id"])["id"])
 
 
 class NativeProgressTests(unittest.TestCase):
@@ -550,6 +617,12 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
         with patch.dict(sys.modules, {"comfy": comfy, "comfy.model_management": mm}), patch.object(qwen, "ask", AsyncMock(return_value=result)) as ask:
             await self.engine.discover(self.scene, "http://unused")
         self.assertEqual(chosen, ask.call_args.kwargs["model_file"])
+
+    async def test_explicit_scene_rename_survives_reference_discovery(self):
+        self.scene.update(name="User chosen scene", autoName=False)
+        self.engine.ask = AsyncMock(return_value={"title": "Generated name", "summary": "Summary", "references": []})
+        await self.engine.discover(self.scene, "http://unused")
+        self.assertEqual("User chosen scene", self.scene["name"])
 
     async def test_foreign_renderer_cannot_be_submitted_as_h3(self):
         self.scene["settings"]["provider"] = "unsupported"

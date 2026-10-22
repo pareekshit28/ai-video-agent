@@ -46,7 +46,9 @@ class Engine:
         existing = {r["id"]: r for r in scene["references"]}
         for ref in references:
             ref["assets"] = existing.get(ref["id"], {}).get("assets", [])
-        scene.update(name=core.text(result["title"], 150), summary=core.text(result["summary"], 1500), references=references, clips=[])
+        if scene.get("autoName", True):
+            scene["name"] = core.text(result["title"], 150)
+        scene.update(summary=core.text(result["summary"], 1500), references=references, clips=[])
 
     async def plan(self, scene, base_url):
         if any(c.get("takeId") for c in scene["clips"]):

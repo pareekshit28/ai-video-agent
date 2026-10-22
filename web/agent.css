@@ -36,6 +36,9 @@
 .ava-section-heading .ava-note { margin: 0; }
 .ava-eyebrow { font-size: 10px; font-weight: 700; letter-spacing: .16em; color: var(--ava-accent); margin: 0 0 10px; }
 .ava-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.ava-selector { display: flex; align-items: flex-end; gap: 8px; flex: 1 1 280px; min-width: min(100%, 280px); }
+.ava-selector > label { min-width: 0; }
+.ava-workspace .ava-selector > button { flex: 0 0 auto; margin: 0 0 14px; padding: 11px 10px; font-size: 11px; }
 .ava-workspace label { display: flex; flex-direction: column; flex: 1; min-width: 100px; gap: 7px; margin: 14px 0; color: #cbd1da; font-size: 12px; font-weight: 500; }
 .ava-workspace input, .ava-workspace select, .ava-workspace textarea { width: 100%; min-width: 0; padding: 11px 12px; font: inherit; font-size: 13px; color: #f0f2f6; border: 1px solid #363d48; border-radius: 9px; background: #111418; transition: border-color .15s, box-shadow .15s; }
 .ava-workspace textarea { resize: vertical; line-height: 1.75; }

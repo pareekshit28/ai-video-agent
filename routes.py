@@ -1,6 +1,7 @@
 """Same-origin ComfyUI workspace API. Credentials stay in server environment variables."""
 import asyncio
 import copy
+from contextlib import AsyncExitStack
 import json
 import os
 from pathlib import Path
@@ -72,10 +73,11 @@ async def state(request):
     project_id = request.query.get("projectId")
     project = next((p for p in projects if p["id"] == project_id), None)
     episodes, scenes, videos = [], [], []
+    episode_id = ""
     if project:
         episodes = project["episodes"]
-        episode_id = request.query.get("episodeId") or episodes[0]["id"]
-        eng.store.episode(project_id, episode_id)
+        requested_episode = request.query.get("episodeId")
+        episode_id = requested_episode if any(e["id"] == requested_episode for e in episodes) else episodes[0]["id"] if episodes else ""
         all_scenes = eng.store.scenes(project_id)
         scenes = [s for s in all_scenes if s["episodeId"] == episode_id]
         episode_names = {e["id"]: e["name"] for e in episodes}
@@ -90,7 +92,7 @@ async def state(request):
             if not watched_scene.get("paused") and any(c["status"] in core.ACTIVE for c in watched_scene["clips"]):
                 eng.watch(watched_project["id"], watched_scene["id"], base_url(request))
     summaries = [{k: p[k] for k in ("id", "name", "createdAt")} for p in projects]
-    return web.json_response({"projects": summaries, "project": project, "episodes": episodes, "scenes": scenes, "videos": videos,
+    return web.json_response({"projects": summaries, "project": project, "episodes": episodes, "selectedEpisodeId": episode_id, "scenes": scenes, "videos": videos,
                               "qwen": qwen.config(eng.store, project_id if project else None), "storage": str(eng.store.root)})
 
 
@@ -128,7 +130,9 @@ async def action(request):
     store = eng.store
     command = body["action"]
     if command == "createProject":
-        return web.json_response({"project": store.create_project(body["name"])})
+        return web.json_response({"project": store.create_project(body.get("name"))})
+    if not body.get("projectId"):
+        raise ValueError("Select a project first")
     project_id = core.identifier(body["projectId"])
     async with eng.lock(project_id):
         project = store.project(project_id)
@@ -140,12 +144,22 @@ async def action(request):
             store.write(f"projects/{project_id}/project.json", project)
             return web.json_response({"ok": True})
         if command == "deleteProject":
-            store.trash_project(project_id)
+            async with AsyncExitStack() as stack:
+                for scene in sorted(store.scenes(project_id), key=lambda s: s["id"]):
+                    await stack.enter_async_context(eng.lock(scene["id"]))
+                store.trash_project(project_id)
             return web.json_response({"ok": True})
         if command == "createScene":
-            return web.json_response({"scene": store.create_scene(project_id, body["name"], body.get("script", ""), body.get("episodeId"))})
+            return web.json_response({"scene": store.create_scene(project_id, body.get("name"), body.get("script", ""), body.get("episodeId"))})
         if command == "createEpisode":
-            return web.json_response({"episode": store.create_episode(project_id, body["name"])})
+            return web.json_response({"episode": store.create_episode(project_id, body.get("name"))})
+        if command == "deleteEpisode":
+            episode_id = core.identifier(body.get("episodeId"))
+            async with AsyncExitStack() as stack:
+                for scene in sorted(store.scenes(project_id, episode_id), key=lambda s: s["id"]):
+                    await stack.enter_async_context(eng.lock(scene["id"]))
+                store.trash_episode(project_id, episode_id)
+            return web.json_response({"ok": True})
         if command == "renameEpisode":
             episode = store.episode(project_id, body["episodeId"])
             next(e for e in project["episodes"] if e["id"] == episode["id"])["name"] = core.text(body["name"], 150)
@@ -167,6 +181,13 @@ async def action(request):
         scene_id = core.identifier(body["sceneId"])
         async with eng.lock(scene_id):
             scene = store.scene(project_id, scene_id, body.get("episodeId"))
+            if command == "renameScene":
+                scene.update(name=core.text(body["name"], 150), autoName=False)
+                store.save_scene(scene)
+                return web.json_response({"ok": True})
+            if command == "deleteScene":
+                store.trash_scene(project_id, scene_id, core.identifier(body.get("episodeId")))
+                return web.json_response({"ok": True})
             core.settings(scene["settings"])
             clip = find_clip(scene, body["clipId"]) if body.get("clipId") else None
             base = base_url(request)

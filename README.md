@@ -53,7 +53,11 @@ Direct continuations use `MiniMaxH3AddGuide` at frame zero. Cuts use the precedi
 
 ### Projects, episodes and scenes
 
-Version 0.5.0 puts **Project → Episode → Scene** above every workspace section and the render monitor. Each project owns its episodes, shared reference/video library and Qwen model selection. Episodes contain separate scenes; each scene retains its own script, references, render settings, clips and takes. Creating an episode starts with no scenes. Use **Manage projects, episodes & scenes** to create or rename projects/episodes and add scenes to the selected episode.
+The **Project → Episode → Scene** selectors sit above every workspace section and the render monitor. Each project owns its episodes, shared reference/video library and Qwen model selection. Episodes contain separate scenes; each scene retains its own script, references, render settings, clips and takes.
+
+Version 0.6.0 adds **Create new project**, **Create new episode** and **Create new scene** beside their selectors. Projects and episodes ask for names and are selected immediately after creation. Scenes are created immediately with names such as **Scene 1** and selected automatically. A project must be selected to create an episode, and an episode must be selected to create a scene. These requirements are checked by both the UI and API. Creating an episode starts with no scenes.
+
+Use **Settings → Names & deletion** to rename or delete the selected project, episode or scene. A scene can be renamed before it has a script. Explicit scene renames are preserved during Qwen reference discovery. Deletion moves saved data into `ai_video_agent/.trash` for recovery; deleting an episode includes its scenes and preserves the project library. Active or uncertain render jobs must be resolved before deleting their scene, episode or project. Deleting the last episode keeps the project and its library; create an episode before adding another scene. Cancelling a name/deletion dialog preserves unsaved edits.
 
 Switching projects restores that project's last selected episode and scene. Switching episodes restores the last selected scene in that episode; selections survive browser reloads. Scene requests, edits and uploads validate the selected episode. The pod's GPU queue remains shared, and an existing render continues when switching projects.
 

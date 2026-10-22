@@ -122,8 +122,10 @@ async function request(path, body) {
   const response = await api.fetchApi(prefix + path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
   return readResponse(response);
 }
-function button(label, work, className = "") {
-  return $("button", { text: label, class: className, disabled: busy, onclick: () => run(work) });
+function button(label, work, className = "", available = true) {
+  const control = $("button", { text: label, class: className, disabled: busy || !available, onclick: () => run(work) });
+  control.dataset.unavailable = String(!available);
+  return control;
 }
 async function run(work) {
   if (busy) return;
@@ -134,9 +136,9 @@ async function run(work) {
   message.textContent = "Working…";
   message.classList.remove("ava-error");
   workspace.querySelectorAll("button").forEach(b => { b.disabled = true; });
-  try { await work(); dirty = false; message.textContent = "Saved"; await refresh(true); }
+  try { if (await work() === false) { message.textContent = "Cancelled"; return; } dirty = false; message.textContent = "Saved"; await refresh(true); }
   catch (error) { message.textContent = error.message; message.classList.add("ava-error"); }
-  finally { busy = false; content.inert = false; projectHost.inert = false; workspace.setAttribute("aria-busy", "false"); workspace.querySelectorAll("button").forEach(b => { b.disabled = false; }); }
+  finally { busy = false; content.inert = false; projectHost.inert = false; workspace.setAttribute("aria-busy", "false"); workspace.querySelectorAll("button").forEach(b => { b.disabled = b.dataset.unavailable === "true"; }); }
 }
 async function action(command, values = {}) {
   return request("/action", { action: command, projectId, episodeId, sceneId, ...values });
@@ -149,8 +151,8 @@ function remember() {
   localStorage.setItem("ava-project", projectId);
   localStorage.setItem("ava-episode", episodeId);
   localStorage.setItem("ava-scene", sceneId);
-  if (projectId && episodeId) {
-    const saved = savedScope(projectId); saved.episodeId = episodeId; saved.scenes[episodeId] = sceneId;
+  if (projectId) {
+    const saved = savedScope(projectId); saved.episodeId = episodeId; if (episodeId) saved.scenes[episodeId] = sceneId;
     localStorage.setItem(`ava-scope-${projectId}`, JSON.stringify(saved));
   }
 }
@@ -158,6 +160,7 @@ async function chooseProject(id) {
   await refreshDone; remember(); projectId = id;
   const saved = savedScope(id); episodeId = saved.episodeId; sceneId = saved.scenes[episodeId] || "";
   scene = null; diagnostics = null; remember();
+  if (!id) switchSection("agent");
 }
 async function chooseEpisode(id) {
   await refreshDone; remember(); episodeId = id; sceneId = savedScope(projectId).scenes[id] || ""; scene = null; remember();
@@ -172,11 +175,7 @@ async function refresh(force = false) {
   try {
     state = await request(`/state${projectId ? `?${scopeQuery()}` : ""}`);
     if (projectId && !state.projects.some(p => p.id === projectId)) { projectId = ""; episodeId = ""; sceneId = ""; diagnostics = null; remember(); }
-    if (!projectId && state.projects.length) {
-      projectId = state.projects[0].id; diagnostics = null; const saved = savedScope(projectId); episodeId = saved.episodeId; sceneId = saved.scenes[episodeId] || "";
-      state = await request(`/state?${scopeQuery()}`);
-    }
-    if (!state.episodes.some(e => e.id === episodeId)) { episodeId = state.episodes[0]?.id || ""; }
+    episodeId = state.selectedEpisodeId || "";
     if (!state.scenes.some(s => s.id === sceneId)) sceneId = state.scenes[0]?.id || "";
     if (sceneId) scene = await request(`/scene?${scopeQuery()}&sceneId=${encodeURIComponent(sceneId)}`);
     else scene = null;
@@ -189,13 +188,6 @@ async function refresh(force = false) {
     // Preserve unsaved prompt, script, selection and comments during background checks.
     if (force || (snapshot() !== renderedSnapshot && !dirty && !busy && !workspace.contains(document.activeElement?.closest("input,textarea,select")))) render();
   } finally { refreshing = false; finish(); }
-}
-
-function newProjectForm() {
-  const name = input("New video project");
-  return card($("h3", { text: "Projects" }), field("Project name", name), button("Create project", async () => {
-    const result = await action("createProject", { name: name.value }); await chooseProject(result.project.id);
-  }));
 }
 
 function connection() {
@@ -213,26 +205,47 @@ function connection() {
 
 function projectControls() {
   const project = state.project;
-  if (!project) return newProjectForm();
-  const projects = select(state.projects, projectId);
+  const projects = select([{ id: "", name: "Select project" }, ...state.projects], projectId);
   projects.onchange = () => run(() => chooseProject(projects.value));
   const scenes = select([{ id: "", name: "Select scene" }, ...state.scenes.map(s => ({ id: s.id, name: s.name }))], sceneId);
   scenes.onchange = () => run(() => chooseScene(scenes.value));
-  const episodes = select(state.episodes, episodeId);
+  const episodes = select(state.episodes.length ? state.episodes : [{ id: "", name: project ? "No episodes yet" : "Select project first" }], episodeId);
   episodes.onchange = () => run(() => chooseEpisode(episodes.value));
-  const projectName = input(project.name), episodeName = input("New episode"), currentEpisode = input(state.episodes.find(e => e.id === episodeId)?.name || ""), sceneName = input("New scene");
-  return card(eyebrow("PROJECT / EPISODE / SCENE"), field("Project", projects), row(field("Episode", episodes), field("Scene", scenes)),
-    $("details", {}, $("summary", { text: "Manage projects, episodes & scenes" }),
-      newProjectForm(), field("Rename current project", projectName), button("Rename project", () => action("renameProject", { name: projectName.value })),
-      field("New episode name", episodeName), button("Create episode", async () => {
-        const result = await action("createEpisode", { name: episodeName.value }); await chooseEpisode(result.episode.id);
-      }), field("Rename current episode", currentEpisode), button("Rename episode", () => action("renameEpisode", { name: currentEpisode.value })),
-      field("New scene name", sceneName), button("Create scene", async () => {
-        const result = await action("createScene", { name: sceneName.value }); await chooseScene(result.scene.id);
-      }), button("Delete project…", async () => {
-        if (!confirm(`Move “${project.name}” and its saved media to the pod's recovery trash?`)) return;
-        await action("deleteProject"); projectId = ""; episodeId = ""; sceneId = ""; remember();
-      }, "ava-danger")));
+  episodes.disabled = !project; scenes.disabled = !episodeId;
+  const control = (label, choices, create) => $("div", { class: "ava-selector" }, field(label, choices), create);
+  return card(eyebrow("PROJECT / EPISODE / SCENE"), control("Project", projects, button("Create new project", async () => {
+    const name = prompt("New project name", `Project ${state.projects.length + 1}`);
+    if (name === null) return false;
+    const result = await action("createProject", { name }); await chooseProject(result.project.id); switchSection("agent");
+  })), row(control("Episode", episodes, button("Create new episode", async () => {
+    const name = prompt("New episode name", `Episode ${state.episodes.length + 1}`);
+    if (name === null) return false;
+    const result = await action("createEpisode", { name }); await chooseEpisode(result.episode.id); switchSection("agent");
+  }, "", !!project)), control("Scene", scenes, button("Create new scene", async () => {
+    const result = await action("createScene"); await chooseScene(result.scene.id); switchSection("agent");
+  }, "", !!project && !!episodeId))));
+}
+
+function manageSelection() {
+  const project = state.project, episode = state.episodes.find(e => e.id === episodeId);
+  const projectName = input(project.name), episodeName = input(episode?.name || ""), sceneName = input(scene?.name || "");
+  episodeName.disabled = !episode; sceneName.disabled = !scene;
+  return card(heading("Names & deletion", "Manage the selected project, episode and scene."),
+    field("Project name", projectName), row(button("Rename project", () => action("renameProject", { name: projectName.value })),
+      button("Delete project…", async () => {
+        if (!confirm(`Delete “${project.name}” and all its episodes and scenes? Saved data goes to recovery trash.`)) return false;
+        await action("deleteProject"); const removed = projectId; await chooseProject(""); localStorage.removeItem(`ava-scope-${removed}`);
+      }, "ava-danger")),
+    field("Episode name", episodeName), row(button("Rename episode", () => action("renameEpisode", { name: episodeName.value }), "", !!episode),
+      button("Delete episode…", async () => {
+        if (!confirm(`Delete “${episode.name}” and its scenes? Saved data goes to recovery trash. The project library is retained.`)) return false;
+        await action("deleteEpisode"); await chooseEpisode("");
+      }, "ava-danger", !!episode)),
+    field("Scene name", sceneName), row(button("Rename scene", () => action("renameScene", { name: sceneName.value }), "", !!scene),
+      button("Delete scene…", async () => {
+        if (!confirm(`Delete “${scene.name}” and its takes? Saved data goes to recovery trash.`)) return false;
+        await action("deleteScene"); scene = null; await chooseScene("");
+      }, "ava-danger", !!scene)));
 }
 
 async function uploadFile(file, values = {}) {
@@ -284,7 +297,7 @@ function savedVideos() {
 
 function sceneDraft() {
   const value = (id, fallback) => content.querySelector(`#ava-${id}`)?.value ?? fallback;
-  return { name: value("scene-name", scene.name), script: value("scene-script", scene.script), settings: {
+  return { name: scene.name, script: value("scene-script", scene.script), settings: {
     provider: "h3", aspectRatio: value("ratio", scene.settings.aspectRatio), megapixels: Number(value("mp", scene.settings.megapixels)),
     steps: Number(value("steps", scene.settings.steps)), seed: Number(value("seed", scene.settings.seed)), refImageSize: value("quality", scene.settings.refImageSize) } };
 }
@@ -303,12 +316,12 @@ function generationSettings() {
 }
 
 function sceneEditor() {
-  const name = input(scene.name), script = area(scene.script, 8);
-  name.id = "ava-scene-name"; script.id = "ava-scene-script";
+  const script = area(scene.script, 8);
+  script.id = "ava-scene-script";
   async function save() {
     await action("saveScene", sceneDraft());
   }
-  return card(eyebrow("01 / PLAN"), heading("Build your scene", "Start with your script. Qwen identifies references, then plans each clip."), field("Scene name", name), field("Script / scene", script),
+  return card(eyebrow("01 / PLAN"), heading("Build your scene", "Start with your script. Qwen identifies references, then plans each clip."), field("Script / scene", script),
     note(`FastH3 · ${scene.settings.aspectRatio} · ${scene.settings.megapixels} MP · ${scene.settings.steps} steps · configure in Settings`),
     row(button("Save scene", save), button("1 · Identify references", async () => { await save(); await action("identify"); })),
     note(scene.summary || "Identify slots, supply your references, then let Qwen inspect them and plan clips."),
@@ -395,12 +408,13 @@ function studio() {
 }
 
 function render() {
+  if (!state.project) section = "agent";
   const detailsState = new Map([...workspace.querySelectorAll("details")].map((el, i) => [`${i}:${el.querySelector("summary")?.textContent}`, el.open]));
   message.classList.remove("ava-error");
   const agent = $("section", { id: "ava-panel-agent", role: "tabpanel", ariaLabel: "Agent" },
     ...(scene ? [sceneEditor(), references(), studio(), scene.clips.length && heading("Review & render", `${scene.clips.filter(c => c.status === "complete").length} of ${scene.clips.length} clips complete · approve each take when ready`), ...scene.clips.map(clipEditor)].filter(Boolean) : [card(heading("Your next video starts here", "Create a project and scene above, then give Qwen your script."))]));
   const libraryPanel = $("section", { id: "ava-panel-library", role: "tabpanel", ariaLabel: "Library" }, projectId ? library() : card(note("Create a project to build its reference library.")));
-  const settingsPanel = $("section", { id: "ava-panel-settings", role: "tabpanel", ariaLabel: "Settings" }, ...(state.project ? [connection()] : []), ...(scene ? [generationSettings()] : []),
+  const settingsPanel = $("section", { id: "ava-panel-settings", role: "tabpanel", ariaLabel: "Settings" }, ...(state.project ? [manageSelection(), connection()] : []), ...(scene ? [generationSettings()] : []),
     card(heading("Render timing", "Automatic tracking for every new take."), note("Elapsed time includes time spent in the queue. Estimated finish uses recent completed takes with matching duration, steps, resolution and reference size. The first render shows a sampling estimate once its rate is known. Completion time is recorded after the video is verified and saved. Times use your browser's local timezone.")));
   projectHost.replaceChildren(projectControls());
   navigation.hidden = !state.project;
@@ -425,6 +439,7 @@ function mount() {
         onkeydown: event => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) { event.preventDefault(); const tabs = [...navigation.children]; const next = event.key === "Home" ? 0 : event.key === "End" ? 2 : (index + (event.key === "ArrowRight" ? 1 : 2)) % 3; switchSection(tabs[next].dataset.section); tabs[next].focus(); } } });
       tab.dataset.section = id; tab.setAttribute("aria-controls", `ava-panel-${id}`); return tab;
     }));
+  navigation.hidden = true;
   livePanel = $("div", { class: "ava-monitor" });
   workspace = $("div", { class: "ava-workspace" }, $("header", { class: "ava-header" },
     $("div", { class: "ava-brand" }, $("span", { class: "ava-mark", text: "a", ariaHidden: "true" }), $("div", {}, $("h2", { text: "AI Video Agent" }), $("span", { class: "ava-subtitle", text: "Qwen plans. FastH3 creates." }))), row(
