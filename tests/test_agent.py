@@ -30,6 +30,17 @@ engine_module = importlib.import_module(namespace.__name__ + ".engine")
 local_qwen = importlib.import_module(namespace.__name__ + ".local_qwen")
 http_contract = importlib.import_module(namespace.__name__ + ".http_contract")
 timing = importlib.import_module(namespace.__name__ + ".timing")
+h3_prompt = importlib.import_module(namespace.__name__ + ".h3_prompt")
+
+BASE_PROMPT = ("integrated_multimodal_description: [Shot 1] Live-action. Static medium shot of an actor opening a door. "
+               "The actor (S1) says with synchronized lips: <d>[English] Hello.</d>\n"
+               "overall_soundscape: The latch clicks over quiet room ambience.\nnon_diegetic_music: N/A")
+REF_PROMPT = ("subject_definitions: Actor <Subject 1> follows the supplied appearance.\n"
+              "summary: [reference generation] Actor opens the door and speaks.\n"
+              "retention_analysis: <Subject 1>: fully_preserved - visual identity and clothing.\n"
+              "detailed_description: Live-action. [Shot 1] Static medium shot of Actor <Subject 1> opening a door. "
+              "Actor (S1) says with synchronized lips: <d>[English] Hello.</d>\n"
+              "overall_soundscape: The latch clicks over quiet room ambience.\nnon_diegetic_music: N/A")
 
 
 class OriginPolicyTests(unittest.TestCase):
@@ -83,6 +94,77 @@ class Fixture:
 
     def teardown_fixture(self):
         self.temp.cleanup()
+
+
+class H3PromptTests(Fixture, unittest.TestCase):
+    def setUp(self): self.setup_fixture()
+    def tearDown(self): self.teardown_fixture()
+
+    def test_base_and_reference_modes_preserve_original_dialogue(self):
+        refs, _ = qwen.reference_context(self.store, self.scene)
+        self.assertEqual(BASE_PROMPT, h3_prompt.validate(BASE_PROMPT, [], 15))
+        hindi = REF_PROMPT.replace("[English] Hello.", "[Hindi] दरवाज़ा खुला है।")
+        self.assertEqual(hindi, h3_prompt.validate(hindi, refs, 15))
+        with self.assertRaisesRegex(ValueError, "sections"):
+            h3_prompt.validate(BASE_PROMPT, refs, 15)
+
+    def test_reordered_reference_inputs_keep_subject_identity_and_bind_real_media(self):
+        self.scene["references"].insert(0, {"id": "room", "name": "Room", "kind": "location", "description": "Room", "assets": [self.asset]})
+        refs, paths = qwen.reference_context(self.store, self.scene, core.selected(self.scene, self.clip))
+        self.assertEqual("<Subject 2>", refs[0]["subjectLabel"])
+        self.assertEqual([self.store.path(self.asset["path"])], paths)
+        self.clip["prompt"] = REF_PROMPT.replace("<Subject 1>", "<Subject 2>")
+        h3_prompt.validate(self.clip["prompt"], refs, 15)
+        bound = core.final_prompt(self.scene, self.clip)
+        self.assertIn("<Picture 1>: Actor, <Subject 2>", bound)
+        self.assertNotIn("<Picture 2>", bound)
+
+    def test_voice_only_reference_does_not_invent_a_visual_subject(self):
+        self.scene["references"][0]["assets"] = [{"path": "voice.wav", "name": "voice.wav", "kind": "audio"}]
+        refs, paths = qwen.reference_context(self.store, self.scene)
+        self.assertIsNone(refs[0]["subjectLabel"])
+        self.assertEqual([], paths)
+        voice = REF_PROMPT.replace("Actor <Subject 1> follows the supplied appearance.", "Actor supplies voice timbre only.").replace("<Subject 1>", "Actor")
+        self.assertEqual(voice, h3_prompt.validate(voice, refs, 15))
+        self.clip["prompt"] = voice
+        bound = core.final_prompt(self.scene, self.clip)
+        self.assertIn("<Audio 1>: Actor", bound)
+        self.assertNotIn("<Picture", bound)
+
+    def test_frame_zero_guide_stays_outside_numbered_identity_images_and_music(self):
+        self.clip.update(status="complete", frame=self.asset)
+        following = self.scene["clips"][1]
+        following["prompt"] = REF_PROMPT
+        bound = core.final_prompt(self.scene, following)
+        self.assertIn("Opening Frame:", bound.split("subject_definitions:")[0])
+        self.assertEqual(1, bound.count("<Picture 1>"))
+        self.assertTrue(bound.endswith("non_diegetic_music: N/A"))
+        following["transition"] = "cut"
+        self.assertNotIn("Opening Frame:", core.final_prompt(self.scene, following))
+
+    def test_rejects_guessed_missing_or_foreign_reference_labels(self):
+        refs, _ = qwen.reference_context(self.store, self.scene)
+        for invalid in (REF_PROMPT + "\n<Picture 1>", REF_PROMPT + "\n<Audio 1>",
+                        REF_PROMPT.replace("<Subject 1>", "<Subject 2>"), REF_PROMPT.replace("<Subject 1>", "Actor")):
+            with self.subTest(prompt=invalid), self.assertRaises(ValueError):
+                h3_prompt.validate(invalid, refs, 15)
+
+    def test_cut_times_are_chronological_and_inside_clip_duration(self):
+        valid = BASE_PROMPT.replace("\noverall_soundscape:", " [Shot 2] At 00:06.500, the shot cuts to the open doorway.\noverall_soundscape:")
+        h3_prompt.validate(valid, [], 15)
+        for invalid in (valid.replace("00:06.500", "00:15.000"), valid.replace("00:06.500", "00:00.000"),
+                        valid.replace("[Shot 2]", "[Shot 3]"), valid.replace("[Shot 1]", "[Shot 1] At 00:00.000,"),
+                        valid.replace("\noverall_soundscape:", " [Shot 3] At 00:05.000, return to Actor.\noverall_soundscape:")):
+            with self.subTest(prompt=invalid), self.assertRaises(ValueError):
+                h3_prompt.validate(invalid, [], 15)
+
+    def test_dialogue_requires_language_balanced_tags_and_ordered_speakers(self):
+        valid = BASE_PROMPT.replace("\noverall_soundscape:", " Another actor (S2) replies: <d>[English] Come in.</d> Actor (S1) nods: <d>[English] Thanks.</d>\noverall_soundscape:")
+        h3_prompt.validate(valid, [], 15)
+        for invalid in (BASE_PROMPT.replace("[English] ", ""), BASE_PROMPT.replace("</d>", ""),
+                        BASE_PROMPT.replace("(S1)", "(S2)"), BASE_PROMPT.replace("(S1)", "")):
+            with self.subTest(prompt=invalid), self.assertRaises(ValueError):
+                h3_prompt.validate(invalid, [], 15)
 
 
 class CoreTests(Fixture, unittest.TestCase):
@@ -592,9 +674,9 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_qwen_json_uses_native_model_and_images_without_network(self):
         paths = [self.store.path(self.asset["path"])]
-        with patch.object(local_qwen, "generate", return_value='{"prompt":"Native prompt"}') as generate:
+        with patch.object(local_qwen, "generate", return_value=json.dumps({"prompt": BASE_PROMPT})) as generate:
             result = await qwen.ask(self.store, qwen.PROMPT, {"target":"clip"}, paths)
-        self.assertEqual("Native prompt", result["prompt"])
+        self.assertEqual(BASE_PROMPT, result["prompt"])
         self.assertEqual(local_qwen.DEFAULT_MODEL, generate.call_args.args[0])
         self.assertEqual(paths, generate.call_args.args[3])
         self.assertIn(qwen.PROMPT, generate.call_args.args[1])
@@ -602,10 +684,66 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
     async def test_qwen_model_override_is_stored_as_a_local_filename(self):
         model = "qwen3vl_8b_fp8_scaled.safetensors"
         self.store.write("qwen.json", qwen.validate_config({"model": model}))
-        with patch.object(local_qwen, "generate", return_value='{"prompt":"Native prompt"}') as generate:
+        with patch.object(local_qwen, "generate", return_value=json.dumps({"prompt": BASE_PROMPT})) as generate:
             await qwen.ask(self.store, qwen.PROMPT, {})
         self.assertEqual(model, generate.call_args.args[0])
         self.assertEqual("comfyui", qwen.config(self.store)["runtime"])
+
+    async def test_planning_minimizes_clips_and_validates_only_selected_reference_mode(self):
+        refs, _ = qwen.reference_context(self.store, self.scene)
+        plan = {"clips": [{"id": "single", "title": "Complete scene", "duration": 15,
+                           "referenceIds": [], "transition": "first", "prompt": BASE_PROMPT}]}
+        payload = {"script": "Actor opens a door and says Hello.", "suppliedReferences": refs}
+        with patch.object(local_qwen, "generate", return_value=json.dumps(plan)) as generate:
+            result = await qwen.ask(self.store, qwen.PLAN, payload)
+        clean = core.validate_plan(self.scene, result)
+        self.assertEqual(1, len(clean))
+        self.assertEqual(15, clean[0]["duration"])
+        sent = json.loads(generate.call_args.args[2])
+        policy = sent["h3Prompting"]["clipPlanning"]
+        self.assertEqual(15, policy["maxSeconds"])
+        self.assertTrue(policy["singleClipWhenSceneFits"] and policy["preserveDialogueAndActions"])
+        self.assertIn("Do not create one clip per sentence", generate.call_args.args[1])
+        self.assertNotIn("h3Prompting", payload, "style metadata must not mutate saved input")
+        generate.assert_called_once()
+
+    async def test_reference_plan_leaves_later_outlines_unformatted(self):
+        refs, _ = qwen.reference_context(self.store, self.scene)
+        plan = {"clips": [{"id": "first", "duration": 15, "referenceIds": ["actor"], "prompt": REF_PROMPT},
+                          {"id": "later", "duration": 6, "referenceIds": ["actor"], "prompt": "Later outline, awaiting actual prior frame."}]}
+        with patch.object(local_qwen, "generate", return_value=json.dumps(plan)) as generate:
+            self.assertEqual(plan, await qwen.ask(self.store, qwen.PLAN, {"suppliedReferences": refs}))
+        generate.assert_called_once()
+
+    async def test_h3_format_repair_once_preserves_source_payload_and_reference_binding(self):
+        refs, _ = qwen.reference_context(self.store, self.scene)
+        payload = {"script": "Actor says Hello.", "references": refs, "frameGuideEnabled": True, "target": {"duration": 15}}
+        with patch.object(local_qwen, "generate", side_effect=['{"prompt":"Old unstructured draft"}', json.dumps({"prompt": REF_PROMPT})]) as generate:
+            result = await qwen.ask(self.store, qwen.PROMPT, payload)
+        self.assertEqual(REF_PROMPT, result["prompt"])
+        sent = json.loads(generate.call_args.args[2])
+        self.assertEqual(payload["script"], sent["script"])
+        self.assertEqual(refs, sent["references"])
+        self.assertEqual(15, sent["target"]["duration"])
+        self.assertEqual("ref2va", sent["h3Prompting"]["mode"])
+        self.assertTrue(sent["h3Prompting"]["frameGuide"])
+        self.assertIn("Old unstructured draft", sent["formatRepair"]["previousResponse"])
+        self.assertNotIn("formatRepair", payload)
+        self.assertEqual(2, generate.call_count)
+
+    async def test_repeated_bad_format_stops_with_actionable_error(self):
+        with patch.object(local_qwen, "generate", return_value="Use the workflow") as generate:
+            with self.assertRaisesRegex(ValueError, "valid H3 prompt"):
+                await qwen.ask(self.store, qwen.PROMPT, {})
+        self.assertEqual(2, generate.call_count)
+
+    async def test_reference_discovery_stays_separate_from_style_and_clip_planning(self):
+        discovered = {"references": []}
+        with patch.object(local_qwen, "generate", return_value=json.dumps(discovered)) as generate:
+            self.assertEqual(discovered, await qwen.ask(self.store, qwen.DISCOVER, {"script": "A silent room."}))
+        self.assertNotIn("H3 PROMPT CONTRACT", generate.call_args.args[1])
+        self.assertNotIn("h3Prompting", json.loads(generate.call_args.args[2]))
+        generate.assert_called_once()
 
     async def test_engine_planning_uses_the_selected_projects_model(self):
         chosen = "qwen3vl_8b_fp8_scaled.safetensors"

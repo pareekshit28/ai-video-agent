@@ -45,11 +45,17 @@ The workspace has three sections: **Agent** for scripts, scene references, promp
 
 1. Select or create a project at the top, choose an episode, then create a scene and paste its script.
 2. **Identify references** creates slots only. Supply the actual images and voice samples, or copy entries from the project library.
-3. **Understand references & plan clips** inspects supplied images and plans 2–15 second H3 clips. The first prompt is ready for editing; later clips keep story outlines until their preceding clip finishes.
+3. **Understand references & plan clips** inspects supplied images and plans the fewest practical 2–15 second H3 clips, combining actions and dialogue when natural. The first prompt is ready for editing; later clips keep story outlines until their preceding clip finishes.
 4. Edit the prompt, reference choices, duration or continuity. Apply revision comments with Qwen if needed. **Approve prompt & generate this clip** submits only that reviewed clip.
 5. The video is saved and verified at 24 FPS, trimmed to the requested duration, and its actual last decoded frame is extracted. Qwen inspects that frame to prepare the following prompt, then pauses for review.
 
 Direct continuations use `MiniMaxH3AddGuide` at frame zero. Cuts use the preceding frame only as story context. You can replace/restore the last frame, stage a new duration while retaining the current take, and regenerate individual clips without deleting previous takes. Lost submission responses stop for recovery; resuming never implicitly creates a replacement render. Projects, references, videos, frames and request audits persist in ComfyUI's output directory under `ai_video_agent` by default. Set `AVA_STORAGE_DIR` to a RunPod volume folder if needed.
+
+### H3 prompt style and fewer clips
+
+Version 0.7.0 follows MiniMax's current H3 prompt guides: six sections for reference-based generation, three without references, explicit shot cuts and speaker/language tags, and separate ambience/music fields. Exact scripted dialogue, named references and frame continuity remain part of the contract. Qwen aims to fit a scene into one clip when practical, otherwise groups beats into fewer clips up to 15 seconds without rushing or dropping content. The app checks prompt structure and attempts one formatting repair before reporting an error.
+
+Use **Replan / optimize unsubmitted clips** to apply the fewer-clip policy before any takes are submitted. Existing rendered plans stay preserved; use a new scene to replan them. **Plan prompt** or **Apply comments with Qwen** applies the new H3 format to one draft. See [H3 prompting notes and official sources](docs/H3_PROMPTING.md) for reference binding, examples and validation limits.
 
 ### Projects, episodes and scenes
 

@@ -69,6 +69,7 @@ class Engine:
         result = await self.ask(base_url, qwen.PROMPT, {"script": scene["script"], "summary": scene["summary"],
             "references": manifest, "previousFrameAttachment": len(paths) if prior else None,
             "previous": {"prompt": prior.get("submittedPrompt"), "actualDuration": prior.get("actualDuration")} if prior else None,
+            "frameGuideEnabled": core.continuation(clip),
             "target": {"outline": clip["outline"], "prompt": clip["prompt"], "duration": clip.get("nextDuration", clip["duration"]),
                        "continuation": core.continuation(clip)}, "settings": scene["settings"], "comments": comments,
             "remainingOutline": [c["outline"] for c in scene["clips"][scene["clips"].index(clip) + 1:]]}, paths, project_id=scene["projectId"])

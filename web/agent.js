@@ -325,6 +325,7 @@ function sceneEditor() {
     note(`FastH3 · ${scene.settings.aspectRatio} · ${scene.settings.megapixels} MP · ${scene.settings.steps} steps · configure in Settings`),
     row(button("Save scene", save), button("1 · Identify references", async () => { await save(); await action("identify"); })),
     note(scene.summary || "Identify slots, supply your references, then let Qwen inspect them and plan clips."),
+    note("Qwen combines consecutive actions and dialogue into fewer clips, up to 15 seconds each, while preserving natural timing."),
     button(scene.clips.length ? "Replan / optimize unsubmitted clips" : "2 · Understand references & plan clips", async () => { await save(); await action("plan"); }, "ava-primary"));
 }
 

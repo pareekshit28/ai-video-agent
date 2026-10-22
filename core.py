@@ -9,6 +9,7 @@ import re
 import shutil
 import time
 import uuid
+from . import h3_prompt
 
 ACTIVE = {"submitting", "submission-unknown", "queued", "rendering", "saving", "recoverable"}
 RATIOS = {"16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1}
@@ -199,8 +200,8 @@ def selected(scene, clip):
 
 def media(scene, clip):
     refs = selected(scene, clip)
-    return ([{**a, "referenceName": r["name"]} for r in refs for a in r["assets"] if a["kind"] == "image"],
-            [{**a, "referenceName": r["name"]} for r in refs for a in r["assets"] if a["kind"] == "audio"])
+    return ([{**a, "referenceName": r["name"], "referenceId": r["id"], "referenceKind": r["kind"]} for r in refs for a in r["assets"] if a["kind"] == "image"],
+            [{**a, "referenceName": r["name"], "referenceId": r["id"]} for r in refs for a in r["assets"] if a["kind"] == "audio"])
 
 
 def previous(scene, clip):
@@ -292,9 +293,15 @@ def final_prompt(scene, clip):
     if TAGS.search(clip["prompt"]):
         raise ValueError("Use reference names in the editable prompt; input tags are assigned automatically")
     images, audios = media(scene, clip)
-    bindings = [f"<Picture {i+1}>: {a['referenceName']}. Use only for this reference's identity, appearance or setting." for i, a in enumerate(images)]
+    labels = h3_prompt.subject_labels(scene)
+    roles = {"character": "Preserve the character's visual identity, clothing and proportions; this is not a required starting-frame composition.",
+             "location": "Preserve the environment's architecture, layout and identifying setting details; this is not a forced starting frame.",
+             "prop": "Preserve the prop's shape, material and identifying details."}
+    bindings = [f"<Picture {i+1}>: {a['referenceName']}, {labels[a['referenceId']]}. {roles[a['referenceKind']]}" for i, a in enumerate(images)]
     bindings += [f"<Audio {i+1}>: {a['referenceName']}'s supplied voice timbre, not the sample's spoken words." for i, a in enumerate(audios)]
-    return "Reference\n" + ("\n".join(bindings) or "No supplied appearance or voice reference inputs.") + "\n\n" + clip["prompt"] + ("\nBegin on the supplied frame-zero guide and continue the preceding action without resetting the scene." if continuation(clip) else "")
+    if continuation(clip) and previous(scene, clip) and previous(scene, clip).get("frame"):
+        bindings.append("Opening Frame: the supplied frame-zero guide anchors the opening composition and state. Continue the preceding action without resetting it. This guide is separate from the numbered reference images.")
+    return "Reference\n" + ("\n".join(bindings) or "No supplied appearance or voice reference inputs.") + "\n\n" + clip["prompt"]
 
 
 def build_h3(store, scene, clip, input_dir, take_id):

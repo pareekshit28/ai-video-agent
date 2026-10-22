@@ -41,15 +41,29 @@ eng = package.routes.engine()
 eng.watch = lambda *args: None
 
 
+def styled_prompt(refs, action):
+    description = "Live-action, warm sunrise light. [Shot 1] Static shot, camera locked off; no camera movement. " + action + " No dialogue."
+    if refs:
+        prompt = ("subject_definitions: " + "\n".join(f"{r['name']} {r.get('subjectLabel') or ''} follows the supplied reference." for r in refs) +
+                  "\nsummary: [reference generation] Woman opens the window and watches the sunrise.\n" +
+                  "retention_analysis: " + "\n".join(f"{r.get('subjectLabel') or r['name']}: fully_preserved - supplied visual identity." for r in refs) +
+                  "\ndetailed_description: " + description)
+    else:
+        prompt = "integrated_multimodal_description: " + description
+    prompt += "\noverall_soundscape: A window latch clicks over soft room ambience.\nnon_diegetic_music: N/A"
+    return package.qwen.h3_prompt.validate(prompt, refs, 15)
+
+
 async def ask(store, instruction, payload, images=(), model_file=None):
     if instruction == package.qwen.DISCOVER:
         return {"title": "Window scene", "summary": "A woman opens a window and smiles.", "references": [
             {"id": "woman", "name": "Woman", "kind": "character", "description": "The woman in the script"}]}
     if instruction == package.qwen.PLAN:
         ids = [r["id"] for r in payload["suppliedReferences"]]
-        return {"clips": [{"id": "open", "title": "Open window", "duration": 5, "referenceIds": ids, "transition": "first", "prompt": "Static shot, camera locked off; no camera movement. Woman opens the window."},
+        # Two clips deliberately exercise frame-aware continuation; this fake is not a planner-quality evaluation.
+        return {"clips": [{"id": "open", "title": "Open window", "duration": 5, "referenceIds": ids, "transition": "first", "prompt": styled_prompt(payload["suppliedReferences"], "Woman opens the window.")},
                           {"id": "smile", "title": "Smile", "duration": 5, "referenceIds": ids, "transition": "continue", "prompt": "She smiles at the sunrise."}]}
-    return {"prompt": "Static shot, camera locked off; no camera movement. Woman smiles at the sunrise. No dialogue."}
+    return {"prompt": styled_prompt(payload.get("references", []), "Woman smiles at the sunrise.")}
 package.qwen.ask = ask
 
 queue = []
