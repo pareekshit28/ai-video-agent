@@ -20,7 +20,7 @@
 .ava-workspace h2 { font-size: 19px; font-weight: 650; margin: 0; }
 .ava-workspace h3 { font-size: 18px; font-weight: 600; }
 .ava-workspace h4 { font-size: 15px; }
-.ava-header, .ava-tabs, .ava-monitor, .ava-workspace main, .ava-workspace > p, .ava-workspace footer { max-width: 1080px; margin-left: auto; margin-right: auto; }
+.ava-header, .ava-project-scope, .ava-tabs, .ava-monitor, .ava-workspace main, .ava-workspace > p, .ava-workspace footer { max-width: 1080px; margin-left: auto; margin-right: auto; }
 .ava-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 4px 0 24px; flex-wrap: wrap; }
 .ava-brand { display: flex; gap: 12px; align-items: center; }
 .ava-mark { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 12px; background: var(--ava-accent); color: #231b15; font-size: 30px; font-weight: 700; line-height: 1; }

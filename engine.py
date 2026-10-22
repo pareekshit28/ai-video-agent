@@ -26,7 +26,7 @@ class Engine:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
             return await qwen.request_json(session, method, url, **kwargs)
 
-    async def ask(self, base_url, instruction, payload, images=()):
+    async def ask(self, base_url, instruction, payload, images=(), project_id=None):
         async with self.qwen_lock:
             # Only unload Comfy models while its global execution queue is idle.
             queue = await self.http("GET", base_url + "/queue")
@@ -35,12 +35,12 @@ class Engine:
             import comfy.model_management as mm
             await asyncio.to_thread(mm.unload_all_models)
             await asyncio.to_thread(mm.soft_empty_cache)
-            return await qwen.ask(self.store, instruction, payload, images)
+            return await qwen.ask(self.store, instruction, payload, images, model_file=qwen.config(self.store, project_id)["model"])
 
     async def discover(self, scene, base_url):
         if any(c.get("takeId") for c in scene["clips"]):
             raise ValueError("Create a new scene to rediscover references after rendering takes")
-        result = await self.ask(base_url, qwen.DISCOVER, {"script": core.text(scene["script"])})
+        result = await self.ask(base_url, qwen.DISCOVER, {"script": core.text(scene["script"])}, project_id=scene["projectId"])
         references = core.validate_references(result)
         # Retain supplied media for slots with stable IDs.
         existing = {r["id"]: r for r in scene["references"]}
@@ -52,7 +52,7 @@ class Engine:
         if any(c.get("takeId") for c in scene["clips"]):
             raise ValueError("Plans with submitted takes are preserved. Create another scene to replan the script.")
         manifest, images = qwen.reference_context(self.store, scene)
-        result = await self.ask(base_url, qwen.PLAN, {"script": core.text(scene["script"]), "suppliedReferences": manifest, "settings": scene["settings"]}, images)
+        result = await self.ask(base_url, qwen.PLAN, {"script": core.text(scene["script"]), "suppliedReferences": manifest, "settings": scene["settings"]}, images, project_id=scene["projectId"])
         clips = core.validate_plan(scene, result)
         scene["clips"] = clips
         clips[0]["promptContext"] = core.prompt_context(self.store, scene, clips[0])
@@ -69,7 +69,7 @@ class Engine:
             "previous": {"prompt": prior.get("submittedPrompt"), "actualDuration": prior.get("actualDuration")} if prior else None,
             "target": {"outline": clip["outline"], "prompt": clip["prompt"], "duration": clip.get("nextDuration", clip["duration"]),
                        "continuation": core.continuation(clip)}, "settings": scene["settings"], "comments": comments,
-            "remainingOutline": [c["outline"] for c in scene["clips"][scene["clips"].index(clip) + 1:]]}, paths)
+            "remainingOutline": [c["outline"] for c in scene["clips"][scene["clips"].index(clip) + 1:]]}, paths, project_id=scene["projectId"])
         prompt = core.text(result["prompt"], 12000)
         if core.TAGS.search(prompt):
             raise ValueError("Qwen returned numbered media tags; retry prompt planning")

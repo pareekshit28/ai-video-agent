@@ -43,13 +43,23 @@ Open **AI Video Agent** in ComfyUI's sidebar for the complete project flow:
 
 The workspace has three sections: **Agent** for scripts, scene references, prompt review and rendering; **Library** for reusable project references, saved videos and previous takes with download links; and **Settings** for the Qwen model, installation checks and scene render settings. Unsaved inputs stay in place when switching sections. **Open workspace** expands the same UI into a larger window.
 
-1. Create a project and scene; paste the script.
+1. Select or create a project at the top, choose an episode, then create a scene and paste its script.
 2. **Identify references** creates slots only. Supply the actual images and voice samples, or copy entries from the project library.
 3. **Understand references & plan clips** inspects supplied images and plans 2–15 second H3 clips. The first prompt is ready for editing; later clips keep story outlines until their preceding clip finishes.
 4. Edit the prompt, reference choices, duration or continuity. Apply revision comments with Qwen if needed. **Approve prompt & generate this clip** submits only that reviewed clip.
 5. The video is saved and verified at 24 FPS, trimmed to the requested duration, and its actual last decoded frame is extracted. Qwen inspects that frame to prepare the following prompt, then pauses for review.
 
 Direct continuations use `MiniMaxH3AddGuide` at frame zero. Cuts use the preceding frame only as story context. You can replace/restore the last frame, stage a new duration while retaining the current take, and regenerate individual clips without deleting previous takes. Lost submission responses stop for recovery; resuming never implicitly creates a replacement render. Projects, references, videos, frames and request audits persist in ComfyUI's output directory under `ai_video_agent` by default. Set `AVA_STORAGE_DIR` to a RunPod volume folder if needed.
+
+### Projects, episodes and scenes
+
+Version 0.5.0 puts **Project → Episode → Scene** above every workspace section and the render monitor. Each project owns its episodes, shared reference/video library and Qwen model selection. Episodes contain separate scenes; each scene retains its own script, references, render settings, clips and takes. Creating an episode starts with no scenes. Use **Manage projects, episodes & scenes** to create or rename projects/episodes and add scenes to the selected episode.
+
+Switching projects restores that project's last selected episode and scene. Switching episodes restores the last selected scene in that episode; selections survive browser reloads. Scene requests, edits and uploads validate the selected episode. The pod's GPU queue remains shared, and an existing render continues when switching projects.
+
+All episodes share the selected project's library. Saved videos include their episode and scene names. Qwen settings are saved per project; older pod-wide Qwen settings provide the initial default until a project chooses its own model. Installation files and the physical GPU remain shared by the ComfyUI installation.
+
+Existing projects and scenes appear under **Episode 1** automatically. This compatibility mapping keeps original scene IDs, take histories and media paths intact. **Open workspace** is hidden while the expanded workspace is open and returns after closing it, including with Escape.
 
 ### Render status and timing
 

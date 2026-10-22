@@ -70,13 +70,28 @@ async def state(request):
     eng = engine()
     projects = eng.store.projects()
     project_id = request.query.get("projectId")
-    scenes = eng.store.scenes(project_id) if project_id and any(p["id"] == project_id for p in projects) else []
+    project = next((p for p in projects if p["id"] == project_id), None)
+    episodes, scenes, videos = [], [], []
+    if project:
+        episodes = project["episodes"]
+        episode_id = request.query.get("episodeId") or episodes[0]["id"]
+        eng.store.episode(project_id, episode_id)
+        all_scenes = eng.store.scenes(project_id)
+        scenes = [s for s in all_scenes if s["episodeId"] == episode_id]
+        episode_names = {e["id"]: e["name"] for e in episodes}
+        for saved in all_scenes:
+            for clip in saved["clips"]:
+                for take in [clip, *clip.get("versions", [])]:
+                    if take.get("video"):
+                        videos.append({k: take.get(k) for k in ("id", "title", "video", "duration", "actualDuration", "timing")} | {"sceneName": saved["name"], "episodeName": episode_names.get(saved["episodeId"], "Episode 1")})
     # Restore monitoring after a server restart, but never resubmit a job.
-    for project in projects:
-        for scene in eng.store.scenes(project["id"]):
-            if not scene.get("paused") and any(c["status"] in core.ACTIVE for c in scene["clips"]):
-                eng.watch(project["id"], scene["id"], base_url(request))
-    return web.json_response({"projects": projects, "scenes": scenes, "qwen": qwen.config(eng.store), "storage": str(eng.store.root)})
+    for watched_project in projects:
+        for watched_scene in eng.store.scenes(watched_project["id"]):
+            if not watched_scene.get("paused") and any(c["status"] in core.ACTIVE for c in watched_scene["clips"]):
+                eng.watch(watched_project["id"], watched_scene["id"], base_url(request))
+    summaries = [{k: p[k] for k in ("id", "name", "createdAt")} for p in projects]
+    return web.json_response({"projects": summaries, "project": project, "episodes": episodes, "scenes": scenes, "videos": videos,
+                              "qwen": qwen.config(eng.store, project_id if project else None), "storage": str(eng.store.root)})
 
 
 @PromptServer.instance.routes.get("/ava-agent/health")
@@ -88,7 +103,7 @@ async def health(request):
     missing = sorted(({n["class_type"] for n in template.values()} | {"MiniMaxH3AddGuide"}) - set(nodes.NODE_CLASS_MAPPINGS))
     required = {"diffusion_models": [template["127"]["inputs"]["unet_name"]], "text_encoders": [template["128"]["inputs"]["clip_name"]],
                 "vae": [template["119"]["inputs"]["vae_name"], template["120"]["inputs"]["vae_name"]]}
-    conf = qwen.validate_config(qwen.config(eng.store))
+    conf = qwen.validate_config(qwen.config(eng.store, request.query.get("projectId")))
     required["text_encoders"].append(conf["model"])
     missing_models = [name for kind, names in required.items() for name in names if name not in folder_paths.get_filename_list(kind)]
     result = {"missingNodes": missing, "missingModels": missing_models, "ffmpeg": bool(shutil.which(os.getenv("FFMPEG_PATH", "ffmpeg"))),
@@ -112,14 +127,14 @@ async def action(request):
     eng = engine()
     store = eng.store
     command = body["action"]
-    if command == "qwenConfig":
-        store.write("qwen.json", qwen.validate_config(body["config"]))
-        return web.json_response({"ok": True})
     if command == "createProject":
         return web.json_response({"project": store.create_project(body["name"])})
     project_id = core.identifier(body["projectId"])
     async with eng.lock(project_id):
         project = store.project(project_id)
+        if command == "qwenConfig":
+            store.write(f"projects/{project_id}/qwen.json", qwen.validate_config(body["config"]))
+            return web.json_response({"ok": True})
         if command == "renameProject":
             project["name"] = core.text(body["name"], 120)
             store.write(f"projects/{project_id}/project.json", project)
@@ -128,7 +143,14 @@ async def action(request):
             store.trash_project(project_id)
             return web.json_response({"ok": True})
         if command == "createScene":
-            return web.json_response({"scene": store.create_scene(project_id, body["name"], body.get("script", ""))})
+            return web.json_response({"scene": store.create_scene(project_id, body["name"], body.get("script", ""), body.get("episodeId"))})
+        if command == "createEpisode":
+            return web.json_response({"episode": store.create_episode(project_id, body["name"])})
+        if command == "renameEpisode":
+            episode = store.episode(project_id, body["episodeId"])
+            next(e for e in project["episodes"] if e["id"] == episode["id"])["name"] = core.text(body["name"], 150)
+            store.write(f"projects/{project_id}/project.json", project)
+            return web.json_response({"ok": True})
         if command in ("createLibrary", "cloneLibrary", "removeLibrary"):
             if command == "createLibrary":
                 if body["kind"] not in ("character", "location", "prop"):
@@ -144,7 +166,7 @@ async def action(request):
             return web.json_response({"ok": True})
         scene_id = core.identifier(body["sceneId"])
         async with eng.lock(scene_id):
-            scene = store.scene(project_id, scene_id)
+            scene = store.scene(project_id, scene_id, body.get("episodeId"))
             core.settings(scene["settings"])
             clip = find_clip(scene, body["clipId"]) if body.get("clipId") else None
             base = base_url(request)
@@ -276,7 +298,7 @@ def public_scene(eng, scene):
 @errors
 async def get_scene(request):
     eng = engine()
-    return web.json_response(public_scene(eng, eng.store.scene(request.query["projectId"], request.query["sceneId"])))
+    return web.json_response(public_scene(eng, eng.store.scene(request.query["projectId"], request.query["sceneId"], request.query.get("episodeId"))))
 
 
 @PromptServer.instance.routes.post("/ava-agent/upload")
@@ -288,7 +310,7 @@ async def upload(request):
     async with eng.lock(project_id):
         async with eng.lock(scene_id or "library-" + project_id):
             project = eng.store.project(project_id)
-            scene = eng.store.scene(project_id, scene_id) if scene_id else None
+            scene = eng.store.scene(project_id, scene_id, request.query.get("episodeId")) if scene_id else None
             frame_clip = find_clip(scene, request.query["clipId"]) if request.query.get("clipId") else None
             if frame_clip:
                 if frame_clip["status"] != "complete":

@@ -14,7 +14,10 @@ const $ = (tag, props = {}, ...children) => {
   el.append(...children.filter(Boolean));
   return el;
 };
-const field = (label, input) => $("label", {}, $("span", { text: label }), input);
+const field = (label, input) => {
+  input.setAttribute("aria-label", label);
+  return $("label", {}, $("span", { text: label }), input);
+};
 const input = (value = "", type = "text") => $("input", { value, type });
 const area = (value = "", rows = 5) => $("textarea", { value, rows });
 const select = (values, current) => $("select", {}, ...values.map(v => $("option", { value: typeof v === "string" ? v : v.id, text: typeof v === "string" ? v : v.name, selected: (typeof v === "string" ? v : v.id) === current })));
@@ -23,9 +26,10 @@ const card = (...children) => $("section", { class: "ava-card" }, ...children);
 const note = text => $("p", { class: "ava-note", text });
 const mediaUrl = asset => api.apiURL(`${prefix}/media?path=${encodeURIComponent(asset.path)}`);
 
-let workspace, message, content, navigation, livePanel, projectId = localStorage.getItem("ava-project") || "", sceneId = localStorage.getItem("ava-scene") || "";
+let workspace, message, content, projectHost, navigation, livePanel, openButton, projectId = localStorage.getItem("ava-project") || "", sceneId = localStorage.getItem("ava-scene") || "", episodeId = localStorage.getItem("ava-episode") || "";
 let state, scene, busy = false, dirty = false, modal, poller, refreshing = false, sidebarHost, diagnostics;
 let renderedSnapshot = "", sceneReceivedAt = Date.now() / 1000;
+let refreshDone = Promise.resolve();
 const originalTitle = document.title;
 let section = ["agent", "library", "settings"].includes(localStorage.getItem("ava-section")) ? localStorage.getItem("ava-section") : "agent";
 const statusLabels = { submitting: "Submitting", "submission-unknown": "Check submission", queued: "In queue", rendering: "Rendering", saving: "Saving video", complete: "Complete", failed: "Failed", recoverable: "Needs recovery", "awaiting-approval": "Awaiting approval" };
@@ -126,32 +130,55 @@ async function run(work) {
   busy = true;
   workspace.setAttribute("aria-busy", "true");
   content.inert = true;
+  projectHost.inert = true;
   message.textContent = "Working…";
   message.classList.remove("ava-error");
   workspace.querySelectorAll("button").forEach(b => { b.disabled = true; });
   try { await work(); dirty = false; message.textContent = "Saved"; await refresh(true); }
   catch (error) { message.textContent = error.message; message.classList.add("ava-error"); }
-  finally { busy = false; content.inert = false; workspace.setAttribute("aria-busy", "false"); workspace.querySelectorAll("button").forEach(b => { b.disabled = false; }); }
+  finally { busy = false; content.inert = false; projectHost.inert = false; workspace.setAttribute("aria-busy", "false"); workspace.querySelectorAll("button").forEach(b => { b.disabled = false; }); }
 }
 async function action(command, values = {}) {
-  return request("/action", { action: command, projectId, sceneId, ...values });
+  return request("/action", { action: command, projectId, episodeId, sceneId, ...values });
+}
+function savedScope(id) {
+  try { const saved = JSON.parse(localStorage.getItem(`ava-scope-${id}`) || "{}"); return { episodeId: saved.episodeId || "", scenes: saved.scenes || {} }; }
+  catch { return { episodeId: "", scenes: {} }; }
 }
 function remember() {
   localStorage.setItem("ava-project", projectId);
+  localStorage.setItem("ava-episode", episodeId);
   localStorage.setItem("ava-scene", sceneId);
+  if (projectId && episodeId) {
+    const saved = savedScope(projectId); saved.episodeId = episodeId; saved.scenes[episodeId] = sceneId;
+    localStorage.setItem(`ava-scope-${projectId}`, JSON.stringify(saved));
+  }
 }
-async function chooseProject(id) { projectId = id; sceneId = ""; remember(); }
+async function chooseProject(id) {
+  await refreshDone; remember(); projectId = id;
+  const saved = savedScope(id); episodeId = saved.episodeId; sceneId = saved.scenes[episodeId] || "";
+  scene = null; diagnostics = null; remember();
+}
+async function chooseEpisode(id) {
+  await refreshDone; remember(); episodeId = id; sceneId = savedScope(projectId).scenes[id] || ""; scene = null; remember();
+}
 async function chooseScene(id) { sceneId = id; remember(); }
+const scopeQuery = () => new URLSearchParams({ projectId, ...(episodeId ? { episodeId } : {}) }).toString();
 
 async function refresh(force = false) {
-  if (refreshing) return;
+  if (refreshing) { await refreshDone; if (force) return refresh(true); return; }
   refreshing = true;
+  let finish; refreshDone = new Promise(resolve => { finish = resolve; });
   try {
-    state = await request(`/state${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`);
-    if (projectId && !state.projects.some(p => p.id === projectId)) { projectId = ""; sceneId = ""; remember(); }
-    if (!projectId && state.projects.length) { projectId = state.projects[0].id; remember(); state = await request(`/state?projectId=${projectId}`); }
+    state = await request(`/state${projectId ? `?${scopeQuery()}` : ""}`);
+    if (projectId && !state.projects.some(p => p.id === projectId)) { projectId = ""; episodeId = ""; sceneId = ""; diagnostics = null; remember(); }
+    if (!projectId && state.projects.length) {
+      projectId = state.projects[0].id; diagnostics = null; const saved = savedScope(projectId); episodeId = saved.episodeId; sceneId = saved.scenes[episodeId] || "";
+      state = await request(`/state?${scopeQuery()}`);
+    }
+    if (!state.episodes.some(e => e.id === episodeId)) { episodeId = state.episodes[0]?.id || ""; }
     if (!state.scenes.some(s => s.id === sceneId)) sceneId = state.scenes[0]?.id || "";
-    if (sceneId) scene = await request(`/scene?projectId=${projectId}&sceneId=${sceneId}`);
+    if (sceneId) scene = await request(`/scene?${scopeQuery()}&sceneId=${encodeURIComponent(sceneId)}`);
     else scene = null;
     sceneReceivedAt = Date.now() / 1000;
     remember();
@@ -161,7 +188,7 @@ async function refresh(force = false) {
     updateStatus();
     // Preserve unsaved prompt, script, selection and comments during background checks.
     if (force || (snapshot() !== renderedSnapshot && !dirty && !busy && !workspace.contains(document.activeElement?.closest("input,textarea,select")))) render();
-  } finally { refreshing = false; }
+  } finally { refreshing = false; finish(); }
 }
 
 function newProjectForm() {
@@ -176,36 +203,41 @@ function connection() {
   const model = input(conf.model);
   const result = $("pre", { class: "ava-diagnostics", text: diagnostics || "Check the pod's models, nodes, media tools and Qwen connection." });
   return card(heading("Qwen & RunPod setup", "Your planning model and pod connection."),
-    note("Qwen-VL runs directly inside ComfyUI using the planner file in models/text_encoders. Download links are in workflow.json. The existing H3 Qwen encoder stays in the render graph."),
+    note(`Planner selection is saved for ${state.project.name}. All episodes use this project's Qwen model and reference library.`),
     field("Qwen planner model filename", model),
     button("Save Qwen model", () => action("qwenConfig", { config: { model: model.value } })),
-    button("Check installation", async () => { diagnostics = JSON.stringify(await request("/health"), null, 2); result.textContent = diagnostics; }), result,
+    button("Check installation", async () => { diagnostics = JSON.stringify(await request(`/health?projectId=${encodeURIComponent(projectId)}`), null, 2); result.textContent = diagnostics; }), result,
     note(`Storage on pod: ${state.storage}. Use a RunPod persistent volume.`)
   );
 }
 
 function projectControls() {
-  const project = state.projects.find(p => p.id === projectId);
+  const project = state.project;
   if (!project) return newProjectForm();
   const projects = select(state.projects, projectId);
   projects.onchange = () => run(() => chooseProject(projects.value));
   const scenes = select([{ id: "", name: "Select scene" }, ...state.scenes.map(s => ({ id: s.id, name: s.name }))], sceneId);
   scenes.onchange = () => run(() => chooseScene(scenes.value));
-  const projectName = input(project.name), sceneName = input("New scene");
-  return card(row(field("Project", projects), field("Scene", scenes)),
-    $("details", {}, $("summary", { text: "Manage projects & scenes" }),
+  const episodes = select(state.episodes, episodeId);
+  episodes.onchange = () => run(() => chooseEpisode(episodes.value));
+  const projectName = input(project.name), episodeName = input("New episode"), currentEpisode = input(state.episodes.find(e => e.id === episodeId)?.name || ""), sceneName = input("New scene");
+  return card(eyebrow("PROJECT / EPISODE / SCENE"), field("Project", projects), row(field("Episode", episodes), field("Scene", scenes)),
+    $("details", {}, $("summary", { text: "Manage projects, episodes & scenes" }),
       newProjectForm(), field("Rename current project", projectName), button("Rename project", () => action("renameProject", { name: projectName.value })),
+      field("New episode name", episodeName), button("Create episode", async () => {
+        const result = await action("createEpisode", { name: episodeName.value }); await chooseEpisode(result.episode.id);
+      }), field("Rename current episode", currentEpisode), button("Rename episode", () => action("renameEpisode", { name: currentEpisode.value })),
       field("New scene name", sceneName), button("Create scene", async () => {
         const result = await action("createScene", { name: sceneName.value }); await chooseScene(result.scene.id);
       }), button("Delete project…", async () => {
         if (!confirm(`Move “${project.name}” and its saved media to the pod's recovery trash?`)) return;
-        await action("deleteProject"); projectId = ""; sceneId = ""; remember();
+        await action("deleteProject"); projectId = ""; episodeId = ""; sceneId = ""; remember();
       }, "ava-danger")));
 }
 
 async function uploadFile(file, values = {}) {
   const form = new FormData(); form.append("file", file);
-  const query = new URLSearchParams({ projectId, ...values });
+  const query = new URLSearchParams({ projectId, ...(values.sceneId ? { episodeId } : {}), ...values });
   const response = await api.fetchApi(`${prefix}/upload?${query}`, { method: "POST", body: form });
   await readResponse(response);
 }
@@ -227,10 +259,10 @@ function assets(ref, sceneReference = false) {
 }
 
 function library() {
-  const project = state.projects.find(p => p.id === projectId);
+  const project = state.project;
   if (!project) return null;
   const name = input(), kind = select(["character", "location", "prop"], "character"), description = area("", 2);
-  return $("div", {}, heading("Reference library", `${project.library.length} saved entries · reusable across this project's scenes`),
+  return $("div", {}, heading("Reference library", `${project.library.length} saved entries · shared by every episode of ${project.name}`),
     $("details", { open: !project.library.length }, $("summary", { text: "Create a library entry" }), card(
     field("Name", name), field("Kind", kind), field("Description", description),
     button("Create library entry", () => action("createLibrary", { name: name.value, kind: kind.value, description: description.value })))),
@@ -243,10 +275,10 @@ function library() {
 }
 
 function savedVideos() {
-  const takes = state.scenes.flatMap(saved => saved.clips.flatMap(clip => [clip, ...(clip.versions || [])].filter(take => take.video).map(take => ({ ...take, sceneName: saved.name }))));
+  const takes = state.videos;
   return $("div", {}, heading("Saved videos", `${takes.length} saved take${takes.length === 1 ? "" : "s"} in this project`),
     takes.length ? $("div", { class: "ava-library-grid" }, ...takes.map(take => card($("h4", { text: take.title }),
-      note(`${take.sceneName} · ${take.actualDuration || take.duration}s`), $("video", { src: mediaUrl(take.video), controls: true, preload: "none" }),
+      note(`${take.episodeName} / ${take.sceneName} · ${take.actualDuration || take.duration}s`), $("video", { src: mediaUrl(take.video), controls: true, preload: "none" }),
       note(`Completed at: ${timeText(take.timing?.completedAt)}`), $("a", { href: mediaUrl(take.video), download: take.video.name || `${take.id}.mp4`, text: "Download video" })))) : card(note("Your finished clips and previous takes will appear here.")));
 }
 
@@ -284,7 +316,7 @@ function sceneEditor() {
 }
 
 function references() {
-  const project = state.projects.find(p => p.id === projectId);
+  const project = state.project;
   const name = input(), kind = select(["character", "location", "prop"], "character");
   return $("details", { open: !scene.clips.length }, $("summary", { text: `Scene references (${scene.references.length})` }), card(
     note("Empty slots are ignored. Add images and voice samples you actually want used. Choose references independently for each clip."),
@@ -330,7 +362,7 @@ function clipEditor(clip, index) {
     field("Revision comments", comments), button("Apply comments with Qwen", async () => { await save(); await action("revisePrompt", { clipId: clip.id, comments: comments.value }); }),
     button(clip.takeId ? "Approve prompt & regenerate this clip" : "Approve prompt & generate this clip", async () => {
       await save();
-      const savedScene = await request(`/scene?projectId=${projectId}&sceneId=${sceneId}`);
+      const savedScene = await request(`/scene?${scopeQuery()}&sceneId=${encodeURIComponent(sceneId)}`);
       const saved = savedScene.clips.find(c => c.id === clip.id);
       if (!saved.reviewKey) throw new Error("Plan this prompt again after changing references, continuity or duration, then review it before generating.");
       await action("approveGenerate", { clipId: clip.id, reviewKey: saved.reviewKey });
@@ -363,16 +395,18 @@ function studio() {
 }
 
 function render() {
-  const detailsState = new Map([...content.querySelectorAll("details")].map((el, i) => [`${i}:${el.querySelector("summary")?.textContent}`, el.open]));
+  const detailsState = new Map([...workspace.querySelectorAll("details")].map((el, i) => [`${i}:${el.querySelector("summary")?.textContent}`, el.open]));
   message.classList.remove("ava-error");
   const agent = $("section", { id: "ava-panel-agent", role: "tabpanel", ariaLabel: "Agent" },
     ...(scene ? [sceneEditor(), references(), studio(), scene.clips.length && heading("Review & render", `${scene.clips.filter(c => c.status === "complete").length} of ${scene.clips.length} clips complete · approve each take when ready`), ...scene.clips.map(clipEditor)].filter(Boolean) : [card(heading("Your next video starts here", "Create a project and scene above, then give Qwen your script."))]));
   const libraryPanel = $("section", { id: "ava-panel-library", role: "tabpanel", ariaLabel: "Library" }, projectId ? library() : card(note("Create a project to build its reference library.")));
-  const settingsPanel = $("section", { id: "ava-panel-settings", role: "tabpanel", ariaLabel: "Settings" }, connection(), ...(scene ? [generationSettings()] : []),
+  const settingsPanel = $("section", { id: "ava-panel-settings", role: "tabpanel", ariaLabel: "Settings" }, ...(state.project ? [connection()] : []), ...(scene ? [generationSettings()] : []),
     card(heading("Render timing", "Automatic tracking for every new take."), note("Elapsed time includes time spent in the queue. Estimated finish uses recent completed takes with matching duration, steps, resolution and reference size. The first render shows a sampling estimate once its rate is known. Completion time is recorded after the video is verified and saved. Times use your browser's local timezone.")));
-  content.replaceChildren(projectControls(), agent, libraryPanel, settingsPanel);
+  projectHost.replaceChildren(projectControls());
+  navigation.hidden = !state.project;
+  content.replaceChildren(agent, libraryPanel, settingsPanel);
   switchSection(section);
-  [...content.querySelectorAll("details")].forEach((el, i) => { const key = `${i}:${el.querySelector("summary")?.textContent}`; if (detailsState.has(key)) el.open = detailsState.get(key); });
+  [...workspace.querySelectorAll("details")].forEach((el, i) => { const key = `${i}:${el.querySelector("summary")?.textContent}`; if (detailsState.has(key)) el.open = detailsState.get(key); });
   renderedSnapshot = snapshot();
   updateStatus();
 }
@@ -383,6 +417,8 @@ function mount() {
   document.head.append(style);
   message = $("p", { role: "status", text: "Loading…" });
   content = $("main");
+  projectHost = $("div", { class: "ava-project-scope" });
+  openButton = $("button", { text: "Open workspace", onclick: openModal });
   navigation = $("nav", { class: "ava-tabs", role: "tablist", ariaLabel: "Workspace sections" },
     ...["agent", "library", "settings"].map((id, index) => {
       const tab = $("button", { role: "tab", id: `ava-tab-${id}`, text: id[0].toUpperCase() + id.slice(1), onclick: () => switchSection(id),
@@ -392,7 +428,7 @@ function mount() {
   livePanel = $("div", { class: "ava-monitor" });
   workspace = $("div", { class: "ava-workspace" }, $("header", { class: "ava-header" },
     $("div", { class: "ava-brand" }, $("span", { class: "ava-mark", text: "a", ariaHidden: "true" }), $("div", {}, $("h2", { text: "AI Video Agent" }), $("span", { class: "ava-subtitle", text: "Qwen plans. FastH3 creates." }))), row(
-    button("Refresh", () => refresh(true)), $("button", { text: "Open workspace", onclick: openModal }))), navigation, message, livePanel, content,
+    button("Refresh", () => refresh(true)), openButton)), projectHost, navigation, message, livePanel, content,
     $("footer", { text: "QWEN + FASTH3 / YOUR COMFYUI WORKSPACE" }));
   workspace.addEventListener("input", () => { dirty = true; });
   workspace.addEventListener("change", event => { if (event.target.tagName !== "SELECT" || event.target.closest("main")) dirty = true; });
@@ -403,13 +439,15 @@ function mount() {
 
 function openModal() {
   mount();
+  if (modal?.open) return;
   if (!modal) {
     modal = $("dialog", { class: "ava-dialog" });
     const close = $("button", { text: "Close workspace", onclick: () => modal.close() });
-    modal.addEventListener("close", () => { if (sidebarHost) sidebarHost.append(workspace); });
+    modal.addEventListener("close", () => { openButton.hidden = false; if (sidebarHost) sidebarHost.append(workspace); });
     modal.append(close); document.body.append(modal);
   }
   modal.append(workspace);
+  openButton.hidden = true;
   if (!modal.open) modal.showModal();
 }
 

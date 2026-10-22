@@ -16,6 +16,7 @@ DEFAULTS = {"provider": "h3", "aspectRatio": "16:9", "megapixels": 2,
             "steps": 8, "seed": -1, "refImageSize": "match"}
 ID = re.compile(r"^[a-zA-Z0-9_-]{1,80}$")
 TAGS = re.compile(r"<(?:Picture|Audio|Video)\s*\d+>", re.I)
+DEFAULT_EPISODE = "episode_1"
 
 
 def uid():
@@ -79,10 +80,26 @@ class Store:
         return json.loads(self.path(relative).read_text(encoding="utf-8"))
 
     def project(self, project_id):
-        return self.read(f"projects/{identifier(project_id)}/project.json")
+        project = self.read(f"projects/{identifier(project_id)}/project.json")
+        # Virtual migration preserves every existing scene ID and media path.
+        project.setdefault("episodes", [{"id": DEFAULT_EPISODE, "name": "Episode 1", "createdAt": project.get("createdAt", 0)}])
+        return project
 
-    def scene(self, project_id, scene_id):
-        return self.read(self.scene_dir(project_id, scene_id) + "/scene.json")
+    def episode(self, project_id, episode_id):
+        episode_id = identifier(episode_id)
+        episode = next((e for e in self.project(project_id)["episodes"] if e["id"] == episode_id), None)
+        if episode is None:
+            raise ValueError("Episode does not belong to this project")
+        return episode
+
+    def scene(self, project_id, scene_id, episode_id=None):
+        scene = self.read(self.scene_dir(project_id, scene_id) + "/scene.json")
+        scene.setdefault("episodeId", DEFAULT_EPISODE)
+        if episode_id is not None:
+            self.episode(project_id, episode_id)
+            if scene["episodeId"] != episode_id:
+                raise ValueError("Scene does not belong to the selected episode")
+        return scene
 
     def scene_dir(self, project_id, scene_id):
         return f"projects/{identifier(project_id)}/scenes/{identifier(scene_id)}"
@@ -92,20 +109,33 @@ class Store:
         self.write(self.scene_dir(scene["projectId"], scene["id"]) + "/scene.json", scene)
 
     def projects(self):
-        return sorted([self.read(str(p.relative_to(self.root))) for p in self.root.glob("projects/*/project.json")], key=lambda p: p.get("createdAt", 0), reverse=True)
+        return sorted([self.project(p.parent.name) for p in self.root.glob("projects/*/project.json")], key=lambda p: p.get("createdAt", 0), reverse=True)
 
-    def scenes(self, project_id):
+    def scenes(self, project_id, episode_id=None):
         self.project(project_id)
-        return sorted([self.read(str(p.relative_to(self.root))) for p in self.path(f"projects/{identifier(project_id)}/scenes").glob("*/scene.json")], key=lambda s: s.get("createdAt", 0))
+        if episode_id is not None:
+            self.episode(project_id, episode_id)
+        scenes = [self.scene(project_id, p.parent.name) for p in self.path(f"projects/{identifier(project_id)}/scenes").glob("*/scene.json")]
+        return sorted([s for s in scenes if episode_id is None or s["episodeId"] == episode_id], key=lambda s: s.get("createdAt", 0))
 
     def create_project(self, name):
         project = {"id": uid(), "name": text(name, 120), "createdAt": time.time(), "library": []}
+        project["episodes"] = [{"id": DEFAULT_EPISODE, "name": "Episode 1", "createdAt": project["createdAt"]}]
         self.write(f"projects/{project['id']}/project.json", project)
         return project
 
-    def create_scene(self, project_id, name, script=""):
+    def create_episode(self, project_id, name):
+        project = self.project(project_id)
+        episode = {"id": uid(), "name": text(name, 150), "createdAt": time.time()}
+        project["episodes"].append(episode)
+        self.write(f"projects/{project_id}/project.json", project)
+        return episode
+
+    def create_scene(self, project_id, name, script="", episode_id=None):
         self.project(project_id)
-        scene = {"id": uid(), "projectId": project_id, "name": text(name, 150), "script": script,
+        episode_id = episode_id or DEFAULT_EPISODE
+        self.episode(project_id, episode_id)
+        scene = {"id": uid(), "projectId": project_id, "episodeId": episode_id, "name": text(name, 150), "script": script,
                  "summary": "", "references": [], "clips": [], "settings": DEFAULTS.copy(),
                  "createdAt": time.time(), "paused": True, "reviewAfterEachClip": True}
         self.save_scene(scene)

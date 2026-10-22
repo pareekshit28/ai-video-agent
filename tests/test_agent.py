@@ -217,6 +217,64 @@ class CoreTests(Fixture, unittest.TestCase):
         self.assertEqual(1, len(list(self.store.path(".trash").iterdir())))
 
 
+class HierarchyTests(Fixture, unittest.TestCase):
+    def setUp(self): self.setup_fixture()
+    def tearDown(self): self.teardown_fixture()
+
+    def test_legacy_scenes_appear_in_episode_one_without_moving_media(self):
+        project = self.store.project(self.project["id"])
+        project.pop("episodes")
+        self.store.write(f"projects/{project['id']}/project.json", project)
+        self.scene.pop("episodeId")
+        self.store.save_scene(self.scene)
+        self.assertEqual("Episode 1", self.store.project(project["id"])["episodes"][0]["name"])
+        scenes = self.store.scenes(project["id"], core.DEFAULT_EPISODE)
+        self.assertEqual([self.scene["id"]], [s["id"] for s in scenes])
+        self.assertTrue(self.store.path(self.asset["path"]).is_file())
+        self.assertEqual(self.scene["clips"], scenes[0]["clips"])
+
+    def test_episode_scenes_are_isolated_and_membership_is_enforced(self):
+        episode = self.store.create_episode(self.project["id"], "Episode 2")
+        other = self.store.create_scene(self.project["id"], "Other scene", episode_id=episode["id"])
+        self.assertEqual([other["id"]], [s["id"] for s in self.store.scenes(self.project["id"], episode["id"])])
+        self.assertEqual([self.scene["id"]], [s["id"] for s in self.store.scenes(self.project["id"], core.DEFAULT_EPISODE)])
+        with self.assertRaisesRegex(ValueError, "selected episode"):
+            self.store.scene(self.project["id"], self.scene["id"], episode["id"])
+
+    def test_another_projects_episode_and_scene_are_rejected(self):
+        episode = self.store.create_episode(self.project["id"], "Project A episode")
+        other = self.store.create_project("Project B")
+        with self.assertRaisesRegex(ValueError, "this project"):
+            self.store.create_scene(other["id"], "Wrong", episode_id=episode["id"])
+        with self.assertRaises(FileNotFoundError):
+            self.store.scene(other["id"], self.scene["id"])
+
+    def test_library_is_shared_between_episodes_but_not_projects(self):
+        project = self.store.project(self.project["id"])
+        project["library"] = [{"id": "actor", "assets": [self.asset]}]
+        self.store.write(f"projects/{project['id']}/project.json", project)
+        self.store.create_episode(project["id"], "Episode 2")
+        self.assertEqual([self.asset], self.store.project(project["id"])["library"][0]["assets"])
+        other = self.store.create_project("Another project")
+        self.assertEqual([], self.store.project(other["id"])["library"])
+
+    def test_qwen_model_selection_is_project_specific(self):
+        other = self.store.create_project("Project B")
+        chosen = "qwen3vl_8b_fp8_scaled.safetensors"
+        self.store.write(f"projects/{self.project['id']}/qwen.json", qwen.validate_config({"model": chosen}))
+        self.assertEqual(chosen, qwen.config(self.store, self.project["id"])["model"])
+        self.assertEqual(local_qwen.DEFAULT_MODEL, qwen.config(self.store, other["id"])["model"])
+        self.assertFalse(self.store.path("qwen.json").exists())
+
+    def test_legacy_pod_model_remains_an_initial_default(self):
+        chosen = "qwen3vl_8b_fp8_scaled.safetensors"
+        self.store.write("qwen.json", qwen.validate_config({"model": chosen}))
+        self.assertEqual(chosen, qwen.config(self.store, self.project["id"])["model"])
+        self.store.write(f"projects/{self.project['id']}/qwen.json", qwen.validate_config({"model": local_qwen.DEFAULT_MODEL}))
+        self.assertEqual(local_qwen.DEFAULT_MODEL, qwen.config(self.store, self.project["id"])["model"])
+        self.assertEqual(chosen, qwen.config(self.store)["model"])
+
+
 class NativeProgressTests(unittest.TestCase):
     def setUp(self):
         self.context = None
@@ -481,6 +539,17 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
             await qwen.ask(self.store, qwen.PROMPT, {})
         self.assertEqual(model, generate.call_args.args[0])
         self.assertEqual("comfyui", qwen.config(self.store)["runtime"])
+
+    async def test_engine_planning_uses_the_selected_projects_model(self):
+        chosen = "qwen3vl_8b_fp8_scaled.safetensors"
+        self.store.write(f"projects/{self.project['id']}/qwen.json", qwen.validate_config({"model": chosen}))
+        mm = types.SimpleNamespace(unload_all_models=lambda: None, soft_empty_cache=lambda: None)
+        comfy = types.ModuleType("comfy"); comfy.__path__ = []; comfy.model_management = mm
+        self.engine.http = AsyncMock(return_value={"queue_running": [], "queue_pending": []})
+        result = {"title": "Scene", "summary": "Scene summary", "references": []}
+        with patch.dict(sys.modules, {"comfy": comfy, "comfy.model_management": mm}), patch.object(qwen, "ask", AsyncMock(return_value=result)) as ask:
+            await self.engine.discover(self.scene, "http://unused")
+        self.assertEqual(chosen, ask.call_args.kwargs["model_file"])
 
     async def test_foreign_renderer_cannot_be_submitted_as_h3(self):
         self.scene["settings"]["provider"] = "unsupported"

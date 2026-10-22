@@ -41,7 +41,7 @@ eng = package.routes.engine()
 eng.watch = lambda *args: None
 
 
-async def ask(store, instruction, payload, images=()):
+async def ask(store, instruction, payload, images=(), model_file=None):
     if instruction == package.qwen.DISCOVER:
         return {"title": "Window scene", "summary": "A woman opens a window and smiles.", "references": [
             {"id": "woman", "name": "Woman", "kind": "character", "description": "The woman in the script"}]}
