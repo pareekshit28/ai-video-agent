@@ -1,4 +1,4 @@
-"""PC pairing, claim ownership, recovery and helper protocol tests; no GPU needed."""
+"""URL-only desktop connections, pod switching, ownership and recovery; no GPU needed."""
 import asyncio
 from collections import deque
 import hashlib
@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import MagicMock, patch
@@ -22,7 +23,6 @@ class BridgeTests(Fixture, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.setup_fixture()
         self.bridge = codex_bridge.CodexBridge(self.store)
-        self.token = self.bridge.pair()
         self.bridge.touch("pc", MODELS, helper.VERSION)
         self.tasks = []
 
@@ -41,17 +41,21 @@ class BridgeTests(Fixture, unittest.IsolatedAsyncioTestCase):
     def claim(self, helper_id="pc"):
         return self.bridge.claim(helper_id, MODELS, helper.VERSION)
 
-    async def test_pairing_keeps_only_hash_and_revokes_old_token(self):
-        self.assertTrue(self.bridge.authenticate("Bearer " + self.token))
-        self.assertFalse(self.bridge.authenticate("Bearer wrong"))
-        self.assertNotIn(self.token, json.dumps(self.bridge.settings()))
-        self.assertNotIn("tokenHash", self.bridge.status())
+    async def test_disconnect_fails_owned_work_and_reports_offline(self):
         task = await self.enqueue()
-        replacement = self.bridge.pair()
-        self.assertFalse(self.bridge.authenticate("Bearer " + self.token))
-        self.assertTrue(self.bridge.authenticate("Bearer " + replacement))
-        with self.assertRaisesRegex(ValueError, "pairing changed"):
+        self.claim()
+        self.bridge.disconnect("pc")
+        self.assertFalse(self.bridge.status()["connected"])
+        with self.assertRaisesRegex(ValueError, "disconnected or switched pods"):
             await task
+
+    async def test_old_connection_credentials_are_discarded_on_upgrade(self):
+        self.store.write("codex/bridge.json", {"tokenHash": "obsolete", "pairedAt": 1, "lastSeen": time.time(), "models": MODELS})
+        upgraded = codex_bridge.CodexBridge(self.store)
+        self.assertNotIn("tokenHash", upgraded.settings())
+        self.assertNotIn("paired", upgraded.status())
+        self.assertFalse(upgraded.status()["connected"])
+        self.assertEqual(2, upgraded.status()["protocolVersion"])
 
     async def test_claim_is_exclusive_and_lost_claim_response_recovers_same_job(self):
         task = await self.enqueue()
@@ -120,7 +124,7 @@ class BridgeTests(Fixture, unittest.IsolatedAsyncioTestCase):
             await task
 
     async def test_offline_helper_and_files_outside_store_are_rejected(self):
-        self.store.write("codex/bridge.json", {"tokenHash": "hash", "lastSeen": 1})
+        self.store.write("codex/bridge.json", {"lastSeen": 1})
         with self.assertRaisesRegex(ValueError, "offline"):
             await self.bridge.generate("", "system", "script")
         self.bridge.touch("pc", MODELS, helper.VERSION)
@@ -159,7 +163,7 @@ class HelperTests(unittest.TestCase):
     def test_remote_url_requires_https_and_excludes_credentials_and_tokens(self):
         self.assertEqual("https://pod.proxy.runpod.net", helper.base_url("https://pod.proxy.runpod.net/"))
         self.assertEqual("http://127.0.0.1:8199", helper.base_url("http://127.0.0.1:8199"))
-        for url in ("http://remote.example", "https://user:password@pod.example", "https://pod.example?token=secret", "file:///tmp/x"):
+        for url in ("http://remote.example", "https://user:password@pod.example", "https://pod.example?token=secret", "file:///tmp/x", "https://[", "https://pod.example:invalid"):
             with self.subTest(url=url), self.assertRaises(helper.HelperError):
                 helper.base_url(url)
 
@@ -176,7 +180,7 @@ class HelperTests(unittest.TestCase):
         client = MagicMock()
         client.initialize.return_value = MODELS
         client.plan.return_value = '{"prompt":"Actor opens a door."}'
-        with patch.object(helper, "CodexClient", return_value=client), patch.object(helper.time, "sleep"):
+        with patch.object(helper, "CodexClient", return_value=client):
             helper.execute_job(pod, {"id": "request", "claimId": "claim", "images": []})
         client.plan.assert_called_once()
         self.assertEqual(2, len(calls))
@@ -192,6 +196,50 @@ class HelperTests(unittest.TestCase):
             helper.execute_job(pod, job)
         client.assert_not_called()
         self.assertIn("did not match", pod.request.call_args.args[1]["error"])
+
+    def test_saved_settings_keep_only_url_and_preference(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(helper, "CONFIG_PATH", Path(directory)/"helper.json"):
+            helper.CONFIG_PATH.write_text('{"url":"https://old.example","token":"obsolete"}')
+            self.assertNotIn("token", helper.load_settings())
+            helper.save_settings("https://new.example/", False)
+            self.assertEqual({"url":"https://new.example", "connectOnOpen":False}, json.loads(helper.CONFIG_PATH.read_text()))
+
+    def test_controller_switches_pods_serially_and_ignores_stale_updates(self):
+        first, second = threading.Event(), threading.Event()
+        calls, events = [], []
+        def run(url, stopped, emit):
+            calls.append(("start", url))
+            if url == "https://first.example":
+                first.set()
+            else:
+                second.set()
+            stopped.wait(3)
+            emit("activity", "Old request stopped")
+            calls.append(("stop", url))
+        with patch.object(helper, "run_helper", side_effect=run):
+            controller = helper.HelperController(lambda *event: events.append(event))
+            try:
+                controller.connect("https://first.example")
+                self.assertTrue(first.wait(2))
+                controller.connect("https://first.example")
+                controller.connect("https://second.example")
+                self.assertTrue(second.wait(2))
+                self.assertEqual([("start","https://first.example"),("stop","https://first.example"),("start","https://second.example")], calls)
+                self.assertFalse(any(state=="activity" and url=="https://first.example" for state,message,url in events))
+            finally:
+                controller.close()
+                controller.thread.join(3)
+            self.assertFalse(controller.thread.is_alive())
+
+    def test_connection_uses_only_url_and_no_authorization_header(self):
+        pod = helper.PodClient("https://pod.example")
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok":true}'
+        pod.opener.open = MagicMock(return_value=response)
+        pod.request("connect", pod.identity(models=MODELS,version=helper.VERSION))
+        request = pod.opener.open.call_args.args[0]
+        self.assertIsNone(request.get_header("Authorization"))
+        self.assertEqual("https://pod.example/ava-agent/codex/connect", request.full_url)
 
 
 if __name__ == "__main__":

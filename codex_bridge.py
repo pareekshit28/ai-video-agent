@@ -23,6 +23,10 @@ class CodexBridge:
     def __init__(self, store):
         self.store = store
         self.pending = set()
+        # Version 0.9 connects by URL. Discard obsolete pairing credentials.
+        saved = self.settings()
+        self.store.write("codex/bridge.json", {k: v for k, v in saved.items()
+                                              if k in ("helperId", "helperVersion", "models")} | {"lastSeen": 0})
         for job in self.jobs():
             if job["status"] in ("queued", "running"):
                 self.fail(job, "ComfyUI restarted during this planning request. Explicitly retry from the workspace.")
@@ -30,23 +34,20 @@ class CodexBridge:
     def settings(self):
         return self.store.read("codex/bridge.json") if self.store.path("codex/bridge.json").exists() else {}
 
-    def pair(self):
-        token = secrets.token_urlsafe(32)
-        self.store.write("codex/bridge.json", {"tokenHash": hashlib.sha256(token.encode()).hexdigest(), "pairedAt": time.time()})
-        for job in [self.store.read(self.path(job_id)) for job_id in list(self.pending)]:
-            if job["status"] in ("queued", "running"):
-                self.fail(job, "PC helper pairing changed. Pair it again and explicitly retry planning.")
-        return token
-
-    def authenticate(self, authorization):
-        token = authorization[7:] if authorization.startswith("Bearer ") else ""
-        expected = self.settings().get("tokenHash", "")
-        return bool(token and expected and secrets.compare_digest(hashlib.sha256(token.encode()).hexdigest(), expected))
-
     def status(self):
         saved = self.settings()
-        return {"paired": bool(saved.get("tokenHash")), "connected": time.time() - saved.get("lastSeen", 0) < ONLINE_SECONDS,
+        return {"protocolVersion": 2, "connected": time.time() - saved.get("lastSeen", 0) < ONLINE_SECONDS,
                 "lastSeen": saved.get("lastSeen"), "helperVersion": saved.get("helperVersion"), "models": saved.get("models", [])}
+
+    def disconnect(self, helper_id):
+        for job_id in list(self.pending):
+            job = self.store.read(self.path(job_id))
+            if job.get("helperId") == helper_id and job["status"] == "running":
+                self.fail(job, "The desktop helper disconnected or switched pods. Reconnect and explicitly retry planning.")
+        saved = self.settings()
+        if saved.get("helperId") == helper_id:
+            saved["lastSeen"] = 0
+            self.store.write("codex/bridge.json", saved)
 
     def path(self, job_id):
         return f"codex/jobs/{core.identifier(job_id)}.json"
@@ -138,10 +139,8 @@ class CodexBridge:
 
     async def generate(self, model, system, content, images=()):
         status = self.status()
-        if not status["paired"]:
-            raise ValueError("Pair your PC helper in Settings → Codex & RunPod setup first")
         if not status["connected"]:
-            raise ValueError("The Codex PC helper is offline. Start it on your PC, then retry planning.")
+            raise ValueError("The Codex desktop helper is offline. Open it, enter this ComfyUI URL and connect, then retry planning.")
         descriptors = []
         for image in images:
             path = Path(image).resolve()

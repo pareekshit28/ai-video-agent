@@ -1,6 +1,6 @@
 # Codex prompt writing for FastH3
 
-Version 0.8.0 uses one natural-language prompt per clip. H3 writing guides inform descriptive quality, while the app's actual media bindings determine which reference names and labels can be used. The app does not enforce the guides' section layout.
+Version 0.9.0 uses one natural-language prompt per clip. H3 writing guides inform descriptive quality, while the app's actual media bindings determine which reference names and labels can be used. The app does not enforce the guides' section layout.
 
 Reference guides:
 
@@ -8,7 +8,7 @@ Reference guides:
 - [Full-reference format guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md)
 - [Base video format guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md)
 
-Codex plans through the paired PC helper. Prompt guidance does not install a separate rewrite model or change FastH3 weights.
+Codex plans through the URL-connected desktop helper on Windows or macOS. Prompt guidance does not install a separate rewrite model or change FastH3 weights.
 
 ## Clip count and durations
 

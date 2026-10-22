@@ -138,8 +138,6 @@ async def action(request):
         if command == "codexConfig":
             store.write(f"projects/{project_id}/codex.json", planner.validate_config(body["config"]))
             return web.json_response({"ok": True})
-        if command == "pairCodex":
-            return web.json_response({"token": eng.bridge.pair()})
         if command == "renameProject":
             project["name"] = core.text(body["name"], 120)
             store.write(f"projects/{project_id}/project.json", project)
@@ -316,11 +314,11 @@ def public_scene(eng, scene):
     return result
 
 
-def helper_auth(request):
-    bridge = engine().bridge
-    if not bridge.authenticate(request.headers.get("Authorization", "")):
-        raise web.HTTPUnauthorized(text="PC helper pairing was rejected. Pair it again in ComfyUI Settings.")
-    return bridge
+def helper_bridge(request):
+    # URL-only desktop clients have no browser Origin. Keep browser cross-site writes blocked.
+    if request.headers.get("Origin") or request.headers.get("Sec-Fetch-Site"):
+        origin_guard(request)
+    return engine().bridge
 
 
 async def helper_body(request):
@@ -335,7 +333,7 @@ async def helper_body(request):
 @PromptServer.instance.routes.post("/ava-agent/codex/next")
 @errors
 async def helper_next(request):
-    bridge = helper_auth(request)
+    bridge = helper_bridge(request)
     body = await helper_body(request)
     job = bridge.claim(body["helperId"], body.get("models", []), body.get("version", "unknown"))
     return web.json_response({"job": job}, headers={"Cache-Control": "no-store"})
@@ -344,16 +342,25 @@ async def helper_next(request):
 @PromptServer.instance.routes.post("/ava-agent/codex/connect")
 @errors
 async def helper_connect(request):
-    bridge = helper_auth(request)
+    bridge = helper_bridge(request)
     body = await helper_body(request)
     bridge.touch(body["helperId"], body.get("models", []), body.get("version", "unknown"))
+    return web.json_response({"ok": True})
+
+
+@PromptServer.instance.routes.post("/ava-agent/codex/disconnect")
+@errors
+async def helper_disconnect(request):
+    bridge = helper_bridge(request)
+    body = await helper_body(request)
+    bridge.disconnect(body["helperId"])
     return web.json_response({"ok": True})
 
 
 @PromptServer.instance.routes.post("/ava-agent/codex/job/{job_id}/heartbeat")
 @errors
 async def helper_heartbeat(request):
-    bridge = helper_auth(request)
+    bridge = helper_bridge(request)
     body = await helper_body(request)
     bridge.heartbeat(request.match_info["job_id"], body["helperId"], body["claimId"])
     return web.json_response({"ok": True})
@@ -362,7 +369,7 @@ async def helper_heartbeat(request):
 @PromptServer.instance.routes.post("/ava-agent/codex/job/{job_id}/result")
 @errors
 async def helper_result(request):
-    bridge = helper_auth(request)
+    bridge = helper_bridge(request)
     body = await helper_body(request)
     bridge.complete(request.match_info["job_id"], body["helperId"], body["claimId"], body.get("output"), body.get("error"))
     return web.json_response({"ok": True})
@@ -371,7 +378,7 @@ async def helper_result(request):
 @PromptServer.instance.routes.get("/ava-agent/codex/job/{job_id}/image/{index}")
 @errors
 async def helper_image(request):
-    bridge = helper_auth(request)
+    bridge = helper_bridge(request)
     path = bridge.image(request.match_info["job_id"], int(request.match_info["index"]),
                         request.headers.get("X-AVA-Helper", ""), request.headers.get("X-AVA-Claim", ""))
     return web.FileResponse(path, headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})

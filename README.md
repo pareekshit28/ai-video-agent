@@ -16,12 +16,12 @@ Restart ComfyUI, then drag **workflow.json** onto the canvas. Use a recent Comfy
 
 ## Connect your PC's Codex
 
-1. Open **Settings → Codex & RunPod setup** in the browser and select **Download Windows helper**.
-2. Select **Create / replace pairing token**. The token pairs this pod with your helper; it is separate from your OpenAI login.
-3. On your PC, run `py pc_helper.py --url "https://YOUR-POD-8188.proxy.runpod.net"` from the downloaded file's folder. Paste the pairing token when prompted.
-4. Keep the helper running. Settings shows **PC helper connected** and the models available through your Codex installation. Leave model selection at **Use PC's default Codex model**, or choose a model from the list.
+1. Download the [desktop app for Windows or macOS](https://github.com/pareekshit28/ai-video-agent/releases/tag/helper-v0.9.0). Windows uses the `.exe`; Mac downloads contain a `.app` for Apple Silicon or Intel.
+2. Open **ComfyUI Codex Helper** and paste your pod's HTTPS ComfyUI URL. It connects automatically; **Connect** also retries immediately.
+3. Keep the app open while planning. Paste a replacement pod URL to disconnect the old pod and connect to the new one. The app remembers the URL and can connect when reopened.
+4. ComfyUI Settings shows **PC helper connected** and the models available through your Codex installation. Leave model selection at **Use PC's default Codex model**, or choose a model from the list.
 
-The helper needs Python 3.10+ and a Codex installation signed in with ChatGPT (`codex login`). It uses only the Python standard library. Later runs can use `py pc_helper.py`; `--pair` replaces the saved pairing token and `--url` updates a changed pod URL. `--check` checks connectivity without claiming work. No inbound PC port or RunPod management API key is required. See [PC helper details](docs/CODEX_HELPER.md).
+The desktop downloads bundle Python and the UI. Install Codex and sign in with ChatGPT on each computer (`codex login`). The same helper core supports Windows and macOS; only the supplied ComfyUI URL is needed to connect. Source users can run `python desktop_helper.py` or the optional console `python pc_helper.py --url "https://YOUR-POD-8188.proxy.runpod.net"`. No inbound computer port or RunPod management API key is required. See [desktop helper details](docs/CODEX_HELPER.md).
 
 ## Models
 
@@ -56,7 +56,7 @@ Direct continuations use `MiniMaxH3AddGuide` at frame zero. Cuts use the precedi
 
 ### H3 prompt style and fewer clips
 
-Version 0.8.0 replaces GPU-based planning with the PC-connected Codex helper and asks Codex for **one complete natural-language prompt string**. Section headings, shot labels, speaker IDs and dialogue tags are optional. The app no longer rejects prompts for missing H3 sections, section order or special shot/dialogue syntax. It checks that text is nonempty, at most 12000 characters and uses only real media bindings. Older section objects are still flattened into text for compatibility. Descriptive guidance preserves scripted dialogue, named references and frame continuity without enforcing a prose layout.
+Version 0.9.0 uses the URL-only desktop Codex helper and asks Codex for **one complete natural-language prompt string**. Section headings, shot labels, speaker IDs and dialogue tags are optional. The app no longer rejects prompts for missing H3 sections, section order or special shot/dialogue syntax. It checks that text is nonempty, at most 12000 characters and uses only real media bindings. Older section objects are still flattened into text for compatibility. Descriptive guidance preserves scripted dialogue, named references and frame continuity without enforcing a prose layout.
 
 Codex chooses the clip count and each clip's duration from the script and supplied references. It aims to use the fewest clips that preserve actions, exact dialogue and natural pacing, using 2–15 seconds per clip and favoring 12–15 seconds when useful. These are model estimates of speech, pauses and action; the app validates the returned limits, IDs and transitions rather than measuring speech duration. Durations remain editable before approval.
 
@@ -112,6 +112,6 @@ Update the custom-node folder with `git pull --ff-only`, restart ComfyUI, then h
 python -m unittest discover -s tests -v
 ```
 
-Tests exercise paired-helper requests, native H3 rendering calls with stubbed execution, reference/image ordering, approval and duration rules, H3 graph wiring, submission recovery, workflow metadata and real FFmpeg finalization. Browser integration exercises the real UI/routes/store with mocked Codex and Comfy execution. Live RunPod integration and H3 GPU inference and the automatic ComfyUI model-download dialog still require validation on the target pod. Direct download links and terminal commands are provided in the workflow independently of that dialog.
+Tests exercise URL-only connections, serial pod switching, request ownership, native H3 rendering calls with stubbed execution, reference/image ordering, approval and duration rules, H3 graph wiring, submission recovery, workflow metadata and real FFmpeg finalization. Browser integration exercises the real UI/routes/store with mocked Codex and Comfy execution. Desktop builds receive a UI startup check on each target platform. A live Codex request and a live GPU render are separate checks; H3 inference and ComfyUI's automatic model-download dialog still require target-pod validation. Direct download links and terminal commands are provided in the workflow independently of that dialog.
 
 Sources: [Codex app-server](https://learn.chatgpt.com/docs/app-server), [Codex authentication](https://learn.chatgpt.com/docs/auth), [H3 nodes](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_minimax_h3.py).

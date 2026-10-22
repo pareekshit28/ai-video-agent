@@ -4,7 +4,6 @@ Python 3.10+ standard library only. No OpenAI credentials are sent to the pod.
 """
 import argparse
 from collections import deque
-import getpass
 import hashlib
 import json
 import os
@@ -20,7 +19,7 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 import uuid
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 CONFIG_PATH = Path.home() / ".ai-video-agent" / "helper.json"
 
 
@@ -36,7 +35,11 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 def base_url(value):
-    parsed = urlsplit(value.strip())
+    try:
+        parsed = urlsplit(value.strip())
+        parsed.port
+    except ValueError:
+        raise HelperError("Enter a valid HTTPS ComfyUI URL.") from None
     local = parsed.hostname in ("127.0.0.1", "localhost", "::1")
     if (parsed.scheme != "https" and not (local and parsed.scheme == "http")) or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise HelperError("Enter the HTTPS ComfyUI URL from your browser, without login credentials, query parameters or fragments.")
@@ -44,29 +47,28 @@ def base_url(value):
 
 
 class PodClient:
-    def __init__(self, url, token, helper_id=None):
-        self.url, self.token = base_url(url), token
+    def __init__(self, url, helper_id=None):
+        self.url = base_url(url)
         self.helper_id = helper_id or uuid.uuid4().hex
         self.opener = build_opener(NoRedirect())
 
-    def request(self, path, body=None, *, image=False, claim=None):
-        headers = {"Authorization": "Bearer " + self.token, "User-Agent": "ComfyUI-Codex-Helper/" + VERSION}
+    def request(self, path, body=None, *, image=False, claim=None, timeout=15):
+        headers = {"User-Agent": "ComfyUI-Codex-Helper/" + VERSION}
         if body is not None:
             headers["Content-Type"] = "application/json"
         if claim:
             headers.update({"X-AVA-Helper": self.helper_id, "X-AVA-Claim": claim})
         data = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
-        request = Request(self.url + "/ava-agent/codex/" + path, data=data, headers=headers)
+        endpoint = "/ava-agent/health" if path == "health" else "/ava-agent/codex/" + path
+        request = Request(self.url + endpoint, data=data, headers=headers)
         try:
-            with self.opener.open(request, timeout=15) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 limit = 20 * 1024 * 1024 if image else 2 * 1024 * 1024
                 raw = response.read(limit + 1)
                 if len(raw) > limit:
                     raise HelperError("The pod response exceeded the allowed size")
                 return raw if image else json.loads(raw)
         except HTTPError as error:
-            if error.code == 401:
-                raise HelperError("Pairing token rejected. Create a new token in ComfyUI Settings, then restart with --pair.", 401) from None
             try:
                 detail = json.loads(error.read(4096)).get("error", "")
             except (ValueError, AttributeError):
@@ -82,7 +84,10 @@ class PodClient:
 def codex_executable():
     configured = os.getenv("CODEX_CLI_PATH")
     bundled = Path(os.getenv("LOCALAPPDATA", "")) / "Programs/OpenAI/Codex/bin/codex.exe"
-    executable = configured or (str(bundled) if bundled.is_file() else shutil.which("codex"))
+    candidates = [bundled, Path("/Applications/Codex.app/Contents/Resources/codex"),
+                  Path.home() / "Applications/Codex.app/Contents/Resources/codex",
+                  Path("/opt/homebrew/bin/codex"), Path("/usr/local/bin/codex"), Path.home() / ".local/bin/codex"]
+    executable = configured or shutil.which("codex") or next((str(path) for path in candidates if path.is_file()), None)
     if not executable:
         raise HelperError("Install Codex CLI or the Codex desktop app on this PC, then run codex login.")
     return executable
@@ -92,7 +97,10 @@ class CodexClient:
     def __init__(self, disabled_servers=()):
         # Force the existing ChatGPT login instead of inheriting API-key billing.
         environment = {key: value for key, value in os.environ.items()
-                       if key not in ("OPENAI_API_KEY", "CODEX_API_KEY", "ACCESS_TOKEN")}
+                       if key not in ("OPENAI_API_KEY", "CODEX_API_KEY", "ACCESS_TOKEN") and not key.startswith(("_PYI", "PYINSTALLER_"))}
+        # Frozen apps must not leak their Python/Tk library paths into Codex or its runtimes.
+        for key in ("TCL_LIBRARY", "TK_LIBRARY", "PYTHONHOME", "PYTHONPATH"):
+            environment.pop(key, None)
         arguments = [codex_executable(), "app-server", "--listen", "stdio://", "-c", 'model_provider="openai"',
                      "-c", "features.shell_tool=false", "-c", "features.apps=false", "-c", 'web_search="disabled"',
                      "-c", "mcp_servers={}"]
@@ -240,19 +248,35 @@ class CodexClient:
                 stream.close()
 
 
-def execute_job(pod, job):
-    stopped, disconnected = threading.Event(), threading.Event()
+class Cancellation:
+    def __init__(self, external):
+        self.external, self.local = external, threading.Event()
+
+    def is_set(self):
+        return self.local.is_set() or self.external.is_set()
+
+    def set(self):
+        self.local.set()
+
+
+def execute_job(pod, job, cancelled=None, emit=None):
+    emit = emit or print
+    cancelled = cancelled or threading.Event()
+    stopped = threading.Event()
+    cancellation = Cancellation(cancelled)
     identity = pod.identity(claimId=job["claimId"])
 
     def heartbeat():
         last_ok = time.monotonic()
         while not stopped.wait(10):
+            if cancellation.is_set():
+                return
             try:
                 pod.request(f"job/{job['id']}/heartbeat", identity)
                 last_ok = time.monotonic()
             except HelperError as error:
                 if error.status in (400, 401, 404) or time.monotonic() - last_ok > 60:
-                    disconnected.set()
+                    cancellation.set()
                     return
 
     watcher = threading.Thread(target=heartbeat, daemon=True)
@@ -262,6 +286,8 @@ def execute_job(pod, job):
         with tempfile.TemporaryDirectory(prefix="comfyui-codex-") as temporary:
             directory, paths = Path(temporary), []
             for index, image in enumerate(job["images"]):
+                if cancellation.is_set():
+                    raise HelperError("Planning stopped because the desktop helper disconnected or switched pods.")
                 if image["index"] != index or image["suffix"] not in (".png", ".jpg", ".jpeg", ".webp"):
                     raise HelperError("The pod supplied an invalid reference-image manifest")
                 raw = pod.request(f"job/{job['id']}/image/{index}", image=True, claim=job["claimId"])
@@ -271,12 +297,12 @@ def execute_job(pod, job):
                 path.write_bytes(raw)
                 paths.append(path)
             client = CodexClient()
-            client.cancelled = disconnected
+            client.cancelled = cancellation
             models = client.initialize()
             try:
                 output = client.plan(job, paths, directory, models)
             finally:
-                client.close()
+                client.close(cancel=False)
                 client = None
         result = {**identity, "output": output}
     except HelperError as error:
@@ -285,66 +311,162 @@ def execute_job(pod, job):
         result = {**identity, "error": "The PC helper could not complete planning. Check its terminal and Codex installation."}
     finally:
         if client is not None:
-            client.close()
+            client.close(cancel=False)
     # Retrying this delivery is idempotent. Never repeat inference to recover a lost result response.
     deadline = time.monotonic() + 60
     try:
         while True:
             try:
-                pod.request(f"job/{job['id']}/result", result)
-                print("Planning complete." if "output" in result else "Planning failed: " + result["error"], flush=True)
+                pod.request(f"job/{job['id']}/result", result, timeout=5 if cancelled.is_set() else 15)
+                emit("Planning complete." if "output" in result else "Planning failed: " + result["error"])
                 return
             except HelperError as error:
+                if cancelled.is_set():
+                    return
                 if error.status in (400, 401, 404) or time.monotonic() > deadline:
                     raise HelperError("The planning result could not be confirmed by the pod. Check ComfyUI before retrying; the helper will stop to avoid duplicate work.") from None
-                time.sleep(2)
+                cancelled.wait(2)
     finally:
         stopped.set()
         watcher.join(timeout=16)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", help="Your HTTPS ComfyUI browser URL")
-    parser.add_argument("--pair", action="store_true", help="Enter a new pairing token")
-    parser.add_argument("--check", action="store_true", help="Check Codex and the pod connection, then exit")
-    args = parser.parse_args()
-    saved = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
-    url = base_url(args.url or saved.get("url") or input("ComfyUI HTTPS URL: "))
-    token = saved.get("token") if not args.pair and saved.get("url") == url else None
-    token = token or getpass.getpass("Pairing token from ComfyUI Settings: ").strip()
-    if not token:
-        raise HelperError("A pairing token is required")
+def load_settings():
+    try:
+        saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return {"url": saved.get("url", ""), "connectOnOpen": saved.get("connectOnOpen", True)}
+    except (OSError, ValueError, AttributeError):
+        return {"url": "", "connectOnOpen": True}
+
+
+def save_settings(url, connect_on_open=True):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps({"url": base_url(url), "connectOnOpen": bool(connect_on_open)}), encoding="utf-8")
+
+
+def run_helper(url, stopped, emit, check=False):
+    """One fixed pod per run: switching never sends an old result to a new URL."""
+    emit("checking", "Checking your local Codex installation…")
     client = CodexClient()
+    client.cancelled = Cancellation(stopped)
     try:
         models = client.initialize()
     finally:
-        client.close()
-    pod = PodClient(url, token)
-    hello = pod.identity(models=models, version=VERSION)
-    pod.request("connect", hello)
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps({"url": url, "token": token}), encoding="utf-8")
-    if os.name != "nt":
-        CONFIG_PATH.chmod(0o600)
-    print("Connected to ComfyUI with your PC's ChatGPT-signed-in Codex. No OpenAI credentials were sent to the pod.", flush=True)
-    if args.check:
+        client.close(cancel=False)
+    if stopped.is_set():
         return
-    print("Keep this helper running while planning. Press Ctrl+C to stop.", flush=True)
-    while True:
-        try:
-            job = pod.request("next", hello).get("job")
-        except HelperError as error:
-            if error.status == 401:
-                raise
-            print(str(error) + " Reconnecting…", flush=True)
-            time.sleep(5)
-            continue
-        if job:
-            print("Planning request " + job["id"] + "…", flush=True)
-            execute_job(pod, job)
-        else:
-            time.sleep(2)
+    pod = PodClient(url)
+    hello = pod.identity(models=models, version=VERSION)
+    connected = False
+    try:
+        while not stopped.is_set():
+            try:
+                health = pod.request("health", timeout=5)
+                if health.get("helper", {}).get("protocolVersion") != 2:
+                    raise HelperError("Update the ComfyUI AI Video Agent custom nodes to version 0.9 or later, then restart ComfyUI.", 409)
+                pod.request("connect", hello, timeout=5)
+                connected = True
+                emit("connected", f"Connected · {len(models)} Codex models available. Ready for planning.")
+                if check:
+                    return
+                while not stopped.is_set():
+                    job = pod.request("next", hello, timeout=5).get("job")
+                    if stopped.is_set():
+                        return
+                    if job:
+                        emit("planning", "Codex is inspecting references and preparing your prompt…")
+                        # Delivery failures leave this loop entirely; do not claim/repeat inference.
+                        try:
+                            execute_job(pod, job, stopped, lambda message: emit("activity", message))
+                        except HelperError as error:
+                            raise HelperError(str(error), 409) from None
+                        if not stopped.is_set():
+                            emit("connected", "Connected · Ready for the next planning request.")
+                    else:
+                        stopped.wait(2)
+            except HelperError as error:
+                if error.status in (400, 401, 403, 409):
+                    raise
+                emit("reconnecting", str(error) + " Retrying automatically…")
+                stopped.wait(3)
+    finally:
+        if connected:
+            try:
+                pod.request("disconnect", pod.identity(), timeout=5)
+            except HelperError:
+                pass
+
+
+class HelperController:
+    """Serial worker keeps UI responsive and drains one pod before moving to another."""
+    def __init__(self, emit):
+        self.emit = emit
+        self.condition = threading.Condition()
+        self.target, self.generation, self.closed = None, 0, False
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._work, daemon=True)
+        self.thread.start()
+
+    def connect(self, url):
+        url = base_url(url)
+        with self.condition:
+            if self.target == url and not self.stopped.is_set():
+                return
+            self.generation += 1
+            self.target = url
+            self.stopped.set()
+            self.emit("connecting", "Connecting to " + url + "…", url)
+            self.condition.notify_all()
+
+    def disconnect(self):
+        with self.condition:
+            self.generation += 1
+            self.target = None
+            self.stopped.set()
+            self.emit("disconnected", "Disconnected. Enter a ComfyUI URL to connect.", "")
+            self.condition.notify_all()
+
+    def close(self):
+        self.disconnect()
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+
+    def _work(self):
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.target is not None or self.closed)
+                if self.closed:
+                    return
+                url, generation = self.target, self.generation
+                self.stopped = threading.Event()
+                stopped = self.stopped
+            def update(state, message):
+                with self.condition:
+                    if generation == self.generation:
+                        self.emit(state, message, url)
+            try:
+                run_helper(url, stopped, update)
+            except HelperError as error:
+                if not stopped.is_set():
+                    update("error", str(error))
+            except Exception:
+                if not stopped.is_set():
+                    update("error", "The helper could not start. Check that Codex is installed and signed in with ChatGPT.")
+            finally:
+                with self.condition:
+                    if generation == self.generation:
+                        self.target = None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", help="Your HTTPS ComfyUI browser URL")
+    parser.add_argument("--check", action="store_true", help="Check Codex and the pod connection, then exit")
+    args = parser.parse_args()
+    url = base_url(args.url or load_settings()["url"] or input("ComfyUI HTTPS URL: "))
+    save_settings(url)
+    run_helper(url, threading.Event(), lambda state, message: print(message, flush=True), args.check)
 
 
 if __name__ == "__main__":

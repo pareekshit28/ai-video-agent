@@ -41,7 +41,6 @@ eng = package.routes.engine()
 eng.watch = lambda *args: None
 planning_fixture = {"delay": 0, "fail": False, "calls": 0, "live": False}
 real_ask = package.planner.ask
-eng.bridge.pair()
 eng.bridge.touch("fixture_pc", [{"id": "codex-default-test", "name": "Default test model", "default": True, "images": True},
                                 {"id": "codex-alternate-test", "name": "Alternate test model", "default": False, "images": True}], "fixture")
 

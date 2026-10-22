@@ -889,14 +889,12 @@ class PlanningRouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(400, response.status)
         self.engine.plan.assert_not_awaited()
 
-    async def test_pc_helper_routes_require_pairing_and_return_only_claimed_images(self):
-        paired = await self.post("pairCodex")
-        token = (await paired.json())["token"]
-        identity = {"helperId": "pc", "version": "0.8.0", "models": []}
-        denied = await self.client.post("/ava-agent/codex/connect", json=identity)
-        self.assertEqual(401, denied.status)
-        headers = {"Authorization": "Bearer " + token}
-        connected = await self.client.post("/ava-agent/codex/connect", json=identity, headers=headers)
+    async def test_url_only_helper_connects_and_returns_only_claimed_images(self):
+        identity = {"helperId": "pc", "version": "0.9.0", "models": []}
+        denied = await self.client.post("/ava-agent/codex/connect", json=identity, headers={"Origin":"https://unrelated.example"})
+        self.assertEqual(403, denied.status)
+        headers = {}
+        connected = await self.client.post("/ava-agent/codex/connect", json=identity)
         self.assertEqual(200, connected.status)
         task = asyncio.create_task(self.engine.bridge.generate("", "system", "script", [self.store.path(self.asset["path"])]))
         try:
@@ -911,6 +909,9 @@ class PlanningRouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
                                             json={"helperId": "pc", "claimId": job["claimId"], "output": "Result"})
             self.assertEqual(200, result.status)
             self.assertEqual("Result", await task)
+            disconnected = await self.client.post("/ava-agent/codex/disconnect", json=identity)
+            self.assertEqual(200, disconnected.status)
+            self.assertFalse(self.engine.bridge.status()["connected"])
             download = await self.client.get("/ava-agent/codex/helper.py")
             self.assertEqual(200, download.status)
             self.assertIn("pc_helper.py", download.headers["Content-Disposition"])

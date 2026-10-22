@@ -1,4 +1,4 @@
-"""Codex planning through the paired PC helper; rendering stays on the pod."""
+"""Codex planning through the URL-connected desktop helper; rendering stays on the pod."""
 import json
 import re
 from urllib.parse import urlparse

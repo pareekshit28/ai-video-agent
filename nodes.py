@@ -6,7 +6,7 @@ from . import core, planner
 
 
 async def ask_canvas(state, instruction, payload, images=(), model_file=None):
-    # The paired PC helper claims each request once; H3 GPU state is untouched.
+    # The desktop helper claims each request once; H3 GPU state is untouched.
     if isinstance(model_file, str) and model_file.endswith(".safetensors"):
         model_file = None  # A saved pre-Codex node widget is not a Codex model choice.
     return await planner.ask(state, instruction, payload, images, model_file=model_file)

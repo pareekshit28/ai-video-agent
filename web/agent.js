@@ -29,7 +29,7 @@ const note = text => $("p", { class: "ava-note", text });
 const mediaUrl = asset => api.apiURL(`${prefix}/media?path=${encodeURIComponent(asset.path)}`);
 
 let workspace, message, content, projectHost, navigation, livePanel, openButton, projectId = localStorage.getItem("ava-project") || "", sceneId = localStorage.getItem("ava-scene") || "", episodeId = localStorage.getItem("ava-episode") || "";
-let state, scene, busy = false, dirty = false, modal, poller, refreshing = false, sidebarHost, diagnostics, pairingToken;
+let state, scene, busy = false, dirty = false, modal, poller, refreshing = false, sidebarHost, diagnostics;
 let renderedSnapshot = "", sceneReceivedAt = Date.now() / 1000;
 let refreshDone = Promise.resolve();
 const originalTitle = document.title;
@@ -243,15 +243,14 @@ function connection() {
   const catalog = [{ id: "", name: "Use PC's default Codex model" }, ...(state.helper?.models || []).map(m => ({ id: m.id, name: m.name }))];
   if (conf.model && !catalog.some(m => m.id === conf.model)) catalog.push({ id: conf.model, name: conf.model });
   const model = select(catalog, conf.model);
-  const token = input(pairingToken || ""); token.readOnly = true;
+  const podUrl = input(location.origin); podUrl.readOnly = true;
   const result = $("pre", { class: "ava-diagnostics", text: diagnostics || "Check the pod's models, nodes, media tools and Codex connection." });
   return card(heading("Codex & RunPod setup", "Codex plans on your PC. H3 renders on this pod."),
     note(state.helper?.connected ? "PC helper connected" : "PC helper offline — start it on your PC before planning."),
-    $("a", { text: "Download Windows helper", href: api.apiURL(`${prefix}/codex/helper.py`), download: "pc_helper.py" }),
-    note(`Run py pc_helper.py --url "${location.origin}" on your PC. Paste the pairing token when prompted. Later runs can use py pc_helper.py.`),
-    button("Create / replace pairing token", async () => { pairingToken = (await action("pairCodex")).token; }),
-    pairingToken && field("PC helper pairing token", token),
-    note("Creating a new token disconnects the previously paired helper. Your Codex ChatGPT login stays on your PC."),
+    $("a", { text: "Download desktop app · Windows & macOS", href: "https://github.com/pareekshit28/ai-video-agent/releases/tag/helper-v0.9.0", target: "_blank", rel: "noopener" }),
+    field("ComfyUI URL for the desktop app", podUrl),
+    note("Paste this URL into the Codex desktop helper. It connects automatically. Paste a new pod URL to switch; keep the desktop app open while planning."),
+    note("Your Codex ChatGPT login stays on your computer."),
     note(`Model selection is saved for ${state.project.name}. The choices come from the connected PC's Codex installation.`),
     field("Codex planner model", model),
     button("Save Codex model", () => action("codexConfig", { config: { model: model.value } })),
