@@ -1,6 +1,7 @@
 """CPU-only contract tests. Comfy queue/model/Qwen calls are mocked, media is real FFmpeg."""
 import asyncio
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import importlib
 import importlib.util
 import json
@@ -180,9 +181,14 @@ class CoreTests(Fixture, unittest.TestCase):
         mm.unload_all_models = MagicMock()
         mm.soft_empty_cache = MagicMock()
         comfy = types.ModuleType("comfy"); comfy.__path__ = []; comfy.model_management = mm
+        utils = types.SimpleNamespace(PROGRESS_BAR_HOOK=None)
+        utils.set_progress_bar_global_hook = lambda hook: setattr(utils, "PROGRESS_BAR_HOOK", hook)
+        comfy.utils = utils
         modules = {"nodes": types.SimpleNamespace(CLIPLoader=lambda: loader),
                    "folder_paths": types.SimpleNamespace(get_filename_list=lambda kind: [local_qwen.DEFAULT_MODEL]),
-                   "comfy": comfy, "comfy.model_management": mm}
+                   "comfy": comfy, "comfy.model_management": mm, "comfy.utils": utils,
+                   "comfy_execution": types.SimpleNamespace(),
+                   "comfy_execution.utils": types.SimpleNamespace(get_executing_context=lambda: None)}
         with patch.dict(sys.modules, modules), patch.object(local_qwen, "image_tensor", side_effect=["image-one", "image-two"]):
             result = local_qwen.generate(local_qwen.DEFAULT_MODEL, "system", "content", ["one.png", "two.png"])
         self.assertEqual('{"prompt":"Native response"}', result)
@@ -208,6 +214,115 @@ class CoreTests(Fixture, unittest.TestCase):
         self.store.trash_project(self.project["id"])
         self.assertEqual([], self.store.projects())
         self.assertEqual(1, len(list(self.store.path(".trash").iterdir())))
+
+
+class NativeProgressTests(unittest.TestCase):
+    def setUp(self):
+        self.context = None
+        self.server = types.SimpleNamespace()  # Fresh server: no last_prompt_id.
+        self.mm = types.ModuleType("comfy.model_management")
+        self.mm.unload_all_models = MagicMock()
+        self.mm.soft_empty_cache = MagicMock()
+        self.mm.throw_exception_if_processing_interrupted = MagicMock()
+        self.utils = types.ModuleType("comfy.utils")
+        self.utils.set_progress_bar_global_hook = lambda hook: setattr(self.utils, "PROGRESS_BAR_HOOK", hook)
+
+        def native_hook(value, total, preview, node_id=None):
+            # Reproduce main.hijack_progress's missing queued-prompt fallback.
+            return self.context.prompt_id if self.context is not None else self.server.last_prompt_id
+
+        self.native_hook = MagicMock(side_effect=native_hook)
+        self.utils.PROGRESS_BAR_HOOK = self.native_hook
+        utils = self.utils
+
+        class ProgressBar:
+            def __init__(self, total):
+                self.total, self.current, self.hook = total, 0, utils.PROGRESS_BAR_HOOK
+
+            def update(self, value):
+                self.current += value
+                if self.hook is not None:
+                    self.hook(self.current, self.total, None, node_id=None)
+
+        self.utils.ProgressBar = ProgressBar
+        self.clip = MagicMock()
+        self.clip.generate.side_effect = lambda *args, **kwargs: (ProgressBar(1).update(1), [1])[1]
+        self.clip.decode.return_value = '{"references":[]}'
+        loader = MagicMock(); loader.load_clip.return_value = (self.clip,)
+        comfy = types.ModuleType("comfy"); comfy.__path__ = []
+        comfy.model_management, comfy.utils = self.mm, self.utils
+        modules = {"nodes": types.SimpleNamespace(CLIPLoader=lambda: loader),
+                   "folder_paths": types.SimpleNamespace(get_filename_list=lambda kind: [local_qwen.DEFAULT_MODEL]),
+                   "comfy": comfy, "comfy.model_management": self.mm, "comfy.utils": self.utils,
+                   "comfy_execution": types.SimpleNamespace(),
+                   "comfy_execution.utils": types.SimpleNamespace(get_executing_context=lambda: self.context)}
+        self.patcher = patch.dict(sys.modules, modules)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def generate(self):
+        return local_qwen.generate(local_qwen.DEFAULT_MODEL, "system", "content")
+
+    def test_fresh_server_crash_is_reproduced_then_sidebar_generation_succeeds(self):
+        with self.assertRaisesRegex(AttributeError, "last_prompt_id"):
+            self.utils.ProgressBar(1).update(1)
+        self.native_hook.reset_mock()
+        self.assertEqual('{"references":[]}', self.generate())
+        self.native_hook.assert_not_called()
+        self.mm.throw_exception_if_processing_interrupted.assert_called_once()
+        self.assertIs(self.native_hook, self.utils.PROGRESS_BAR_HOOK)
+        self.assertFalse(local_qwen._sidebar_progress.get())
+
+    def test_canvas_generation_keeps_native_progress(self):
+        self.context = types.SimpleNamespace(prompt_id="canvas-prompt")
+        self.generate()
+        self.native_hook.assert_called_once_with(1, 1, None, node_id=None)
+        self.assertIs(self.native_hook, self.utils.PROGRESS_BAR_HOOK)
+
+    def test_other_thread_and_retained_bars_keep_native_progress(self):
+        self.server.last_prompt_id = "render-prompt"
+        bars = []
+
+        def tokens(*args, **kwargs):
+            self.utils.ProgressBar(1).update(1)  # Sidebar: must be suppressed.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                bars.append(pool.submit(self.utils.ProgressBar, 2).result())
+                pool.submit(bars[0].update, 1).result()
+            return [1]
+
+        self.clip.generate.side_effect = tokens
+        self.generate()
+        self.native_hook.assert_called_once_with(1, 2, None, node_id=None)
+        bars[0].update(1)  # Captured wrapper still works after it is restored.
+        self.assertEqual(2, self.native_hook.call_count)
+
+    def test_generation_failure_restores_hook_and_offloads_model(self):
+        self.clip.generate.side_effect = RuntimeError("model failed")
+        with self.assertRaisesRegex(RuntimeError, "model failed"):
+            self.generate()
+        self.assertIs(self.native_hook, self.utils.PROGRESS_BAR_HOOK)
+        self.assertFalse(local_qwen._sidebar_progress.get())
+        self.assertEqual(2, self.mm.unload_all_models.call_count)
+        self.clip.decode.assert_not_called()
+
+    def test_sidebar_token_progress_keeps_cancellation(self):
+        self.mm.throw_exception_if_processing_interrupted.side_effect = RuntimeError("interrupted")
+        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+            self.generate()
+        self.assertIs(self.native_hook, self.utils.PROGRESS_BAR_HOOK)
+        self.assertEqual(2, self.mm.unload_all_models.call_count)
+
+    def test_another_extension_hook_is_not_overwritten_on_exit(self):
+        replacement = MagicMock()
+        self.clip.generate.side_effect = lambda *a, **kw: (self.utils.set_progress_bar_global_hook(replacement), [1])[1]
+        self.generate()
+        self.assertIs(replacement, self.utils.PROGRESS_BAR_HOOK)
+
+    def test_generation_without_a_native_progress_hook(self):
+        self.utils.PROGRESS_BAR_HOOK = None
+        self.generate()
+        self.assertIsNone(self.utils.PROGRESS_BAR_HOOK)
+        self.mm.throw_exception_if_processing_interrupted.assert_called_once()
 
 
 class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):

@@ -1,5 +1,7 @@
 """Run a complete Qwen-VL checkpoint through ComfyUI's own CLIP runtime."""
 import gc
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 import threading
 
@@ -8,6 +10,41 @@ from PIL import Image, ImageOps
 DEFAULT_MODEL = "qwen3vl_4b_fp8_scaled.safetensors"
 MODEL_URL = "https://huggingface.co/Comfy-Org/Qwen3-VL/resolve/main/text_encoders/" + DEFAULT_MODEL
 _lock = threading.Lock()
+_sidebar_progress = ContextVar("ava_sidebar_progress", default=False)
+
+
+@contextmanager
+def generation_progress():
+    """Keep unqueued planning out of Comfy's queued-prompt progress hook."""
+    import comfy.utils as utils
+    import comfy.model_management as mm
+    from comfy_execution.utils import get_executing_context
+
+    if get_executing_context() is not None:
+        # asyncio.to_thread preserves the canvas node's execution context.
+        yield
+        return
+
+    original = utils.PROGRESS_BAR_HOOK
+    token = _sidebar_progress.set(True)
+
+    def hook(*args, **kwargs):
+        if _sidebar_progress.get():
+            # The normal hook also checks interruption on every token. Retain
+            # cancellation, without reading stale/missing server prompt IDs.
+            mm.throw_exception_if_processing_interrupted()
+        elif original is not None:
+            # Other threads (including H3 renders) keep their normal progress.
+            original(*args, **kwargs)
+
+    utils.set_progress_bar_global_hook(hook)
+    try:
+        yield
+    finally:
+        _sidebar_progress.reset(token)
+        # Do not undo a newer hook installed by another extension.
+        if utils.PROGRESS_BAR_HOOK is hook:
+            utils.set_progress_bar_global_hook(original)
 
 
 def validate_model_name(model):
@@ -39,7 +76,7 @@ def generate(model, system, content, images=(), max_tokens=8192):
         raise ValueError(f"Download {model} into ComfyUI/models/text_encoders. The direct link is in workflow.json.")
     # Comfy's Qwen3-VL detection is based on tensor keys; stable_diffusion selects
     # its ordinary Qwen3VLTEModel rather than a diffusion-specific template.
-    with _lock:
+    with _lock, generation_progress():
         clip = None
         try:
             mm.unload_all_models()

@@ -67,6 +67,10 @@ Version 0.3.1 fixes a sidebar error reported as `Unexpected token 'U', "Use the 
 
 Update the custom-node folder with `git pull --ff-only`, restart ComfyUI, then hard-refresh the browser. If your proxy strips the browser's `Sec-Fetch-Site` header, set `AVA_PUBLIC_ORIGIN` to the exact public ComfyUI origin, for example `https://your-pod-8188.proxy.runpod.net`, and restart. Cross-origin browser requests remain blocked.
 
+### Qwen progress error before any queued workflow
+
+Version 0.3.2 fixes `AttributeError: 'PromptServer' object has no attribute 'last_prompt_id'` during sidebar planning. ComfyUI's token progress callback assumes a queued workflow, but sidebar requests run outside the queue. Sidebar generation now checks cancellation without sending progress through that callback; canvas nodes and progress from other threads retain ComfyUI's normal hook. The original hook is restored on success or failure. Update with `git pull --ff-only` and restart ComfyUI; model files do not need to be downloaded again.
+
 ## Validation
 
 ```bash
