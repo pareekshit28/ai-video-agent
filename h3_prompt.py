@@ -1,7 +1,7 @@
 """Plain H3 prompt guidance and checks for the host's actual media bindings."""
 import re
 
-VERSION = "h3-import-2026-10-23.1"
+VERSION = "h3-import-2026-10-23.2"
 # These names only preserve ordering when flattening older section-object output.
 BASE_FIELDS = ("integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
 REF_FIELDS = ("subject_definitions", "summary", "retention_analysis", "detailed_description", "overall_soundscape", "non_diegetic_music")
@@ -9,7 +9,12 @@ SUBJECT = re.compile(r"<Subject\s+(\d+)>")
 ASSET = re.compile(r"<(?:Picture|Audio|Video)\s*\d+>", re.I)
 
 RULES = """H3 PROMPT GUIDANCE (apply to every imported clip prompt):
-Return each final prompt as ONE complete natural-language text string in the requested JSON response.
+Identify needed Image and Audio slots without assuming access to the user's project library.
+Begin each prompt with one exact Tag: Name (type) declaration per JSON reference, in array order,
+then a blank line and natural-language scene prose. Image slots precede Audio slots, and each medium
+is numbered from 1 without gaps. The host maps Image N to <Picture N> and Audio N to <Audio N>,
+binding exactly one selected project-library file per slot. Do not write raw H3 tags or a Reference block.
+Return each final prompt as ONE complete text string in the requested JSON response.
 Write descriptive prose covering the visible style, subjects, setting, composition, lighting, action,
 reactions and end state, with sound and speech naturally included in the same prompt. There are no
 required section headings, shot labels, speaker IDs or dialogue tags. Escape newlines correctly in JSON.
@@ -20,10 +25,8 @@ off-screen. Keep visible characters' lips closed for voiceover. Never invent dia
 subtitles. Include ambience and physical sounds; include music only when requested by the script or
 comments. Fit action, natural speech, pauses and reactions into the clip's requested duration.
 
-Use the actual supplied images as authority for appearance and setting. Refer to selected characters,
-places and props by their supplied names. If using Subject labels, use only supplied subjectLabel
-values. A voice sample supplies timbre and delivery, not its recorded words or a person's appearance.
-Never invent Picture/Audio/Video indices or a Reference block; the host binds real media at render time.
+Use supplied images as authority for appearance and setting when actually available. Refer to characters,
+places and props by their planned names. A voice sample supplies timbre, not its recorded words or appearance.
 Choose framing, camera movement and cuts to serve the scene and user direction. There is no
 fixed-camera or static-shot default. Describe the intended motion and cuts clearly in ordinary prose,
 keeping them achievable within the duration.
@@ -46,8 +49,8 @@ def subject_labels(scene):
 
 def context(references, frame_guide=False):
     return {"version": VERSION, "mode": "ref2va" if references else "t2va", "frameGuide": bool(frame_guide),
-            "promptFormat": "one natural-language text string; no required headings or tags",
-            "assetBinding": "Host assigns actual Picture/Audio indices in Reference; never guess them."}
+            "promptFormat": "ordered Tag: Name (type) declarations, blank line, then scene prose",
+            "assetBinding": "Host maps Image/Audio slots to actual Picture/Audio files in order."}
 
 
 def normalize(prompt, references, duration=None):

@@ -1,66 +1,64 @@
 ---
 name: comfyui-scene-planner
-description: Plan or revise a scene as importable clip JSON for the ComfyUI AI Video Agent, including H3 prompts, natural durations, project reference selection and last-frame continuity decisions. Use whenever the user plans a scene for this agent.
+description: Plan or revise a scene as importable FastH3 clip JSON, identifying needed character, location and prop reference slots without access to the ComfyUI library. Use whenever planning a scene for this agent.
 ---
 
 # ComfyUI scene planner
 
-Return a complete scene plan as one valid JSON object that the user can paste into the ComfyUI AI Video Agent. Plan and write prompts here in ChatGPT; the ComfyUI agent imports and renders them after the user's per-clip approval.
+Plan every clip and write its complete FastH3 prompt in ChatGPT. Return one JSON object the user can paste into the ComfyUI AI Video Agent. The agent shows reference slots, and the user fills them with files from the selected project's library before approving each render.
 
-Use this skill for every scene planned for this agent. In a ChatGPT Project, attach this file and add the instruction: "Use the attached ComfyUI scene planner skill whenever planning or revising a scene for my ComfyUI AI Video Agent."
+Use this skill for every scene planned for this agent. In a ChatGPT Project, attach this file and instruct ChatGPT to use it whenever planning or revising a scene for the ComfyUI AI Video Agent.
 
-## Inputs and references
+## Identify needed references
 
-Read the scene/script, creative direction and the current project's exported reference manifest. Inspect supplied images and any actual last-frame image. If a script depends on reference assets that have not been supplied, identify the needed character, location or prop references first and request them before the final plan. A scene that needs no assets can use an empty references list.
+Analyze the scene and decide which visual or audio inputs H3 needs for each clip. Do not assume knowledge of existing library items, ask for a library manifest, invent library IDs or file paths, or claim to have inspected media that was not supplied. Name each needed subject or sound so the user can find or create the corresponding library item. Use `type: "character"`, `"location"` or `"prop"`. A character image establishes appearance; a location image establishes the environment; a prop image establishes an object's look. An audio sample may establish a character's voice, location ambience or prop sound. Put only needed inputs in a clip; use `[]` if no external reference is needed.
 
-Select only library entries in the supplied project's manifest. Copy their exact IDs into each clip's `references` array; unique exact names are accepted by the importer, but IDs avoid ambiguity. Use those entries' names in the prose prompt. Select only what that clip needs. Each clip supports at most 9 image files and 3 voice files, counted across all selected entries. A voice reference supplies timbre, not new dialogue or visual appearance. Metadata and filenames alone do not reveal an image's contents; do not claim to have seen or heard unavailable media.
+Each entry in `references` is one file slot: `{"tag":"Image 1","name":"Mara","type":"character"}`. Use `Image 1` through `Image 9` and then `Audio 1` through `Audio 3`, with contiguous numbers starting at 1 for each medium. List every Image slot before Audio slots. If a subject needs two supplied images, give it two slots. Names and types describe the requirement; the user selects the actual project-library item and file later. The previous clip's final frame is never a reference slot.
 
-If the manifest is unavailable, ask for it when references are needed. Do not invent IDs, file paths, asset URLs, numbered media tags, or a `Reference` block. The renderer binds real `<Picture N>` and `<Audio N>` inputs. Last-frame continuity uses the preceding clip's saved frame as a separate frame-zero guide; do not include it in `references`.
+## Write H3 prompts with reference tags
 
-## Clip planning
+Start each clip's `prompt` with **one declaration line per reference, in exactly the same order as the JSON array**. Each line must exactly match `Tag: Name (type)`, using the slot's spelling and capitalization. Follow the declarations with a blank line and scene prose. For example:
 
-Preserve every required event and the exact dialogue, language, speaker and order. Estimate natural delivery plus pauses, reactions and action. Use one clip if the scene fits naturally within 15 seconds; otherwise use the fewest natural 2–15 second clips. Speech and action can overlap when plausible. Split at natural beats or sentence boundaries. Never rush dialogue, omit action or add filler to reduce clip count. Necessary internal cuts can occur within one clip.
+```text
+Image 1: Mara (character)
+Image 2: Riverside station (location)
+Audio 1: Mara voice (character)
 
-Write every clip's complete generation prompt now, including later clips. Prompts are editable and can be revised after an actual frame is available. Use descriptive English prose for style, subjects, setting, framing, lighting, ordered action, reactions and end state. Keep dialogue and visible text in their original language. Identify each speaker, delivery and lip sync or off-screen speech. Include appropriate ambience and physical sound; add narration, subtitles or music only when requested. No section headings, dialogue tags or shot numbering are required.
+A smooth tracking shot follows Mara through Riverside station. Preserve Mara's facial features and clothing, and the station's layout and signage. She says, "The train is here," softly in her supplied voice timbre, with synchronized lip movement. Footsteps and distant train noise sit under her speech.
+```
 
-Choose framing, camera movement and cuts to suit the story and user direction. There is no static-shot requirement or fixed-camera default. Keep camera motion, transitions, action and dialogue feasible within the duration.
+The declaration header establishes each image or audio tag's subject, type and order. In the prose, use those names to describe how the references affect appearance, setting, object details or sound. The renderer turns the header into H3 `<Picture N>` and `<Audio N>` bindings in the same order and attaches exactly one selected library file to each slot. Do not write raw `<Picture N>`, `<Audio N>`, `<Video N>` or a `Reference` section yourself. Do not make an appearance image a compulsory starting composition. For audio, state whether it supplies voice timbre, ambience or a physical sound; do not treat words in an audio sample as new scripted dialogue.
 
-## Last-frame decision
+After the header, write clear English prose for style, subjects, setting, framing, lighting, ordered action, reactions and end state. Preserve the exact dialogue, language, speaker and order from the scene. Identify delivery and whether speech has visible synchronized lips or is off-screen. Include appropriate ambience and physical sounds; add narration, subtitles or music only if requested. Choose camera movement and cuts to fit the story. There is no static-shot requirement. Keep motion, dialogue, pauses and reactions feasible within the clip duration.
 
-Set `use_last_frame` independently for each clip:
+## Plan clips and continuity
 
-- `true` for continuous action that should start from the immediately preceding clip's saved final frame. Continue the physical state without replaying completed dialogue or actions. When a real frame is supplied, adapt to its visible pose, gaze, objects and lighting. When it is not available yet, describe continuing from the supplied opening frame without inventing its observed contents.
-- `false` for a new scene, intentional shot reset, incompatible composition, time jump, or whenever the previous composition should not anchor the start. Appearance references still apply.
+Prefer one clip if the complete scene fits naturally in 2–15 seconds. Otherwise use the fewest natural 2–15 second clips. Split at a useful beat without rushing or omitting action or dialogue. Write complete prompts for later clips now; the user can revise them after rendering the preceding clip.
 
-The first clip in a project has no predecessor, so set continuity to `false`. The first clip of an appended scene can use continuity when it follows the project's last clip. Later clips can use continuity after their immediate predecessor renders. The app uses that predecessor's current saved frame, including a replacement take, at review/render time. It never searches other clips or a library for a newer frame. If the predecessor's frame is unsuitable, set continuity to `false` or revise the plan. Do not assume that a still frame proves dialogue was spoken.
+Set `use_last_frame` to `true` only when continuous action should start from the immediately preceding clip's saved final frame. Continue its physical state without replaying completed action or dialogue. If the frame has not been shown to you, do not invent observed pose, gaze or objects. Set it to `false` for a new composition, time jump or incompatible predecessor. The first clip of a project must use `false`; the first clip of an appended scene can use `true` if the project's previous clip is its intended predecessor.
 
 ## Output contract
 
-When inputs are sufficient, return JSON only, without Markdown fences or surrounding commentary. Escape dialogue quotes and newlines correctly. `version` must be integer `1`; `clips` must contain 1–40 objects. `scene` and each clip's `title` are optional labels. Required clip fields are `duration` (number, 2–15 seconds), `references` (array of distinct library ID strings), `use_last_frame` (boolean), and `prompt` (nonempty string, at most 12000 characters).
-
-Example without external appearance or voice references:
+When the scene is sufficiently specified, return JSON only, with no Markdown fence. `version` is integer `1`; `clips` contains 1–40 objects. `scene` and `title` are optional labels. Each clip requires `duration` (number, 2–15), `references` (ordered array of `{tag,name,type}` slots), `use_last_frame` (boolean) and `prompt` (nonempty string, at most 12000 characters). Escape newlines and dialogue quotes as valid JSON. A clip with no references has no declaration header and begins directly with scene prose.
 
 ```json
 {
   "version": 1,
-  "scene": "The arrival",
+  "scene": "Arrival",
   "clips": [
     {
-      "title": "Approaching the house",
+      "title": "At the platform",
       "duration": 8,
-      "references": [],
+      "references": [
+        { "tag": "Image 1", "name": "Mara", "type": "character" },
+        { "tag": "Image 2", "name": "Riverside station", "type": "location" },
+        { "tag": "Audio 1", "name": "Mara voice", "type": "character" }
+      ],
       "use_last_frame": false,
-      "prompt": "Cinematic live action in warm late-afternoon light. A gentle tracking shot follows a traveler along a gravel path toward a small house. She slows at the door, raises her hand and knocks twice. Footsteps crunch and the knocks echo softly. No dialogue."
-    },
-    {
-      "title": "An answer",
-      "duration": 5,
-      "references": [],
-      "use_last_frame": true,
-      "prompt": "Continue from the supplied opening frame at the door without repeating the approach or knocks. The traveler lowers her hand as the door opens. The camera eases closer to her relieved expression. She says, \"You're home.\" softly, with synchronized lip movement. A hinge creaks over quiet outdoor ambience."
+      "prompt": "Image 1: Mara (character)\nImage 2: Riverside station (location)\nAudio 1: Mara voice (character)\n\nA moving camera follows Mara through Riverside station. Preserve Mara's appearance and the station's layout. She says, \"The train is here,\" softly in her supplied voice timbre, with synchronized lip movement. Footsteps and distant train noise accompany her."
     }
   ]
 }
 ```
 
-Check that every referenced ID exists in the current manifest, media counts fit, every clip has a complete prompt, all required story beats and exact dialogue appear once, durations allow natural performance, and continuity decisions fit the intended transitions. Importing appends clips and never submits a render or replaces saved takes.
+Before responding, check that the reference declarations match the array exactly, each needed slot has a clear name and type, the prompt describes how the inputs affect the clip, events and exact dialogue appear once, durations allow natural performance, and continuity matches the intended transition. Importing a plan does not fill slots, submit a render or replace saved takes.

@@ -36,11 +36,12 @@ class Fixture:
                     "assets": [{"path": path, "name": "actor.png", "kind": "image"}]}
         self.project["library"].append(self.ref)
         self.store.write(f"projects/{self.project['id']}/project.json", self.project)
+        self.scene["references"] = [copy.deepcopy(self.ref)]
         self.plan = {"version": 1, "scene": "Arrival", "clips": [
-            {"title": "Door", "duration": 5, "references": ["actor"], "use_last_frame": False,
-             "prompt": "A moving camera follows Actor opening the door."},
-            {"title": "Greeting", "duration": 4, "references": ["actor"], "use_last_frame": True,
-             "prompt": "Continue from the opening frame. Actor says hello."}]}
+            {"title": "Door", "duration": 5, "references": [{"tag": "Image 1", "name": "Actor", "type": "character"}], "use_last_frame": False,
+             "prompt": "Image 1: Actor (character)\n\nA moving camera follows Actor opening the door."},
+            {"title": "Greeting", "duration": 4, "references": [{"tag": "Image 1", "name": "Actor", "type": "character"}], "use_last_frame": True,
+             "prompt": "Image 1: Actor (character)\n\nContinue from the opening frame. Actor says hello."}]}
 
     def tearDown(self):
         self.temp.cleanup()
@@ -53,30 +54,41 @@ class Fixture:
                     extractedFrame={"path": path, "name": take_id + ".jpg"},
                     video={"path": f"projects/{self.project['id']}/{take_id}.mp4", "name": take_id + ".mp4"})
 
+    def bind_actor(self, clip):
+        clip["referenceSlots"] = core.bind_slots(self.scene, clip, [{"tag": "Image 1", "referenceId": "actor", "assetPath": self.ref["assets"][0]["path"]}])
+        clip["referenceIds"] = ["actor"]
+        clip["promptContext"] = core.prompt_context(self.store, self.scene, clip)
+
 
 class CoreTests(Fixture, unittest.TestCase):
     def test_import_is_atomic_and_append_only(self):
         clips = core.import_plan(self.store, self.scene, self.plan)
         self.assertEqual(2, len(clips))
-        self.assertEqual(["actor"], clips[0]["referenceIds"])
+        self.assertEqual([], clips[0]["referenceIds"])
+        self.assertEqual("Image 1", clips[0]["referenceSlots"][0]["tag"])
+        self.assertEqual("", clips[0]["referenceSlots"][0]["referenceId"])
         before = copy.deepcopy(self.scene["clips"])
         bad = copy.deepcopy(self.plan)
-        bad["clips"][1]["references"] = ["missing"]
-        with self.assertRaisesRegex(ValueError, "Missing or ambiguous"):
+        bad["clips"][1]["references"][0]["tag"] = "Image 2"
+        with self.assertRaisesRegex(ValueError, "numbered in order"):
             core.import_plan(self.store, self.scene, bad)
         self.assertEqual(before, self.scene["clips"])
         core.import_plan(self.store, self.scene, self.plan)
         self.assertEqual(4, len(self.scene["clips"]))
 
-    def test_cross_project_reference_rejected(self):
+    def test_import_does_not_need_project_library(self):
         other = self.store.create_project("Other")
-        with self.assertRaisesRegex(ValueError, "Missing or ambiguous"):
-            core.import_plan(self.store, self.store.workspace(other["id"]), self.plan)
-        self.assertEqual([], self.store.workspace(other["id"])["clips"])
+        workspace = self.store.workspace(other["id"])
+        imported = core.import_plan(self.store, workspace, self.plan)
+        self.assertEqual("Actor", imported[0]["referenceSlots"][0]["name"])
+        with self.assertRaisesRegex(ValueError, "Fill Image 1"):
+            core.ensure_ready(self.store, workspace, imported[0])
         self.assertEqual([], self.store.project(other["id"])["library"])
 
     def test_continuity_uses_immediately_previous_clip_and_invalidates_review(self):
         first, second = core.import_plan(self.store, self.scene, self.plan)
+        self.bind_actor(first)
+        self.bind_actor(second)
         with self.assertRaisesRegex(ValueError, "immediately preceding clip"):
             core.ensure_ready(self.store, self.scene, second)
         self.frame("take_one", first)
@@ -129,6 +141,68 @@ class CoreTests(Fixture, unittest.TestCase):
         bad = copy.deepcopy(self.plan)
         bad["clips"][0]["prompt"] = "Use <Picture 1>"
         with self.assertRaises(ValueError): core.import_plan(self.store, self.scene, bad)
+
+    def test_ordered_slots_bind_exact_files_to_h3(self):
+        location_path = f"projects/{self.project['id']}/station.png"
+        alternate_actor_path = f"projects/{self.project['id']}/actor_profile.png"
+        voice_path = f"projects/{self.project['id']}/voice.wav"
+        Image.new("RGB", (32, 32), "green").save(self.store.path(location_path))
+        Image.new("RGB", (32, 32), "yellow").save(self.store.path(alternate_actor_path))
+        self.store.path(voice_path).write_bytes(b"voice fixture")
+        location = {"id": "station", "name": "Station", "kind": "location", "description": "A platform",
+                    "assets": [{"path": location_path, "name": "station.png", "kind": "image"}]}
+        self.ref["assets"].append({"path": alternate_actor_path, "name": "actor_profile.png", "kind": "image"})
+        self.ref["assets"].append({"path": voice_path, "name": "voice.wav", "kind": "audio"})
+        self.scene["references"][0] = copy.deepcopy(self.ref)
+        self.scene["references"].append(location)
+        plan = {"version": 1, "clips": [{"duration": 6, "use_last_frame": False,
+            "references": [{"tag": "Image 1", "name": "Actor", "type": "character"},
+                           {"tag": "Image 2", "name": "Station", "type": "location"},
+                           {"tag": "Audio 1", "name": "Actor voice", "type": "character"}],
+            "prompt": "Image 1: Actor (character)\nImage 2: Station (location)\nAudio 1: Actor voice (character)\n\nActor crosses Station and speaks in the supplied voice."}]}
+        clip = core.import_plan(self.store, self.scene, plan)[0]
+        with self.assertRaisesRegex(ValueError, "Fill Image 1"):
+            core.ensure_ready(self.store, self.scene, clip)
+        with self.assertRaisesRegex(ValueError, "Image 1 requires a character"):
+            core.bind_slots(self.scene, clip, [{"tag": "Image 1", "referenceId": "station", "assetPath": location_path},
+                                               {"tag": "Image 2"}, {"tag": "Audio 1"}])
+        clip["referenceSlots"] = core.bind_slots(self.scene, clip, [
+            {"tag": "Image 1", "referenceId": "actor", "assetPath": alternate_actor_path},
+            {"tag": "Image 2", "referenceId": "station", "assetPath": location_path},
+            {"tag": "Audio 1", "referenceId": "actor", "assetPath": voice_path}])
+        clip["referenceIds"] = ["actor", "station"]
+        clip["promptContext"] = core.prompt_context(self.store, self.scene, clip)
+        core.ensure_ready(self.store, self.scene, clip)
+        input_dir = Path(self.temp.name) / "input"
+        graph = core.build_h3(self.store, self.scene, clip, input_dir, "ordered")
+        prompt = graph["138"]["inputs"]["value"]
+        self.assertLess(prompt.index("<Picture 1>: Actor"), prompt.index("<Picture 2>: Station"))
+        self.assertLess(prompt.index("<Picture 2>: Station"), prompt.index("<Audio 1>: Actor voice"))
+        self.assertEqual(["ava_image_0", 0], graph["136"]["inputs"]["ref_images.ref_image_0"])
+        self.assertEqual(["ava_image_1", 0], graph["136"]["inputs"]["ref_images.ref_image_1"])
+        self.assertEqual(["ava_audio_0", 0], graph["136"]["inputs"]["ref_audios.ref_audio_0"])
+        for node_id, source in (("ava_image_0", alternate_actor_path),
+                                ("ava_image_1", location_path), ("ava_audio_0", voice_path)):
+            kind = "audio" if "audio" in node_id else "image"
+            copied = input_dir / graph[node_id]["inputs"][kind]
+            self.assertEqual(self.store.path(source).read_bytes(), copied.read_bytes())
+
+    def test_slot_prompt_order_and_type_must_match_json(self):
+        bad = copy.deepcopy(self.plan)
+        bad["clips"][0]["prompt"] = "Image 1: Actor (location)\n\nActor walks."
+        with self.assertRaisesRegex(ValueError, "Prompt reference 1"):
+            core.import_plan(self.store, self.scene, bad)
+        bad = copy.deepcopy(self.plan)
+        bad["clips"][0]["prompt"] += " Image 1 appears again."
+        with self.assertRaisesRegex(ValueError, "exactly once"):
+            core.import_plan(self.store, self.scene, bad)
+
+    def test_clip_without_references_needs_no_library_selection(self):
+        plan = {"version": 1, "clips": [{"duration": 3, "references": [], "use_last_frame": False,
+                                         "prompt": "A camera glides across an empty hallway in quiet ambience."}]}
+        clip = core.import_plan(self.store, self.scene, plan)[0]
+        core.ensure_ready(self.store, self.scene, clip)
+        self.assertEqual(([], []), core.media(self.scene, clip))
 
     def test_legacy_scene_migration_preserves_take(self):
         project = self.store.create_project("Legacy")
@@ -206,12 +280,28 @@ class RouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
         await self.post("importPlan", plan=self.plan, requestId="one")
         saved = self.store.workspace(self.project["id"])
         clip = saved["clips"][0]
-        response = await self.post("saveClip", clipId=clip["id"], prompt=clip["prompt"], referenceIds=["actor"], use_last_frame=False, duration=5)
+        response = await self.post("saveClip", clipId=clip["id"], prompt=clip["prompt"],
+                                   referenceSlots=[{"tag": "Image 1", "referenceId": "actor", "assetPath": self.ref["assets"][0]["path"]}],
+                                   use_last_frame=False, duration=5)
         self.assertEqual(200, response.status)
         review = (await response.json())["workspace"]["clips"][0]["reviewKey"]
         rejected = await self.post("approveGenerate", clipId=clip["id"], reviewKey="wrong")
         self.assertEqual(400, rejected.status)
         self.assertTrue(review)
+
+    async def test_slot_selection_rejects_other_project_item(self):
+        await self.post("importPlan", plan=self.plan, requestId="one")
+        clip = self.store.workspace(self.project["id"])["clips"][0]
+        other = self.store.create_project("Other")
+        other_project = self.store.project(other["id"])
+        other_project["library"].append({"id": "other_actor", "name": "Actor", "kind": "character", "description": "Other project",
+                                         "assets": [{"path": f"projects/{other['id']}/actor.png", "name": "actor.png", "kind": "image"}]})
+        self.store.write(f"projects/{other['id']}/project.json", other_project)
+        response = await self.post("saveClip", clipId=clip["id"], prompt=clip["prompt"],
+                                   referenceSlots=[{"tag": "Image 1", "referenceId": "other_actor", "assetPath": f"projects/{other['id']}/actor.png"}],
+                                   use_last_frame=False, duration=5)
+        self.assertEqual(400, response.status)
+        self.assertEqual("", self.store.workspace(self.project["id"])["clips"][0]["referenceSlots"][0]["referenceId"])
 
     async def test_project_media_cannot_cross_into_another_project(self):
         other = self.store.create_project("Other")

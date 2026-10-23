@@ -180,18 +180,28 @@ async def action(request):
                 base = base_url(request)
                 if command == "saveClip":
                     check_mutable(scene, clip)
-                    refs = body["referenceIds"]
-                    available = {r["id"] for r in scene["references"] if r.get("assets")}
-                    if not isinstance(refs, list) or any(not isinstance(r, str) for r in refs) or len(set(refs)) != len(refs) or not set(refs) <= available:
-                        raise ValueError("Select only supplied project references")
+                    if "referenceSlots" in clip:
+                        slots = core.bind_slots(scene, clip, body.get("referenceSlots"))
+                        refs = list(dict.fromkeys(s["referenceId"] for s in slots if s["referenceId"]))
+                    else:
+                        refs = body["referenceIds"]
+                        available = {r["id"] for r in scene["references"] if r.get("assets")}
+                        if not isinstance(refs, list) or any(not isinstance(r, str) for r in refs) or len(set(refs)) != len(refs) or not set(refs) <= available:
+                            raise ValueError("Select only supplied project references")
                     if type(body.get("use_last_frame")) is not bool:
                         raise ValueError("use_last_frame must be true or false")
                     if body["use_last_frame"] and not core.previous(scene, clip):
                         raise ValueError("The first project clip has no preceding clip for continuity")
-                    prompt = h3_prompt.validate(core.text(body["prompt"], 12000), [])
+                    prompt = core.text(body["prompt"], 12000)
+                    if "referenceSlots" in clip:
+                        core.slot_prompt_body(prompt, slots)
+                    else:
+                        h3_prompt.validate(prompt, [])
                     seconds = core.duration(body["duration"])
                     clip["nextDuration" if clip.get("takeId") else "duration"] = seconds
                     clip.update(prompt=prompt, referenceIds=refs, continuityMode="on" if body["use_last_frame"] else "off")
+                    if "referenceSlots" in clip:
+                        clip["referenceSlots"] = slots
                     clip["promptContext"] = core.prompt_context(store, scene, clip)
                     clip.pop("approvedKey", None)
                 elif command == "approveGenerate":

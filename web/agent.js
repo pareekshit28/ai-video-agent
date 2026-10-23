@@ -284,13 +284,15 @@ function library() {
   if (!project) return null;
   const refs = project.library;
   const name = input(), kind = select(["character", "location", "prop"], "character"), description = area("", 2);
+  const groups = [{ kind: "character", title: "Characters" }, { kind: "location", title: "Locations" }, { kind: "prop", title: "Props" }];
   return $("div", {}, heading("Reference library", `${refs.length} entries · isolated to ${project.name}`),
     $("details", { open: !refs.length }, $("summary", { text: "Create a library entry" }), card(
       field("Name", name), field("Kind", kind), field("Description", description),
       button("Create library entry", () => action("createLibrary", { name: name.value, kind: kind.value, description: description.value })))),
-    $("div", { class: "ava-library-grid" }, ...refs.map(ref => card($("h4", { text: ref.name }), note(`ID: ${ref.id}`), note(ref.description), assets(ref), uploadControl({ referenceId: ref.id }),
-      row(button("Clone", () => action("cloneLibrary", { referenceId: ref.id })),
-        button("Remove library entry", async () => { if (confirm(`Remove ${ref.name} from the library?`)) await action("removeLibrary", { referenceId: ref.id }); }))))),
+    ...groups.map(group => $("section", {}, heading(group.title, `${refs.filter(ref => ref.kind === group.kind).length} library items`),
+      $("div", { class: "ava-library-grid" }, ...refs.filter(ref => ref.kind === group.kind).map(ref => card($("h4", { text: ref.name }), note(ref.description), assets(ref), uploadControl({ referenceId: ref.id }),
+        row(button("Clone", () => action("cloneLibrary", { referenceId: ref.id })),
+          button("Remove library entry", async () => { if (confirm(`Remove ${ref.name} from the library?`)) await action("removeLibrary", { referenceId: ref.id }); }))))))),
     savedVideos());
 }
 
@@ -324,19 +326,13 @@ function generationSettings() {
 
 function planImporter() {
   const json = area("", 12);
-  json.placeholder = '{"version":1,"scene":"Scene name","clips":[{"title":"Opening","duration":5,"references":[],"use_last_frame":false,"prompt":"Describe the clip."}]}';
-  const manifest = { project: state.project.name, references: state.project.library.filter(r => r.assets.length).map(r => ({ id: r.id, name: r.name, kind: r.kind, description: r.description,
-    images: r.assets.filter(a => a.kind === "image").map(a => a.name), voices: r.assets.filter(a => a.kind === "audio").map(a => ({ name: a.name, duration: a.duration })) })),
-    previous_clip: scene.clips.length ? { title: scene.clips.at(-1).title, last_frame_available: scene.clips.at(-1).status === "complete" && !!scene.clips.at(-1).frame } : null };
-  const manifestJSON = JSON.stringify(manifest, null, 2);
+  json.placeholder = '{"version":1,"scene":"Scene name","clips":[{"title":"Opening","duration":5,"references":[{"tag":"Image 1","name":"Mara","type":"character"}],"use_last_frame":false,"prompt":"Image 1: Mara (character)\\n\\nA moving camera follows Mara..."}]}';
   let requestId;
   json.addEventListener("input", () => { requestId = null; });
-  return card(eyebrow("01 / IMPORT"), heading("Import a scene from ChatGPT", "Upload project references in Library, give ChatGPT the planning skill and reference manifest, then paste its clip JSON here."),
+  return card(eyebrow("01 / IMPORT"), heading("Import a scene from ChatGPT", "Give ChatGPT the scene and planning skill. Import its clip JSON, then fill each reference slot from this project's library."),
     $("a", { href: api.apiURL(`${prefix}/scene-planning-skill`), download: "comfyui-scene-planner.md", text: "Download ChatGPT scene-planning skill" }),
-    $("details", {}, $("summary", { text: "Reference manifest for ChatGPT" }), $("pre", { text: manifestJSON }),
-      button("Download reference manifest", () => downloadJSON(manifest, `${state.project.name}-references.json`))),
     field("Scene JSON", json),
-    note("Imports append clips. Existing clips and takes stay saved. Each clip includes duration, references, prompt and use_last_frame."),
+    note("ChatGPT identifies required character, location and prop references without seeing your library. Imports append clips and retain saved takes."),
     button("Import clips", async () => {
       const plan = JSON.parse(json.value);
       requestId ||= globalThis.crypto?.randomUUID?.() || `import_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -353,9 +349,33 @@ function clipEditor(clip, index) {
   const prompt = area(clip.prompt, 10), length = input(clip.nextDuration ?? clip.duration, "number");
   length.min = 2; length.max = 15; length.step = 0.5;
   const continuity = $("input", { type: "checkbox", checked: clip.continuityMode === "on" || clip.continuityMode === "auto" && clip.transition === "continue" });
-  const checks = scene.references.filter(r => r.assets.length).map(ref => ({ ref, box: $("input", { type: "checkbox", checked: clip.referenceIds.includes(ref.id) }) }));
+  const hasSlots = Array.isArray(clip.referenceSlots);
+  const checks = hasSlots ? [] : scene.references.filter(r => r.assets.length).map(ref => ({ ref, box: $("input", { type: "checkbox", checked: clip.referenceIds.includes(ref.id) }) }));
+  const slots = (clip.referenceSlots || []).map(slot => {
+    const mediaKind = slot.tag.startsWith("Image") ? "image" : "audio";
+    const candidates = state.project.library.filter(ref => ref.kind === slot.type && ref.assets.some(asset => asset.kind === mediaKind));
+    const librarySelect = select([{ id: "", name: `Select ${slot.type} library item` }, ...candidates], slot.referenceId || "");
+    const assetSelect = $("select");
+    function updateAssets(changed = false) {
+      const ref = candidates.find(item => item.id === librarySelect.value);
+      const files = ref?.assets.filter(asset => asset.kind === mediaKind) || [];
+      const current = files.length === 1 ? files[0].path : !changed && files.some(asset => asset.path === slot.assetPath) ? slot.assetPath : "";
+      assetSelect.replaceChildren(...[{ path: "", name: `Select ${mediaKind} file` }, ...files].map(asset => $("option", { value: asset.path, text: asset.name, selected: asset.path === current })));
+    }
+    librarySelect.addEventListener("change", () => updateAssets(true));
+    updateAssets();
+    const view = card($("h4", { text: `${slot.tag} · ${slot.name}` }), note(`Required type: ${slot.type} · ${mediaKind} file`),
+      field("Library item", librarySelect), field("File", assetSelect),
+      !candidates.length && note(`No ${slot.type} item with an ${mediaKind} file is in this project yet. Add one in Library.`));
+    view.classList.add("ava-slot");
+    return { slot, librarySelect, assetSelect, view };
+  });
+  const draft = () => ({ clipId: clip.id, prompt: prompt.value,
+    ...(hasSlots ? { referenceSlots: slots.map(({ slot, librarySelect, assetSelect }) => ({ tag: slot.tag, referenceId: librarySelect.value, assetPath: assetSelect.value })) }
+      : { referenceIds: checks.filter(c => c.box.checked).map(c => c.ref.id) }),
+    use_last_frame: continuity.checked, duration: Number(length.value) });
   async function save() {
-    await action("saveClip", { clipId: clip.id, prompt: prompt.value, referenceIds: checks.filter(c => c.box.checked).map(c => c.ref.id), use_last_frame: continuity.checked, duration: Number(length.value) });
+    await action("saveClip", draft());
   }
   const frameControls = clip.frame && $("details", {}, $("summary", { text: "Saved last frame" }), $("img", { src: mediaUrl(clip.frame), alt: "Extracted last frame", loading: "lazy" }));
   const keys = $("details", {}, $("summary", { text: "Canvas node IDs / review key" }),
@@ -364,15 +384,17 @@ function clipEditor(clip, index) {
     clip.continuityOutdated && note("An earlier take or frame changed. This completed take is retained; review continuity before regenerating."),
     clip.error && $("p", { class: "ava-error", text: clip.error }),
     clip.video && $("video", { src: mediaUrl(clip.video), controls: true, preload: "metadata" }),
-    clip.sceneName && note(clip.sceneName), field("Editable video prompt", prompt),
-    $("div", { class: "ava-checks" }, ...checks.map(({ ref, box }) => $("label", {}, box, document.createTextNode(ref.name)))),
+    clip.sceneName && note(clip.sceneName), field("Editable H3 prompt", prompt),
+    hasSlots ? $("div", {}, heading("Reference slots", "Choose a matching library item and one file for every slot. H3 receives files in tag order."),
+      ...slots.map(({ view }) => view), !slots.length && note("This clip needs no reference files."))
+      : $("div", { class: "ava-checks" }, ...checks.map(({ ref, box }) => $("label", {}, box, document.createTextNode(ref.name)))),
     field("Use previous clip's last frame", continuity),
     clip.previousFrame ? card(note(`Opening frame from: ${clip.previousFrame.name}`), $("img", { src: mediaUrl(clip.previousFrame.assets[0]), alt: "Previous clip's last frame", loading: "lazy" })) : continuity.checked && note("Complete the preceding clip before reviewing this continuation."),
     field(clip.takeId ? "Duration for next take" : "Duration", length),
     clip.nextDuration !== undefined && note(`The saved take keeps ${clip.duration}s. Next take: ${clip.nextDuration}s.`),
     button("Save prompt & references", save),
     button(clip.takeId ? "Approve prompt & regenerate this clip" : "Approve prompt & generate this clip", async () => {
-      const result = await action("saveClip", { clipId: clip.id, prompt: prompt.value, referenceIds: checks.filter(c => c.box.checked).map(c => c.ref.id), use_last_frame: continuity.checked, duration: Number(length.value) });
+      const result = await action("saveClip", draft());
       const saved = result.workspace.clips.find(c => c.id === clip.id);
       if (!saved.reviewKey || saved.reviewKey !== clip.reviewKey) {
         dirty = false; await refresh(true);

@@ -17,6 +17,8 @@ DEFAULTS = {"provider": "h3", "aspectRatio": "16:9", "megapixels": 2,
             "steps": 8, "seed": -1, "refImageSize": "match"}
 ID = re.compile(r"^[a-zA-Z0-9_-]{1,80}$")
 TAGS = re.compile(r"<(?:Picture|Audio|Video)\s*\d+>", re.I)
+SLOT_TAG = re.compile(r"(?:Image|Audio) [1-9]\d*")
+REFERENCE_TYPES = {"character", "location", "prop"}
 
 
 def uid():
@@ -190,7 +192,96 @@ def selected(scene, clip):
     return [r for ref_id in clip["referenceIds"] for r in scene["references"] if r["id"] == ref_id and r.get("assets")]
 
 
+def parse_slots(value):
+    if not isinstance(value, list) or len(value) > 12:
+        raise ValueError("references must be an ordered list of at most 9 Image and 3 Audio slots")
+    slots, counts = [], {"Image": 0, "Audio": 0}
+    audio_started = False
+    for item in value:
+        if not isinstance(item, dict) or item.get("type") not in REFERENCE_TYPES:
+            raise ValueError("Each reference needs a character, location or prop type")
+        tag = item.get("tag")
+        if not isinstance(tag, str) or not SLOT_TAG.fullmatch(tag):
+            raise ValueError("Each reference needs a tag such as Image 1 or Audio 1")
+        kind = tag.split()[0]
+        if kind == "Image" and audio_started:
+            raise ValueError("List all Image slots before Audio slots")
+        audio_started |= kind == "Audio"
+        counts[kind] += 1
+        if counts[kind] > (9 if kind == "Image" else 3) or tag != f"{kind} {counts[kind]}":
+            raise ValueError("Image and Audio tags must each be numbered in order from 1")
+        name = text(item.get("name"), 120)
+        if "\n" in name or "\r" in name:
+            raise ValueError("Reference names must stay on one line")
+        slots.append({"tag": tag, "name": name, "type": item["type"],
+                      "referenceId": "", "assetPath": ""})
+    return slots
+
+
+def slot_prompt_body(prompt, slots):
+    """A fixed declaration header makes tag, name, type and order unambiguous."""
+    lines = prompt.splitlines()
+    for index, slot in enumerate(slots):
+        expected = f"{slot['tag']}: {slot['name']} ({slot['type']})"
+        if index >= len(lines) or lines[index].strip() != expected:
+            raise ValueError(f"Prompt reference {index + 1} must be exactly: {expected}")
+    body = "\n".join(lines[len(slots):]).strip()
+    if not body:
+        raise ValueError("Write the clip action after the ordered reference declarations")
+    if SLOT_TAG.search(body):
+        raise ValueError("Mention each Image or Audio tag exactly once, in the declaration order")
+    h3_prompt.validate(body, [])
+    return body
+
+
+def bind_slots(scene, clip, requested):
+    slots = clip["referenceSlots"]
+    if not isinstance(requested, list) or len(requested) != len(slots):
+        raise ValueError("Submit every reference slot in its original order")
+    library = {r["id"]: r for r in scene["references"] if r.get("kind") in REFERENCE_TYPES}
+    bound = []
+    for original, item in zip(slots, requested):
+        if not isinstance(item, dict) or item.get("tag") != original["tag"]:
+            raise ValueError("Reference slot tags and order cannot change")
+        reference_id, asset_path = item.get("referenceId") or "", item.get("assetPath") or ""
+        if not isinstance(reference_id, str) or not isinstance(asset_path, str):
+            raise ValueError("Invalid library selection")
+        if reference_id:
+            ref = library.get(reference_id)
+            media_kind = "image" if original["tag"].startswith("Image") else "audio"
+            if not ref or ref["kind"] != original["type"]:
+                raise ValueError(f"{original['tag']} requires a {original['type']} library item")
+            matching = [a for a in ref.get("assets", []) if a["kind"] == media_kind]
+            if not asset_path and len(matching) == 1:
+                asset_path = matching[0]["path"]
+            if asset_path and not any(a["path"] == asset_path and a["kind"] == media_kind for a in ref.get("assets", [])):
+                raise ValueError(f"{original['tag']} requires a {media_kind} file from the selected library item")
+        elif asset_path:
+            raise ValueError("Select a library item before selecting its file")
+        bound.append({**original, "referenceId": reference_id, "assetPath": asset_path})
+    return bound
+
+
+def resolved_slots(scene, clip):
+    library = {r["id"]: r for r in scene["references"]}
+    result = []
+    for slot in clip["referenceSlots"]:
+        ref = library.get(slot.get("referenceId"))
+        media_kind = "image" if slot["tag"].startswith("Image") else "audio"
+        asset = next((a for a in ref.get("assets", []) if a["path"] == slot.get("assetPath") and a["kind"] == media_kind), None) if ref else None
+        if not ref or ref["kind"] != slot["type"] or not asset:
+            raise ValueError(f"Fill {slot['tag']} ({slot['name']}, {slot['type']}) with a matching project library file")
+        result.append((slot, ref, asset))
+    return result
+
+
 def media(scene, clip):
+    if "referenceSlots" in clip:
+        bound = resolved_slots(scene, clip)
+        return ([{**a, "referenceName": slot["name"], "referenceId": r["id"], "referenceKind": r["kind"]}
+                 for slot, r, a in bound if a["kind"] == "image"],
+                [{**a, "referenceName": slot["name"], "referenceId": r["id"], "referenceKind": r["kind"]}
+                 for slot, r, a in bound if a["kind"] == "audio"])
     refs = selected(scene, clip)
     return ([{**a, "referenceName": r["name"], "referenceId": r["id"], "referenceKind": r["kind"]} for r in refs for a in r["assets"] if a["kind"] == "image"],
             [{**a, "referenceName": r["name"], "referenceId": r["id"]} for r in refs for a in r["assets"] if a["kind"] == "audio"])
@@ -228,8 +319,18 @@ def previous_frame(scene, clip):
 
 def prompt_context(store, scene, clip):
     planning_settings = {k: v for k, v in scene["settings"].items() if k not in ("steps", "seed")}
+    if "referenceSlots" in clip:
+        library = {r["id"]: r for r in scene["references"]}
+        refs = []
+        for slot in clip["referenceSlots"]:
+            ref = library.get(slot.get("referenceId"))
+            asset = next((a for a in ref.get("assets", []) if a["path"] == slot.get("assetPath")), None) if ref else None
+            refs.append({"slot": slot, "library": {k: ref[k] for k in ("id", "name", "kind", "description") if k in ref} if ref else None,
+                         "asset": asset})
+    else:
+        refs = selected(scene, clip)
     return fingerprint(store, {"duration": clip.get("nextDuration", clip["duration"]), "settings": planning_settings,
-                              "refs": selected(scene, clip), "continuation": continuation(clip),
+                              "refs": refs, "continuation": continuation(clip),
                               "frame": ({k: v for k, v in frame.items() if k in ("id", "takeId", "assets")} if (frame := previous_frame(scene, clip)) else None)})
 
 
@@ -244,9 +345,13 @@ def ensure_ready(store, scene, clip):
         raise ValueError("Complete the immediately preceding clip and save its last frame, or turn continuity off.")
     if clip.get("promptContext") != prompt_context(store, scene, clip):
         raise ValueError("References, duration, settings or previous clip frame changed. Save and review this prompt again.")
-    if set(clip["referenceIds"]) != {r["id"] for r in selected(scene, clip)}:
-        raise ValueError("A selected reference is missing its project library files")
-    h3_prompt.validate(clip.get("prompt"), [{**r, "subjectLabel": h3_prompt.subject_labels(scene).get(r["id"])} for r in selected(scene, clip)])
+    if "referenceSlots" in clip:
+        slot_prompt_body(clip["prompt"], clip["referenceSlots"])
+        resolved_slots(scene, clip)
+    else:
+        if set(clip["referenceIds"]) != {r["id"] for r in selected(scene, clip)}:
+            raise ValueError("A selected reference is missing its project library files")
+        h3_prompt.validate(clip.get("prompt"), [{**r, "subjectLabel": h3_prompt.subject_labels(scene).get(r["id"])} for r in selected(scene, clip)])
 
 
 def import_plan(store, scene, result):
@@ -256,13 +361,6 @@ def import_plan(store, scene, result):
     source = result.get("clips")
     if not isinstance(source, list) or not 1 <= len(source) <= 40:
         raise ValueError("Scene JSON must contain 1–40 clips")
-    project = store.project(scene["projectId"])
-    available = {r["id"]: r for r in project["library"] if r["kind"] != "last-frame" and r.get("assets")}
-    names = {}
-    for ref in available.values():
-        names.setdefault(ref["name"], []).append(ref["id"])
-    references = copy.deepcopy(scene["references"])
-    ids = {r["id"] for r in references}
     clean, batch = [], uid()
     for index, value in enumerate(source):
         if not isinstance(value, dict):
@@ -272,39 +370,37 @@ def import_plan(store, scene, result):
             raise ValueError("Each clip needs use_last_frame: true or false")
         if value["use_last_frame"] and not scene["clips"] and index == 0:
             raise ValueError("The first project clip has no preceding clip for continuity")
-        requested = value.get("references")
-        if not isinstance(requested, list) or any(not isinstance(r, str) for r in requested):
-            raise ValueError("references must be a list of this project's library IDs or unique names")
-        selected_ids = []
-        for name in requested:
-            rid = name if name in available else names.get(name, [None])[0] if len(names.get(name, [])) == 1 else None
-            if rid is None:
-                raise ValueError(f"Missing or ambiguous project reference: {name}. Copy exact IDs from the library manifest.")
-            if rid in selected_ids:
-                raise ValueError("A clip cannot select a reference twice")
-            selected_ids.append(rid)
-            if rid not in ids:
-                references.append(copy.deepcopy(available[rid]))
-                ids.add(rid)
-        refs = [available[r] for r in selected_ids]
-        if sum(a["kind"] == "image" for r in refs for a in r["assets"]) > 9 or sum(a["kind"] == "audio" for r in refs for a in r["assets"]) > 3:
-            raise ValueError("H3 accepts at most 9 image and 3 voice inputs per clip")
+        slots = parse_slots(value.get("references"))
         prompt = text(value.get("prompt"), 12000)
-        # Names keep the JSON independent of the host's numbered input bindings.
-        h3_prompt.validate(prompt, [])
+        slot_prompt_body(prompt, slots)
         clean.append({"id": uid(), "title": text(value.get("title", f"Clip {index + 1}"), 150), "duration": seconds,
-            "referenceIds": selected_ids, "transition": "continue" if value["use_last_frame"] else "cut",
+            "referenceIds": [], "referenceSlots": slots, "transition": "continue" if value["use_last_frame"] else "cut",
             "continuityMode": "on" if value["use_last_frame"] else "off", "outline": prompt, "prompt": prompt,
             "status": "awaiting-approval", "versions": [], "batchId": batch,
             "sceneName": text(result.get("scene", "Imported scene"), 150)})
-    candidate = {**scene, "references": references, "clips": [*scene["clips"], *clean]}
+    candidate = {**scene, "clips": [*scene["clips"], *clean]}
     for clip in clean:
         clip["promptContext"] = prompt_context(store, candidate, clip)
-    scene.update(references=references, clips=candidate["clips"])
+    scene["clips"] = candidate["clips"]
     return clean
 
 
 def final_prompt(scene, clip):
+    if "referenceSlots" in clip:
+        body = slot_prompt_body(clip["prompt"], clip["referenceSlots"])
+        bound = resolved_slots(scene, clip)
+        roles = {"character": "Preserve the character's visible identity and clothing.",
+                 "location": "Preserve the setting's architecture and layout.",
+                 "prop": "Preserve the prop's shape and material."}
+        lines = []
+        for slot, _, asset in bound:
+            kind, number = slot["tag"].split()
+            tag = f"<{'Picture' if kind == 'Image' else 'Audio'} {number}>"
+            detail = roles[slot["type"]] if asset["kind"] == "image" else "Use the supplied audio as the reference for this named sound or voice."
+            lines.append(f"{tag}: {slot['name']} ({slot['type']}). {detail}")
+        if continuation(clip):
+            lines.append("Opening Frame: the preceding clip's saved final frame anchors frame zero. Continue its physical state without replaying completed action.")
+        return "Reference\n" + ("\n".join(lines) or "No supplied appearance or audio reference inputs.") + "\n\n" + body
     if TAGS.search(clip["prompt"]):
         raise ValueError("Use reference names in the editable prompt; input tags are assigned automatically")
     images, audios = media(scene, clip)
