@@ -1,7 +1,6 @@
 """Same-origin ComfyUI workspace API. Credentials stay in server environment variables."""
 import asyncio
 import copy
-from contextlib import AsyncExitStack
 import json
 import os
 from pathlib import Path
@@ -11,7 +10,7 @@ from aiohttp import web
 import folder_paths
 from server import PromptServer
 
-from . import core, media, planner
+from . import core, media, h3_prompt
 from .engine import Engine
 from .http_contract import origin_is_allowed
 
@@ -72,29 +71,24 @@ async def state(request):
     projects = eng.store.projects()
     project_id = request.query.get("projectId")
     project = next((p for p in projects if p["id"] == project_id), None)
-    episodes, scenes, videos = [], [], []
-    episode_id = ""
+    workspace, videos = None, []
     if project:
-        episodes = project["episodes"]
-        requested_episode = request.query.get("episodeId")
-        episode_id = requested_episode if any(e["id"] == requested_episode for e in episodes) else episodes[0]["id"] if episodes else ""
-        all_scenes = eng.store.scenes(project_id)
-        scenes = [s for s in all_scenes if s["episodeId"] == episode_id]
-        episode_names = {e["id"]: e["name"] for e in episodes}
-        for saved in all_scenes:
-            for clip in saved["clips"]:
+        async with eng.lock(project_id):
+            workspace = eng.store.workspace(project_id)
+            project = eng.store.project(project_id)
+            workspace["references"] = [copy.deepcopy(r) for r in project["library"] if r["kind"] != "last-frame"]
+            for clip in workspace["clips"]:
                 for take in [clip, *clip.get("versions", [])]:
                     if take.get("video"):
-                        videos.append({k: take.get(k) for k in ("id", "title", "video", "duration", "actualDuration", "timing")} | {"sceneName": saved["name"], "episodeName": episode_names.get(saved["episodeId"], "Episode 1")})
-    # Restore monitoring after a server restart, but never resubmit a job.
+                        videos.append({k: take.get(k) for k in ("id", "title", "video", "duration", "actualDuration", "timing", "sceneName")})
+    # Restore monitoring after a server restart, never resubmit a render.
     for watched_project in projects:
         for watched_scene in eng.store.scenes(watched_project["id"]):
-            eng.planning_status(watched_scene)
             if not watched_scene.get("paused") and any(c["status"] in core.ACTIVE for c in watched_scene["clips"]):
                 eng.watch(watched_project["id"], watched_scene["id"], base_url(request))
     summaries = [{k: p[k] for k in ("id", "name", "createdAt")} for p in projects]
-    return web.json_response({"projects": summaries, "project": project, "episodes": episodes, "selectedEpisodeId": episode_id, "scenes": scenes, "videos": videos,
-                              "planner": planner.config(eng.store, project_id if project else None), "helper": eng.bridge.status(), "storage": str(eng.store.root)})
+    return web.json_response({"projects": summaries, "project": project, "workspace": public_scene(eng, workspace) if workspace else None,
+                              "videos": videos, "storage": str(eng.store.root)}, headers={"Cache-Control": "no-store"})
 
 
 @PromptServer.instance.routes.get("/ava-agent/health")
@@ -106,10 +100,9 @@ async def health(request):
     missing = sorted(({n["class_type"] for n in template.values()} | {"MiniMaxH3AddGuide"}) - set(nodes.NODE_CLASS_MAPPINGS))
     required = {"diffusion_models": [template["127"]["inputs"]["unet_name"]], "text_encoders": [template["128"]["inputs"]["clip_name"]],
                 "vae": [template["119"]["inputs"]["vae_name"], template["120"]["inputs"]["vae_name"]]}
-    conf = planner.validate_config(planner.config(eng.store, request.query.get("projectId")))
     missing_models = [name for kind, names in required.items() for name in names if name not in folder_paths.get_filename_list(kind)]
     result = {"missingNodes": missing, "missingModels": missing_models, "ffmpeg": bool(shutil.which(os.getenv("FFMPEG_PATH", "ffmpeg"))),
-              "ffprobe": bool(shutil.which(os.getenv("FFPROBE_PATH", "ffprobe"))), "planner": conf, "helper": eng.bridge.status()}
+              "ffprobe": bool(shutil.which(os.getenv("FFPROBE_PATH", "ffprobe")))}
     return web.json_response(result)
 
 
@@ -125,187 +118,121 @@ async def action(request):
         if len(raw) > 2 * 1024 * 1024:
             raise ValueError("Request too large")
     body = json.loads(raw)
+    if not isinstance(body, dict):
+        raise ValueError("Expected a JSON object")
     eng = engine()
     store = eng.store
     command = body["action"]
     if command == "createProject":
         return web.json_response({"project": store.create_project(body.get("name"))})
-    if not body.get("projectId"):
-        raise ValueError("Select a project first")
-    project_id = core.identifier(body["projectId"])
+    project_id = core.identifier(body.get("projectId"))
     async with eng.lock(project_id):
-        project = store.project(project_id)
-        if command == "codexConfig":
-            store.write(f"projects/{project_id}/codex.json", planner.validate_config(body["config"]))
-            return web.json_response({"ok": True})
-        if command == "renameProject":
-            project["name"] = core.text(body["name"], 120)
-            store.write(f"projects/{project_id}/project.json", project)
-            return web.json_response({"ok": True})
-        if command == "deleteProject":
-            async with AsyncExitStack() as stack:
-                for scene in sorted(store.scenes(project_id), key=lambda s: s["id"]):
-                    await stack.enter_async_context(eng.lock(scene["id"]))
+        scene = store.workspace(project_id)
+        async with eng.lock(scene["id"]):
+            project = store.project(project_id)
+            scene["references"] = [copy.deepcopy(r) for r in project["library"] if r["kind"] != "last-frame"]
+            if command == "renameProject":
+                project["name"] = core.text(body["name"], 120)
+                scene["name"] = project["name"]
+                store.write(f"projects/{project_id}/project.json", project)
+            elif command == "deleteProject":
                 store.trash_project(project_id)
-            return web.json_response({"ok": True})
-        if command == "createScene":
-            return web.json_response({"scene": store.create_scene(project_id, body.get("name"), body.get("script", ""), body.get("episodeId"))})
-        if command == "createEpisode":
-            return web.json_response({"episode": store.create_episode(project_id, body.get("name"))})
-        if command == "deleteEpisode":
-            episode_id = core.identifier(body.get("episodeId"))
-            async with AsyncExitStack() as stack:
-                for scene in sorted(store.scenes(project_id, episode_id), key=lambda s: s["id"]):
-                    await stack.enter_async_context(eng.lock(scene["id"]))
-                store.trash_episode(project_id, episode_id)
-            return web.json_response({"ok": True})
-        if command == "renameEpisode":
-            episode = store.episode(project_id, body["episodeId"])
-            next(e for e in project["episodes"] if e["id"] == episode["id"])["name"] = core.text(body["name"], 150)
-            store.write(f"projects/{project_id}/project.json", project)
-            return web.json_response({"ok": True})
-        if command in ("createLibrary", "cloneLibrary", "removeLibrary"):
-            if command == "createLibrary":
-                if body["kind"] not in ("character", "location", "prop"):
-                    raise ValueError("Invalid library kind")
-                project["library"].append({"id": core.uid(), "name": core.text(body["name"], 120), "kind": body["kind"], "description": core.text(body.get("description") or body["name"], 1000), "assets": []})
+                return web.json_response({"ok": True})
+            elif command in ("createLibrary", "cloneLibrary", "removeLibrary"):
+                if command == "createLibrary":
+                    if body["kind"] not in ("character", "location", "prop"):
+                        raise ValueError("Invalid reference kind")
+                    project["library"].append({"id": core.uid(), "name": core.text(body["name"], 120), "kind": body["kind"],
+                        "description": core.text(body.get("description") or body["name"], 1000), "assets": []})
+                else:
+                    item = next(r for r in project["library"] if r["id"] == body["referenceId"])
+                    if item["kind"] == "last-frame":
+                        raise ValueError("Last frames are retained with their rendered takes")
+                    check_mutable(scene)
+                    if command == "cloneLibrary":
+                        project["library"].append({**copy.deepcopy(item), "id": core.uid(), "name": (item["name"] + " (copy)")[:120]})
+                    else:
+                        if any(item["id"] in c["referenceIds"] for c in scene["clips"]):
+                            raise ValueError("This reference is used by saved clips. Deselect it before removing it.")
+                        project["library"].remove(item)
+                store.write(f"projects/{project_id}/project.json", project)
+                return web.json_response({"ok": True})
+            elif command == "importPlan":
+                check_mutable(scene)
+                result = body.get("plan")
+                if isinstance(result, str):
+                    result = json.loads(result)
+                # A caller-generated ID makes a lost import response safe to retry.
+                request_id = core.identifier(body["requestId"])
+                imports = scene.setdefault("imports", {})
+                digest = core.fingerprint(store, {"plan": result})
+                if request_id in imports:
+                    if imports[request_id] != digest:
+                        raise ValueError("Import request ID was already used for different JSON")
+                else:
+                    core.import_plan(store, scene, result)
+                    imports[request_id] = digest
+            elif command == "saveSettings":
+                check_mutable(scene)
+                scene["settings"] = core.settings(body["settings"])
             else:
-                item = next(r for r in project["library"] if r["id"] == body["referenceId"])
-                if command == "cloneLibrary":
-                    project["library"].append({**copy.deepcopy(item), "id": core.uid(), "name": (item["name"] + " (copy)")[:120]})
-                else:
-                    project["library"].remove(item)  # Media stays for scene/take recovery.
-            store.write(f"projects/{project_id}/project.json", project)
-            return web.json_response({"ok": True})
-        scene_id = core.identifier(body["sceneId"])
-        async with eng.lock(scene_id):
-            scene = store.scene(project_id, scene_id, body.get("episodeId"))
-            eng.planning_status(scene)
-            if command in ("identify", "plan", "planPrompt", "revisePrompt"):
-                core.settings(scene["settings"])
-                clip = find_clip(scene, body["clipId"]) if command in ("planPrompt", "revisePrompt") else None
-                eng.start_planning(scene, command, base_url(request), clip["id"] if clip else None,
-                                   body.get("comments", ""), body.get("requestId"))
-                return web.json_response({"scene": public_scene(eng, scene)}, status=202)
-            core.ensure_not_planning(scene)
-            if command == "renameScene":
-                scene.update(name=core.text(body["name"], 150), autoName=False)
-                store.save_scene(scene)
-                return web.json_response({"ok": True})
-            if command == "deleteScene":
-                store.trash_scene(project_id, scene_id, core.identifier(body.get("episodeId")))
-                return web.json_response({"ok": True})
-            core.settings(scene["settings"])
-            clip = find_clip(scene, body["clipId"]) if body.get("clipId") else None
-            base = base_url(request)
-            if command == "saveScene":
-                new_settings = core.settings(body["settings"])
-                script = core.text(body["script"])
-                if any(c.get("takeId") for c in scene["clips"]) and script != scene["script"]:
-                    raise ValueError("Create a new scene to change its script after submitting takes")
-                if script != scene["script"] and scene["clips"]:
-                    scene["clips"] = []
-                scene.update(name=core.text(body["name"], 150), script=script, settings=new_settings)
-            elif command == "addLibraryReference":
-                check_mutable(scene)
-                item = next(r for r in project["library"] if r["id"] == body["referenceId"])
-                ref = next((r for r in scene["references"] if r["id"] == body.get("slotId")), None)
-                if ref:
-                    ref["assets"] = copy.deepcopy(item["assets"])
-                elif len(scene["references"]) < 40:
-                    scene["references"].append({**copy.deepcopy(item), "id": core.uid()})
-                else:
-                    raise ValueError("At most 40 reference slots")
-            elif command == "createReference":
-                check_mutable(scene)
-                if len(scene["references"]) >= 40 or body["kind"] not in ("character", "location", "prop"):
-                    raise ValueError("Invalid reference kind or too many slots")
-                scene["references"].append({"id": core.uid(), "name": core.text(body["name"], 120), "kind": body["kind"], "description": core.text(body.get("description") or body["name"], 1000), "assets": []})
-            elif command == "removeAsset":
-                check_mutable(scene)
-                ref = next(r for r in scene["references"] if r["id"] == body["referenceId"])
-                ref["assets"] = [a for a in ref["assets"] if a["path"] != body["path"]]
-            elif command == "saveClip":
-                check_mutable(scene, clip)
-                prompt = body["prompt"].strip() if isinstance(body["prompt"], str) else None
-                if prompt or not core.previous(scene, clip):
-                    prompt = core.text(prompt, 12000)
-                elif prompt is None:
-                    raise ValueError("Prompt must be text")
-                if core.TAGS.search(prompt):
-                    raise ValueError("Use names in prompts; media tags are assigned to actual uploads automatically")
-                refs = body["referenceIds"]
-                if not isinstance(refs, list) or len(refs) != len(set(refs)) or not set(refs) <= {r["id"] for r in scene["references"] if r.get("assets")}:
-                    raise ValueError("Select only supplied references")
-                if body["continuityMode"] not in ("auto", "on", "off"):
-                    raise ValueError("Invalid continuity mode")
-                if not core.previous(scene, clip) and body["continuityMode"] == "on":
-                    raise ValueError("The first clip has no preceding frame")
-                clip.update(prompt=prompt, referenceIds=refs, continuityMode=body["continuityMode"])
-                # Manual prompts are valid for the first clip. Following clips must first be grounded by Codex.
-                if not core.previous(scene, clip):
+                clip = find_clip(scene, body["clipId"])
+                base = base_url(request)
+                if command == "saveClip":
+                    check_mutable(scene, clip)
+                    refs = body["referenceIds"]
+                    available = {r["id"] for r in scene["references"] if r.get("assets")}
+                    if not isinstance(refs, list) or any(not isinstance(r, str) for r in refs) or len(set(refs)) != len(refs) or not set(refs) <= available:
+                        raise ValueError("Select only supplied project references")
+                    if type(body.get("use_last_frame")) is not bool:
+                        raise ValueError("use_last_frame must be true or false")
+                    if body["use_last_frame"] and not core.previous(scene, clip):
+                        raise ValueError("The first project clip has no preceding clip for continuity")
+                    prompt = h3_prompt.validate(core.text(body["prompt"], 12000), [])
+                    seconds = core.duration(body["duration"])
+                    clip["nextDuration" if clip.get("takeId") else "duration"] = seconds
+                    clip.update(prompt=prompt, referenceIds=refs, continuityMode="on" if body["use_last_frame"] else "off")
                     clip["promptContext"] = core.prompt_context(store, scene, clip)
-                clip.pop("approvedKey", None)
-            elif command == "setDuration":
-                value = core.duration(body["duration"])
-                clip["nextDuration" if clip.get("takeId") else "duration"] = value
-                clip.pop("approvedKey", None)
-                clip.pop("promptContext", None)
-            elif command == "approveGenerate":
-                check_mutable(scene, clip)
-                # Require the exact latest saved draft that was visible when approval was clicked.
-                if body.get("reviewKey") != core.approval_key(store, scene, clip):
-                    raise ValueError("The saved clip changed. Refresh, review it, and approve again.")
-                await eng.submit(scene, clip, base)
-            elif command == "manualClip":
-                check_mutable(scene)
-                if scene["clips"]:
-                    raise ValueError("Use a new scene for Video Studio")
-                clip = {"id": core.uid(), "title": "Studio clip", "duration": core.duration(body["duration"]),
-                        "prompt": core.text(body["prompt"], 12000), "outline": body["prompt"], "referenceIds": [r["id"] for r in scene["references"] if r.get("assets")],
-                        "transition": "first", "continuityMode": "off", "status": "awaiting-approval", "versions": []}
-                scene["clips"] = [clip]
-                clip["promptContext"] = core.prompt_context(store, scene, clip)
-            elif command == "pause":
-                scene["paused"] = True  # Remote/native running work continues; no global queue interruption.
-            elif command == "resume":
-                if not clip or not clip.get("jobId"):
-                    raise ValueError("Recover a known job ID first")
-                clip.update(status="saving" if clip.get("source") else "queued")
-                clip.pop("error", None)
-                scene["paused"] = False
-            elif command == "recover":
-                if clip["status"] not in core.ACTIVE or not clip.get("submittedSettings"):
-                    raise ValueError("Only an unresolved submitted job can be recovered")
-                clip.update(jobId=core.identifier(body["jobId"]), status="queued")
-                scene["paused"] = False
-            elif command == "acknowledgeMissingJob":
-                if clip["status"] not in core.ACTIVE or body.get("confirmed") is not True:
-                    raise ValueError("Explicitly confirm the old job was checked and cannot produce another result")
-                clip.update(status="failed", error="User reviewed the ComfyUI queue and released the unresolved submission")
-                scene["paused"] = True
-            elif command == "restoreFrame":
-                if clip["status"] != "complete" or not clip.get("extractedFrame"):
-                    raise ValueError("No extracted frame to restore")
-                clip["frame"] = copy.deepcopy(clip["extractedFrame"])
-                core.invalidate_following(scene, clip)
-            elif command == "exportGraph":
-                core.ensure_ready(store, scene, clip)
-                return web.json_response({"graph": core.build_h3(store, scene, clip, eng.input_dir, core.uid())})
-            else:
-                raise ValueError("Unknown action")
+                    clip.pop("approvedKey", None)
+                elif command == "approveGenerate":
+                    check_mutable(scene, clip)
+                    if body.get("reviewKey") != core.approval_key(store, scene, clip):
+                        raise ValueError("The saved clip or previous clip frame changed. Save, review it, and approve again.")
+                    await eng.submit(scene, clip, base)
+                elif command == "pause":
+                    scene["paused"] = True
+                elif command in ("resume", "recover"):
+                    if clip["status"] not in core.ACTIVE or not clip.get("submittedSettings"):
+                        raise ValueError("Only an unresolved submitted job can be recovered")
+                    if command == "recover":
+                        clip["jobId"] = core.identifier(body["jobId"])
+                    if not clip.get("jobId"):
+                        raise ValueError("Recover a known job ID first")
+                    clip.update(status="saving" if clip.get("source") else "queued")
+                    clip.pop("error", None)
+                    scene["paused"] = False
+                elif command == "acknowledgeMissingJob":
+                    if clip["status"] not in core.ACTIVE or body.get("confirmed") is not True:
+                        raise ValueError("Explicitly confirm the old job cannot produce another result")
+                    clip.update(status="failed", error="User checked the queue and released the unresolved submission")
+                    scene["paused"] = True
+                elif command == "exportGraph":
+                    core.ensure_ready(store, scene, clip)
+                    return web.json_response({"graph": core.build_h3(store, scene, clip, eng.input_dir, core.uid())})
+                else:
+                    raise ValueError("Unknown action")
             store.save_scene(scene)
             if command in ("resume", "recover"):
-                eng.watch(project_id, scene_id, base)
-            return web.json_response({"scene": public_scene(eng, scene)})
+                eng.watch(project_id, scene["id"], base)
+            return web.json_response({"workspace": public_scene(eng, scene)})
 
 
 def public_scene(eng, scene):
     from . import timing
-    eng.planning_status(scene)
     result = copy.deepcopy(scene)
     for clip in result["clips"]:
         clip["timing"] = timing.public(clip)
+        clip["previousFrame"] = core.previous_frame(scene, clip)
         try:
             core.ensure_ready(eng.store, scene, clip)
             clip["reviewKey"] = core.approval_key(eng.store, scene, clip)
@@ -314,120 +241,27 @@ def public_scene(eng, scene):
     return result
 
 
-def helper_bridge(request):
-    # URL-only desktop clients have no browser Origin. Keep browser cross-site writes blocked.
-    if request.headers.get("Origin") or request.headers.get("Sec-Fetch-Site"):
-        origin_guard(request)
-    return engine().bridge
-
-
-async def helper_body(request):
-    raw = bytearray()
-    async for chunk in request.content.iter_chunked(65536):
-        raw.extend(chunk)
-        if len(raw) > 1024 * 1024:
-            raise ValueError("Helper request is too large")
-    return json.loads(raw)
-
-
-@PromptServer.instance.routes.post("/ava-agent/codex/next")
-@errors
-async def helper_next(request):
-    bridge = helper_bridge(request)
-    body = await helper_body(request)
-    job = bridge.claim(body["helperId"], body.get("models", []), body.get("version", "unknown"))
-    return web.json_response({"job": job}, headers={"Cache-Control": "no-store"})
-
-
-@PromptServer.instance.routes.post("/ava-agent/codex/connect")
-@errors
-async def helper_connect(request):
-    bridge = helper_bridge(request)
-    body = await helper_body(request)
-    bridge.touch(body["helperId"], body.get("models", []), body.get("version", "unknown"))
-    return web.json_response({"ok": True})
-
-
-@PromptServer.instance.routes.post("/ava-agent/codex/disconnect")
-@errors
-async def helper_disconnect(request):
-    bridge = helper_bridge(request)
-    body = await helper_body(request)
-    bridge.disconnect(body["helperId"])
-    return web.json_response({"ok": True})
-
-
-@PromptServer.instance.routes.post("/ava-agent/codex/job/{job_id}/heartbeat")
-@errors
-async def helper_heartbeat(request):
-    bridge = helper_bridge(request)
-    body = await helper_body(request)
-    bridge.heartbeat(request.match_info["job_id"], body["helperId"], body["claimId"])
-    return web.json_response({"ok": True})
-
-
-@PromptServer.instance.routes.post("/ava-agent/codex/job/{job_id}/result")
-@errors
-async def helper_result(request):
-    bridge = helper_bridge(request)
-    body = await helper_body(request)
-    bridge.complete(request.match_info["job_id"], body["helperId"], body["claimId"], body.get("output"), body.get("error"))
-    return web.json_response({"ok": True})
-
-
-@PromptServer.instance.routes.get("/ava-agent/codex/job/{job_id}/image/{index}")
-@errors
-async def helper_image(request):
-    bridge = helper_bridge(request)
-    path = bridge.image(request.match_info["job_id"], int(request.match_info["index"]),
-                        request.headers.get("X-AVA-Helper", ""), request.headers.get("X-AVA-Claim", ""))
-    return web.FileResponse(path, headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
-
-
-@PromptServer.instance.routes.get("/ava-agent/codex/helper.py")
-@errors
-async def download_helper(request):
-    return web.FileResponse(Path(__file__).with_name("pc_helper.py"), headers={"Content-Disposition": 'attachment; filename="pc_helper.py"', "Cache-Control": "no-store"})
-
-
-@PromptServer.instance.routes.get("/ava-agent/scene")
-@errors
-async def get_scene(request):
-    eng = engine()
-    return web.json_response(public_scene(eng, eng.store.scene(request.query["projectId"], request.query["sceneId"], request.query.get("episodeId"))), headers={"Cache-Control": "no-store"})
-
-
 @PromptServer.instance.routes.post("/ava-agent/upload")
 @errors
 async def upload(request):
     origin_guard(request)
     eng = engine()
-    project_id, scene_id = core.identifier(request.query["projectId"]), request.query.get("sceneId")
+    project_id = core.identifier(request.query["projectId"])
     async with eng.lock(project_id):
-        async with eng.lock(scene_id or "library-" + project_id):
+        scene = eng.store.workspace(project_id)
+        async with eng.lock(scene["id"]):
+            check_mutable(scene)
             project = eng.store.project(project_id)
-            scene = eng.store.scene(project_id, scene_id, request.query.get("episodeId")) if scene_id else None
-            if scene:
-                eng.planning_status(scene)
-                core.ensure_not_planning(scene)
-            frame_clip = find_clip(scene, request.query["clipId"]) if request.query.get("clipId") else None
-            if frame_clip:
-                if frame_clip["status"] != "complete":
-                    raise ValueError("Complete this clip before replacing its last frame")
-                ref = None
-            else:
-                if scene:
-                    check_mutable(scene)
-                ref = next(r for r in (scene["references"] if scene else project["library"]) if r["id"] == request.query["referenceId"])
-                if len(ref["assets"]) >= 12:
-                    raise ValueError("At most 12 files per reference slot")
+            ref = next(r for r in project["library"] if r["id"] == request.query["referenceId"])
+            if ref["kind"] == "last-frame" or len(ref["assets"]) >= 12:
+                raise ValueError("Upload to a reference entry with fewer than 12 files")
             reader = await request.multipart()
             part = await reader.next()
             if not part or not part.filename:
                 raise ValueError("Choose a reference file")
             suffix = Path(part.filename).suffix.lower()
             kind = "image" if suffix in (".png", ".jpg", ".jpeg", ".webp") else "audio" if suffix in (".wav", ".mp3", ".m4a", ".flac", ".ogg") else None
-            if not kind or (frame_clip and kind != "image"):
+            if not kind:
                 raise ValueError("Unsupported reference format")
             chunks, size = [], 0
             while chunk := await part.read_chunk():
@@ -437,7 +271,7 @@ async def upload(request):
                 chunks.append(chunk)
             if not size:
                 raise ValueError("Reference is empty")
-            directory = eng.store.scene_dir(project_id, scene_id) if scene else f"projects/{project_id}/library"
+            directory = f"projects/{project_id}/library"
             relative = directory + "/references/" + core.uid() + suffix
             target = eng.store.path(relative)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -453,15 +287,8 @@ async def upload(request):
                 if not any(s["codec_type"] == "audio" for s in data.get("streams", [])) or not 0.25 <= length <= 15:
                     raise ValueError("Voice samples must contain 0.25–15 seconds of audio")
                 asset["duration"] = length
-            if frame_clip:
-                frame_clip["frame"] = asset
-                core.invalidate_following(scene, frame_clip)
-            else:
-                ref["assets"].append(asset)
-            if scene:
-                eng.store.save_scene(scene)
-            else:
-                eng.store.write(f"projects/{project_id}/project.json", project)
+            ref["assets"].append(asset)
+            eng.store.write(f"projects/{project_id}/project.json", project)
             return web.json_response({"asset": asset})
 
 
@@ -469,6 +296,17 @@ async def upload(request):
 @errors
 async def get_media(request):
     relative = request.query["path"]
-    if not relative.startswith("projects/") or Path(relative).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov", ".wav", ".mp3", ".m4a", ".flac", ".ogg"):
+    project_id = core.identifier(request.query["projectId"])
+    store = engine().store
+    store.project(project_id)
+    path = store.path(relative)
+    if not path.is_relative_to(store.path(f"projects/{project_id}")) or path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov", ".wav", ".mp3", ".m4a", ".flac", ".ogg"):
         raise ValueError("Unsupported media path")
-    return web.FileResponse(engine().store.path(relative), headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+    return web.FileResponse(path, headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@PromptServer.instance.routes.get("/ava-agent/scene-planning-skill")
+@errors
+async def download_skill(request):
+    return web.FileResponse(Path(__file__).parent / "skills/comfyui-scene-planner/SKILL.md", headers={
+        "Content-Disposition": 'attachment; filename="comfyui-scene-planner.md"', "Cache-Control": "no-store"})

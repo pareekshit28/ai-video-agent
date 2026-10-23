@@ -1,19 +1,19 @@
 """Plain H3 prompt guidance and checks for the host's actual media bindings."""
 import re
 
-VERSION = "h3-plain-2026-10-22.3"
+VERSION = "h3-import-2026-10-23.1"
 # These names only preserve ordering when flattening older section-object output.
 BASE_FIELDS = ("integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
 REF_FIELDS = ("subject_definitions", "summary", "retention_analysis", "detailed_description", "overall_soundscape", "non_diegetic_music")
 SUBJECT = re.compile(r"<Subject\s+(\d+)>")
 ASSET = re.compile(r"<(?:Picture|Audio|Video)\s*\d+>", re.I)
 
-RULES = """H3 PROMPT GUIDANCE (apply to final prompts, not reference discovery or later-clip outlines):
+RULES = """H3 PROMPT GUIDANCE (apply to every imported clip prompt):
 Return each final prompt as ONE complete natural-language text string in the requested JSON response.
 Write descriptive prose covering the visible style, subjects, setting, composition, lighting, action,
 reactions and end state, with sound and speech naturally included in the same prompt. There are no
 required section headings, shot labels, speaker IDs or dialogue tags. Escape newlines correctly in JSON.
-Later-clip outlines remain strings. Write descriptions in English; preserve the original language and
+Write descriptions in English; preserve the original language and
 exact wording of dialogue, lyrics and visible text. Preserve the script's events and speaking order.
 Identify who speaks, their delivery and whether their synchronized lips are visible or the voice is
 off-screen. Keep visible characters' lips closed for voiceover. Never invent dialogue, narration or
@@ -24,16 +24,18 @@ Use the actual supplied images as authority for appearance and setting. Refer to
 places and props by their supplied names. If using Subject labels, use only supplied subjectLabel
 values. A voice sample supplies timbre and delivery, not its recorded words or a person's appearance.
 Never invent Picture/Audio/Video indices or a Reference block; the host binds real media at render time.
-Prefer one continuous shot and a fixed camera for simple action. Describe any requested camera move
-or necessary cut clearly in ordinary prose, keeping actions and cuts achievable within the duration.
+Choose framing, camera movement and cuts to serve the scene and user direction. There is no
+fixed-camera or static-shot default. Describe the intended motion and cuts clearly in ordinary prose,
+keeping them achievable within the duration.
 
-For a continuation, inspect the actual previous-frame attachment and begin from Opening Frame at
-zero seconds. Preserve observed framing, pose, lighting and prop state, then continue the next action
+For a continuation, begin from the supplied Opening Frame at zero seconds. When an actual frame is
+provided, inspect it and preserve observed pose, lighting and prop state, then continue the next action
 without replaying prior beats or lines. This is a frame-zero guide, separate from numbered identity
-references. For a deliberate cut/time jump, use the previous frame only as story context. Do not invent
+references. If the frame has not been rendered, describe continuation without claiming to observe it.
+For a deliberate cut/time jump, disable frame continuity. Do not invent
 unseen prior events, ending-frame constraints or source-video editing inputs. Each final prompt must
-stand alone with the selected references and starting state. Keep saved takes unchanged, and wait for
-the actual prior frame before writing a later clip's final generation prompt.
+stand alone with the selected references and starting state. Plan every clip prompt in the scene JSON;
+review it against the immediately preceding clip's saved last frame before approving its render. Keep saved takes unchanged.
 """
 
 

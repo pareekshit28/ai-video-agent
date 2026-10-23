@@ -9,158 +9,32 @@ from urllib.parse import quote
 
 import aiohttp
 
-from . import core, media as video_media, planner, timing, codex_bridge
+from . import core, media as video_media, timing
 
 
 class Engine:
     def __init__(self, store, input_dir, output_dir):
         self.store, self.input_dir, self.output_dir = store, Path(input_dir), Path(output_dir).resolve()
         self.locks, self.tasks = {}, {}
-        self.planning_tasks = {}
         self.submit_lock = asyncio.Lock()
-        self.planner_lock = asyncio.Lock()
-        self.bridge = codex_bridge.get_bridge(store)
 
     def lock(self, scene_id):
         return self.locks.setdefault(scene_id, asyncio.Lock())
 
-    def planning_status(self, scene):
-        job = scene.get("planning", {})
-        if job.get("status") == "running" and scene["id"] not in self.planning_tasks:
-            job.update(status="failed", finishedAt=time.time(), error="Codex planning was interrupted by a ComfyUI restart. Retry the planning action.")
-            self.store.save_scene(scene)
-        return job
-
-    def start_planning(self, scene, command, base, clip_id=None, comments="", request_id=None, automatic=False):
-        """Called under the scene lock. Persist acceptance before returning HTTP 202."""
-        if command not in ("identify", "plan", "planPrompt", "revisePrompt"):
-            raise ValueError("Unknown planning action")
-        request_id = core.identifier(request_id) if request_id else core.uid()
-        previous = self.planning_status(scene)
-        inputs = {"action": command, "clipId": clip_id, "comments": comments}
-        if previous.get("id") == request_id:
-            if previous.get("inputs") != inputs:
-                raise ValueError("This planning request ID was already used for different inputs")
-            return previous
-        if previous.get("status") == "running" and previous.get("inputs") == inputs:
-            return previous
-        core.ensure_not_planning(scene)
-        if command in ("planPrompt", "revisePrompt"):
-            clip = next(c for c in scene["clips"] if c["id"] == clip_id)
-            prior = core.previous(scene, clip)
-            if prior and (prior["status"] != "complete" or not prior.get("frame")):
-                raise ValueError("Complete the preceding clip first; its real final frame is required")
-        if any(c["status"] in core.ACTIVE for c in scene["clips"]):
-            raise ValueError("Finish or recover this scene's active render before Codex planning")
-        job = {"id": request_id, "status": "running", "startedAt": time.time(), "inputs": inputs, "automatic": automatic}
-        scene["planning"] = job
-        self.store.save_scene(scene)
-        self.planning_tasks[scene["id"]] = asyncio.create_task(self._run_planning(copy.deepcopy(scene), base))
-        return job
-
-    async def _run_planning(self, scene, base):
-        job = scene["planning"]
-        try:
-            inputs = job["inputs"]
-            if inputs["action"] == "identify":
-                await self.discover(scene, base)
-            elif inputs["action"] == "plan":
-                await self.plan(scene, base)
-            else:
-                clip = next(c for c in scene["clips"] if c["id"] == inputs["clipId"])
-                await self.plan_prompt(scene, clip, base, inputs["comments"])
-                if clip.get("error", "").startswith("Prompt planning needs retry:"):
-                    clip.pop("error", None)
-            job["status"] = "complete"
-        except asyncio.CancelledError:
-            job.update(status="failed", error="Codex planning was interrupted. Restart ComfyUI before retrying.")
-            raise
-        except (ValueError, KeyError, TypeError, StopIteration) as error:
-            job.update(status="failed", error=str(error) or "Invalid planning request")
-        except Exception:
-            import logging
-            logging.exception("AI Video Agent background Codex planning failed")
-            job.update(status="failed", error="Codex planning failed. Check the ComfyUI server log.")
-        finally:
-            job["finishedAt"] = time.time()
-            try:
-                async with self.lock(scene["id"]):
-                    saved = self.store.scene(scene["projectId"], scene["id"])
-                    if saved.get("planning", {}).get("id") == job["id"]:
-                        # A failed run must not replace the prior plan, drafts or takes.
-                        if job["status"] == "complete":
-                            self.store.save_scene(scene)
-                        else:
-                            saved["planning"] = job
-                            if job.get("automatic") and job["inputs"].get("clipId"):
-                                following = next(c for c in saved["clips"] if c["id"] == job["inputs"]["clipId"])
-                                following["error"] = "Prompt planning needs retry: " + job["error"]
-                            self.store.save_scene(saved)
-            finally:
-                self.planning_tasks.pop(scene["id"], None)
-
     async def http(self, method, url, **kwargs):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
-            return await planner.request_json(session, method, url, **kwargs)
-
-    async def ask(self, base_url, instruction, payload, images=(), project_id=None):
-        async with self.planner_lock:
-            return await planner.ask(self.store, instruction, payload, images, model_file=planner.config(self.store, project_id)["model"])
-
-    async def discover(self, scene, base_url):
-        if any(c.get("takeId") for c in scene["clips"]):
-            raise ValueError("Create a new scene to rediscover references after rendering takes")
-        result = await self.ask(base_url, planner.DISCOVER, {"script": core.text(scene["script"])}, project_id=scene["projectId"])
-        references = core.validate_references(result)
-        # Retain supplied media for slots with stable IDs.
-        existing = {r["id"]: r for r in scene["references"]}
-        for ref in references:
-            ref["assets"] = existing.get(ref["id"], {}).get("assets", [])
-        if scene.get("autoName", True):
-            scene["name"] = core.text(result["title"], 150)
-        scene.update(summary=core.text(result["summary"], 1500), references=references, clips=[])
-
-    async def plan(self, scene, base_url):
-        if any(c.get("takeId") for c in scene["clips"]):
-            raise ValueError("Plans with submitted takes are preserved. Create another scene to replan the script.")
-        manifest, images = planner.reference_context(self.store, scene)
-        result = await self.ask(base_url, planner.PLAN, {"script": core.text(scene["script"]), "suppliedReferences": manifest, "settings": scene["settings"]}, images, project_id=scene["projectId"])
-        clips = core.validate_plan(scene, result)
-        scene["clips"] = clips
-        clips[0]["promptContext"] = core.prompt_context(self.store, scene, clips[0])
-
-    async def plan_prompt(self, scene, clip, base_url, comments=""):
-        prior = core.previous(scene, clip)
-        if prior and (prior["status"] != "complete" or not prior.get("frame")):
-            raise ValueError("Complete the preceding clip first; its real final frame is required")
-        manifest, paths = planner.reference_context(self.store, scene, core.selected(scene, clip))
-        if prior:
-            paths.append(self.store.path(prior["frame"]["path"]))
-        result = await self.ask(base_url, planner.PROMPT, {"script": scene["script"], "summary": scene["summary"],
-            "references": manifest, "previousFrameAttachment": len(paths) if prior else None,
-            "previous": {"prompt": prior.get("submittedPrompt"), "actualDuration": prior.get("actualDuration")} if prior else None,
-            "frameGuideEnabled": core.continuation(clip),
-            "target": {"outline": clip["outline"], "prompt": clip["prompt"], "duration": clip.get("nextDuration", clip["duration"]),
-                       "continuation": core.continuation(clip)}, "settings": scene["settings"], "comments": comments,
-            "remainingOutline": [c["outline"] for c in scene["clips"][scene["clips"].index(clip) + 1:]]}, paths, project_id=scene["projectId"])
-        prompt = core.text(result["prompt"], 12000)
-        if core.TAGS.search(prompt):
-            raise ValueError("Codex returned numbered media tags; retry prompt planning")
-        clip.update(prompt=prompt, promptContext=core.prompt_context(self.store, scene, clip))
-        clip.pop("frameAnalysis", None)
-        if prior and isinstance(result.get("frameAnalysis"), str) and result["frameAnalysis"].strip():
-            clip["frameAnalysis"] = core.text(result["frameAnalysis"][:4000], 4000)
-        clip.pop("approvedKey", None)
+            async with session.request(method, url, allow_redirects=False, **kwargs) as response:
+                if response.status >= 300:
+                    raise ValueError(f"ComfyUI returned HTTP {response.status}")
+                return await response.json()
 
     def prepare_following(self, scene, clip, base_url):
-        """Persist the finished take, then inspect its frame in a separate planning task."""
-        core.invalidate_following(scene, clip)
+        # ChatGPT supplied every prompt already. Only the frame binding changes.
+        for following in scene["clips"]:
+            if not following.get("takeId") and following["status"] not in core.ACTIVE:
+                following["promptContext"] = core.prompt_context(self.store, scene, following)
+                following.pop("approvedKey", None)
         self.store.save_scene(scene)
-        index = scene["clips"].index(clip)
-        if index + 1 < len(scene["clips"]) and not any(c["status"] in core.ACTIVE for c in scene["clips"]):
-            following = scene["clips"][index + 1]
-            if not following.get("takeId"):
-                self.start_planning(scene, "planPrompt", base_url, following["id"], automatic=True)
 
     async def submit(self, scene, clip, base_url):
         async with self.submit_lock:
@@ -180,9 +54,10 @@ class Engine:
             validation = await execution.validate_prompt(prompt_id, body, None)
             if not validation[0]:
                 raise ValueError("ComfyUI rejected workflow: " + json.dumps({"error": validation[1], "nodes": validation[3]}, ensure_ascii=False)[:3000])
+            frame_reference = copy.deepcopy(core.previous_frame(scene, clip))
             core.archive_take(clip)
             clip.update(takeId=take_id, status="submitting", approvedKey=reviewed_key, submittedPrompt=core.final_prompt(scene, clip),
-                        submittedSettings=copy.deepcopy(scene["settings"]), submittedReferences=copy.deepcopy(core.selected(scene, clip)), jobId=prompt_id,
+                        submittedSettings=copy.deepcopy(scene["settings"]), submittedReferences=copy.deepcopy(core.selected(scene, clip)), submittedFrame=frame_reference, jobId=prompt_id,
                         timing={"submittedAt": time.time()})
             scene["paused"] = False
             self.store.save_scene(scene)  # Durable reservation BEFORE the only submit attempt.
@@ -252,8 +127,8 @@ class Engine:
                 if not (running or pending):
                     # Comfy history is in memory. A pod restart can lose history while
                     # leaving SaveVideo's unique take output on the mounted volume.
-                    directory = self.output_dir / "ai_video_agent/raw" / scene["id"]
-                    candidates = [p for p in directory.glob(f"{clip['id']}-{clip['takeId']}_*") if p.suffix.lower() in (".mp4", ".webm", ".mov") and p.is_file()]
+                    directory = self.output_dir / "ai_video_agent/raw" / clip.get("storageSceneId", scene["id"])
+                    candidates = [p for p in directory.glob(f"{clip.get('storageClipId', clip['id'])}-{clip['takeId']}_*") if p.suffix.lower() in (".mp4", ".webm", ".mov") and p.is_file()]
                     if len(candidates) != 1:
                         raise ValueError("Job is absent from queue/history and no unique saved take output was found. Recover the existing job ID; no resubmission occurred.")
                     saved = candidates[0]

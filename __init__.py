@@ -1,4 +1,4 @@
-"""AI Video Agent: Codex planning and reviewed video production inside ComfyUI."""
+"""AI Video Agent: Imported ChatGPT prompts and reviewed video production inside ComfyUI."""
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from . import routes  # noqa: F401 - registers ComfyUI routes
 

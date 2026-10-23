@@ -3,8 +3,6 @@ import { api } from "../../scripts/api.js";
 
 const prefix = "/ava-agent";
 const active = new Set(["submitting", "submission-unknown", "queued", "rendering", "saving", "recoverable"]);
-const planningActions = new Set(["identify", "plan", "planPrompt", "revisePrompt"]);
-const planningLabels = { identify: "identifying references", plan: "planning clips", planPrompt: "writing the prompt", revisePrompt: "revising the prompt" };
 const $ = (tag, props = {}, ...children) => {
   const el = document.createElement(tag);
   for (const [key, value] of Object.entries(props)) {
@@ -27,9 +25,9 @@ const select = (values, current) => $("select", {}, ...values.map(v => $("option
 const row = (...children) => $("div", { class: "ava-row" }, ...children);
 const card = (...children) => $("section", { class: "ava-card" }, ...children);
 const note = text => $("p", { class: "ava-note", text });
-const mediaUrl = asset => api.apiURL(`${prefix}/media?path=${encodeURIComponent(asset.path)}`);
+const mediaUrl = asset => api.apiURL(`${prefix}/media?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(asset.path)}`);
 
-let workspace, message, content, projectHost, navigation, livePanel, openButton, projectId = localStorage.getItem("ava-project") || "", sceneId = localStorage.getItem("ava-scene") || "", episodeId = localStorage.getItem("ava-episode") || "";
+let workspace, message, content, projectHost, navigation, livePanel, openButton, projectId = localStorage.getItem("ava-project") || "";
 let state, scene, busy = false, dirty = false, modal, poller, refreshing = false, sidebarHost, diagnostics;
 let renderedSnapshot = "", sceneReceivedAt = Date.now() / 1000;
 let refreshDone = Promise.resolve();
@@ -46,7 +44,7 @@ const eyebrow = text => $("p", { class: "ava-eyebrow", text });
 const heading = (title, description) => $("div", { class: "ava-section-heading" }, $("h3", { text: title }), description && note(description));
 const metric = (label, value) => $("div", {}, $("dt", { text: label }), $("dd", { text: value }));
 // Live clocks update independently; they must not rebuild a playing video.
-const snapshot = () => JSON.stringify([state, scene], (key, value) => key === "timing" || key === "helper" && section !== "settings" || key === "lastSeen" ? undefined : value);
+const snapshot = () => JSON.stringify([state, scene], (key, value) => key === "timing" ? undefined : value);
 
 const mediaSource = node => node.dataset.avaMediaSrc || node.getAttribute("src");
 const nodeKey = node => node.nodeType === Node.ELEMENT_NODE ? node.dataset.avaKey || node.id || (/^(VIDEO|AUDIO|IMG)$/.test(node.tagName) ? `${node.tagName}:${mediaSource(node)}` : null) : null;
@@ -152,18 +150,6 @@ function fillStatus(panel, clip) {
 }
 
 function updateStatus() {
-  const planning = scene?.planning;
-  if (!busy && planning?.automatic) {
-    if (planning.status === "running") {
-      message.dataset.automaticPlanning = planning.id;
-      message.classList.remove("ava-error");
-      message.textContent = `Codex is understanding the last frame and optimizing the next prompt… ${Math.max(0, Math.floor(Date.now() / 1000 - planning.startedAt))}s`;
-    } else if (message.dataset.automaticPlanning === planning.id) {
-      message.textContent = planning.status === "failed" ? planning.error : "Next prompt optimized from the previous clip's last frame. Review it before generating.";
-      message.classList.toggle("ava-error", planning.status === "failed");
-      delete message.dataset.automaticPlanning;
-    }
-  }
   if (!scene?.clips.length) { livePanel.replaceChildren(); return; }
   const lastActivity = clip => Math.max(clip.timing?.completedAt || 0, clip.timing?.failedAt || 0, clip.timing?.submittedAt || 0);
   const current = scene.clips.find(c => active.has(c.status)) || [...scene.clips].sort((a, b) => lastActivity(b) - lastActivity(a))[0];
@@ -216,69 +202,15 @@ async function run(work) {
   finally { busy = false; content.inert = false; projectHost.inert = false; workspace.setAttribute("aria-busy", "false"); workspace.querySelectorAll("button").forEach(b => { b.disabled = b.dataset.unavailable === "true"; }); }
 }
 async function action(command, values = {}) {
-  const scope = { projectId, episodeId, sceneId };
-  if (!planningActions.has(command)) return request("/action", { action: command, ...scope, ...values });
-  const requestId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  let jobId = requestId;
-  try {
-    const result = await request("/action", { action: command, ...scope, ...values, requestId });
-    // Older servers may still return the completed result synchronously.
-    if (!result.scene?.planning) return result;
-    jobId = result.scene.planning.id;
-  } catch (error) {
-    if (!error.transportFailure && !(error.status >= 500)) throw error;
-    // The server may have accepted the work. Recover by reading; never resubmit.
-    message.textContent = "Checking whether Codex accepted the request…";
-  }
-  return waitForPlanning(scope, jobId);
-}
-async function waitForPlanning(scope, jobId) {
-  const query = new URLSearchParams(scope);
-  let failures = 0;
-  for (;;) {
-    let saved;
-    try { saved = await request(`/scene?${query}`); failures = 0; }
-    catch (error) {
-      if ((!error.transportFailure && !(error.status >= 500)) || ++failures >= 10) {
-        throw new Error(`${error.message} Codex may still be running. Refresh the workspace to reconnect; this request was not resubmitted.`);
-      }
-      message.textContent = "Reconnecting to Codex planning…";
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      continue;
-    }
-    const job = saved.planning;
-    if (!job || job.id !== jobId) throw new Error("The planning request could not be confirmed. Refresh the workspace and check its state before retrying.");
-    if (job.status === "failed") throw new Error(job.error || "Codex planning failed. Check the ComfyUI server log.");
-    if (job.status === "complete") return { scene: saved };
-    const elapsed = Math.max(0, Math.floor(Date.now() / 1000 - job.startedAt));
-    message.textContent = `Codex is ${planningLabels[job.inputs?.action] || "working"}… ${elapsed}s elapsed. You can reload and reconnect to this task.`;
-    await new Promise(resolve => setTimeout(resolve, 2000));
-  }
-}
-function savedScope(id) {
-  try { const saved = JSON.parse(localStorage.getItem(`ava-scope-${id}`) || "{}"); return { episodeId: saved.episodeId || "", scenes: saved.scenes || {} }; }
-  catch { return { episodeId: "", scenes: {} }; }
-}
-function remember() {
-  localStorage.setItem("ava-project", projectId);
-  localStorage.setItem("ava-episode", episodeId);
-  localStorage.setItem("ava-scene", sceneId);
-  if (projectId) {
-    const saved = savedScope(projectId); saved.episodeId = episodeId; if (episodeId) saved.scenes[episodeId] = sceneId;
-    localStorage.setItem(`ava-scope-${projectId}`, JSON.stringify(saved));
-  }
+  return request("/action", { action: command, projectId, ...values });
 }
 async function chooseProject(id) {
-  await refreshDone; remember(); projectId = id;
-  const saved = savedScope(id); episodeId = saved.episodeId; sceneId = saved.scenes[episodeId] || "";
-  scene = null; diagnostics = null; remember();
+  await refreshDone;
+  projectId = id; scene = null; diagnostics = null;
+  localStorage.setItem("ava-project", id);
   if (!id) switchSection("agent");
 }
-async function chooseEpisode(id) {
-  await refreshDone; remember(); episodeId = id; sceneId = savedScope(projectId).scenes[id] || ""; scene = null; remember();
-}
-async function chooseScene(id) { sceneId = id; remember(); }
-const scopeQuery = () => new URLSearchParams({ projectId, ...(episodeId ? { episodeId } : {}) }).toString();
+const scopeQuery = () => new URLSearchParams({ projectId }).toString();
 
 async function refresh(force = false) {
   if (refreshing) { await refreshDone; if (force) return refresh(true); return; }
@@ -286,95 +218,48 @@ async function refresh(force = false) {
   let finish; refreshDone = new Promise(resolve => { finish = resolve; });
   try {
     state = await request(`/state${projectId ? `?${scopeQuery()}` : ""}`);
-    if (projectId && !state.projects.some(p => p.id === projectId)) { projectId = ""; episodeId = ""; sceneId = ""; diagnostics = null; remember(); }
-    episodeId = state.selectedEpisodeId || "";
-    if (!state.scenes.some(s => s.id === sceneId)) sceneId = state.scenes[0]?.id || "";
-    if (sceneId) scene = await request(`/scene?${scopeQuery()}&sceneId=${encodeURIComponent(sceneId)}`);
-    else scene = null;
+    if (projectId && !state.projects.some(p => p.id === projectId)) { projectId = ""; diagnostics = null; localStorage.removeItem("ava-project"); }
+    scene = state.workspace;
     sceneReceivedAt = Date.now() / 1000;
-    remember();
     if (message.textContent === "Loading…") message.textContent = "Ready";
     const running = scene?.clips.find(c => active.has(c.status));
     document.title = running ? `${running.status} · ${running.title} · ComfyUI` : scene?.clips.length && scene.clips.every(c => c.status === "complete") ? "Video complete · ComfyUI" : originalTitle;
     updateStatus();
     // Preserve unsaved prompt, script, selection and comments during background checks.
     if (force || (snapshot() !== renderedSnapshot && !dirty && !busy && !workspace.contains(document.activeElement?.closest("input,textarea,select")))) render();
-    if (!busy && scene?.planning?.status === "running" && !scene.planning.automatic) {
-      const scope = { projectId, episodeId, sceneId }, jobId = scene.planning.id;
-      void run(() => waitForPlanning(scope, jobId));
-    }
   } finally { refreshing = false; finish(); }
 }
 
 function connection() {
-  const conf = state.planner;
-  const catalog = [{ id: "", name: "Use PC's default Codex model" }, ...(state.helper?.models || []).map(m => ({ id: m.id, name: m.name }))];
-  if (conf.model && !catalog.some(m => m.id === conf.model)) catalog.push({ id: conf.model, name: conf.model });
-  const model = select(catalog, conf.model);
-  const podUrl = input(location.origin); podUrl.readOnly = true;
-  const result = $("pre", { class: "ava-diagnostics", text: diagnostics || "Check the pod's models, nodes, media tools and Codex connection." });
-  return card(heading("Codex & RunPod setup", "Codex plans on your PC. H3 renders on this pod."),
-    note(state.helper?.connected ? "PC helper connected" : "PC helper offline — start it on your PC before planning."),
-    $("a", { text: "Download desktop app · Windows & macOS", href: "https://github.com/pareekshit28/ai-video-agent/releases/tag/helper-v0.9.0", target: "_blank", rel: "noopener" }),
-    field("ComfyUI URL for the desktop app", podUrl),
-    note("Paste this URL into the Codex desktop helper. It connects automatically. Paste a new pod URL to switch; keep the desktop app open while planning."),
-    note("Your Codex ChatGPT login stays on your computer."),
-    note(`Model selection is saved for ${state.project.name}. The choices come from the connected PC's Codex installation.`),
-    field("Codex planner model", model),
-    button("Save Codex model", () => action("codexConfig", { config: { model: model.value } })),
+  const result = $("pre", { class: "ava-diagnostics", text: diagnostics || "Check the pod's models, nodes and media tools." });
+  return card(heading("RunPod setup", "FastH3 renders inside ComfyUI."),
     button("Check installation", async () => { diagnostics = JSON.stringify(await request(`/health?projectId=${encodeURIComponent(projectId)}`), null, 2); result.textContent = diagnostics; }), result,
-    note(`Storage on pod: ${state.storage}. Use a RunPod persistent volume.`)
-  );
+    note(`Storage on pod: ${state.storage}. Use a RunPod persistent volume.`));
 }
 
 function projectControls() {
-  const project = state.project;
   const projects = select([{ id: "", name: "Select project" }, ...state.projects], projectId);
   projects.onchange = () => run(() => chooseProject(projects.value));
-  const scenes = select([{ id: "", name: "Select scene" }, ...state.scenes.map(s => ({ id: s.id, name: s.name }))], sceneId);
-  scenes.onchange = () => run(() => chooseScene(scenes.value));
-  const episodes = select(state.episodes.length ? state.episodes : [{ id: "", name: project ? "No episodes yet" : "Select project first" }], episodeId);
-  episodes.onchange = () => run(() => chooseEpisode(episodes.value));
-  episodes.disabled = !project; scenes.disabled = !episodeId;
-  const control = (label, choices, create) => $("div", { class: "ava-selector" }, field(label, choices), create);
-  return card(eyebrow("PROJECT / EPISODE / SCENE"), control("Project", projects, button("Create new project", async () => {
+  return card(eyebrow("PROJECT"), row(field("Project", projects), button("Create new project", async () => {
     const name = prompt("New project name", `Project ${state.projects.length + 1}`);
     if (name === null) return false;
     const result = await action("createProject", { name }); await chooseProject(result.project.id); switchSection("agent");
-  })), row(control("Episode", episodes, button("Create new episode", async () => {
-    const name = prompt("New episode name", `Episode ${state.episodes.length + 1}`);
-    if (name === null) return false;
-    const result = await action("createEpisode", { name }); await chooseEpisode(result.episode.id); switchSection("agent");
-  }, "", !!project)), control("Scene", scenes, button("Create new scene", async () => {
-    const result = await action("createScene"); await chooseScene(result.scene.id); switchSection("agent");
-  }, "", !!project && !!episodeId))));
+  })));
 }
 
 function manageSelection() {
-  const project = state.project, episode = state.episodes.find(e => e.id === episodeId);
-  const projectName = input(project.name), episodeName = input(episode?.name || ""), sceneName = input(scene?.name || "");
-  episodeName.disabled = !episode; sceneName.disabled = !scene;
-  return card(heading("Names & deletion", "Manage the selected project, episode and scene."),
-    field("Project name", projectName), row(button("Rename project", () => action("renameProject", { name: projectName.value })),
+  const project = state.project, name = input(project.name);
+  return card(heading("Project settings", "References and videos belong to this project."),
+    field("Project name", name), row(button("Rename project", () => action("renameProject", { name: name.value })),
       button("Delete project…", async () => {
-        if (!confirm(`Delete “${project.name}” and all its episodes and scenes? Saved data goes to recovery trash.`)) return false;
-        await action("deleteProject"); const removed = projectId; await chooseProject(""); localStorage.removeItem(`ava-scope-${removed}`);
-      }, "ava-danger")),
-    field("Episode name", episodeName), row(button("Rename episode", () => action("renameEpisode", { name: episodeName.value }), "", !!episode),
-      button("Delete episode…", async () => {
-        if (!confirm(`Delete “${episode.name}” and its scenes? Saved data goes to recovery trash. The project library is retained.`)) return false;
-        await action("deleteEpisode"); await chooseEpisode("");
-      }, "ava-danger", !!episode)),
-    field("Scene name", sceneName), row(button("Rename scene", () => action("renameScene", { name: sceneName.value }), "", !!scene),
-      button("Delete scene…", async () => {
-        if (!confirm(`Delete “${scene.name}” and its takes? Saved data goes to recovery trash.`)) return false;
-        await action("deleteScene"); scene = null; await chooseScene("");
-      }, "ava-danger", !!scene)));
+        if (!confirm(`Delete “${project.name}” and its clips? Saved data goes to recovery trash.`)) return false;
+        await action("deleteProject"); await chooseProject("");
+      }, "ava-danger")));
 }
 
 async function uploadFile(file, values = {}) {
   const form = new FormData(); form.append("file", file);
-  const query = new URLSearchParams({ projectId, ...(values.sceneId ? { episodeId } : {}), ...values });
+  const query = new URLSearchParams({ projectId, ...values });
   const response = await api.fetchApi(`${prefix}/upload?${query}`, { method: "POST", body: form });
   await readResponse(response);
 }
@@ -387,41 +272,39 @@ function uploadControl(values, label = "Add images / voices") {
   }));
 }
 
-function assets(ref, sceneReference = false) {
+function assets(ref) {
   return $("div", { class: "ava-assets" }, ...ref.assets.map(asset => card(
     asset.kind === "image" ? $("img", { src: mediaUrl(asset), alt: ref.name, loading: "lazy" }) : $("audio", { src: mediaUrl(asset), controls: true, preload: "none" }),
-    note(asset.name + (asset.duration ? ` · ${asset.duration.toFixed(2)}s` : "")),
-    sceneReference && button("Remove from scene slot", () => action("removeAsset", { referenceId: ref.id, path: asset.path }))
+    note(asset.name + (asset.duration ? ` · ${asset.duration.toFixed(2)}s` : ""))
   )));
 }
 
 function library() {
   const project = state.project;
   if (!project) return null;
+  const refs = project.library;
   const name = input(), kind = select(["character", "location", "prop"], "character"), description = area("", 2);
-  return $("div", {}, heading("Reference library", `${project.library.length} saved entries · shared by every episode of ${project.name}`),
-    $("details", { open: !project.library.length }, $("summary", { text: "Create a library entry" }), card(
-    field("Name", name), field("Kind", kind), field("Description", description),
-    button("Create library entry", () => action("createLibrary", { name: name.value, kind: kind.value, description: description.value })))),
-    $("div", { class: "ava-library-grid" },
-    ...project.library.map(ref => card($("h4", { text: ref.name }), note(ref.description), assets(ref), uploadControl({ referenceId: ref.id }),
-      row(scene && button("Add to current scene", () => action("addLibraryReference", { referenceId: ref.id })),
-        button("Clone", () => action("cloneLibrary", { referenceId: ref.id })),
-        button("Remove library entry", async () => { if (confirm(`Remove ${ref.name} from the library? Scene copies remain available.`)) await action("removeLibrary", { referenceId: ref.id }); }))
-    ))), savedVideos());
+  return $("div", {}, heading("Reference library", `${refs.length} entries · isolated to ${project.name}`),
+    $("details", { open: !refs.length }, $("summary", { text: "Create a library entry" }), card(
+      field("Name", name), field("Kind", kind), field("Description", description),
+      button("Create library entry", () => action("createLibrary", { name: name.value, kind: kind.value, description: description.value })))),
+    $("div", { class: "ava-library-grid" }, ...refs.map(ref => card($("h4", { text: ref.name }), note(`ID: ${ref.id}`), note(ref.description), assets(ref), uploadControl({ referenceId: ref.id }),
+      row(button("Clone", () => action("cloneLibrary", { referenceId: ref.id })),
+        button("Remove library entry", async () => { if (confirm(`Remove ${ref.name} from the library?`)) await action("removeLibrary", { referenceId: ref.id }); }))))),
+    savedVideos());
 }
 
 function savedVideos() {
   const takes = state.videos;
   return $("div", {}, heading("Saved videos", `${takes.length} saved take${takes.length === 1 ? "" : "s"} in this project`),
     takes.length ? $("div", { class: "ava-library-grid" }, ...takes.map(take => card($("h4", { text: take.title }),
-      note(`${take.episodeName} / ${take.sceneName} · ${take.actualDuration || take.duration}s`), $("video", { src: mediaUrl(take.video), controls: true, preload: "none" }),
+      note(`${take.sceneName || "Clip"} · ${take.actualDuration || take.duration}s`), $("video", { src: mediaUrl(take.video), controls: true, preload: "none" }),
       note(`Completed at: ${timeText(take.timing?.completedAt)}`), $("a", { href: mediaUrl(take.video), download: take.video.name || `${take.id}.mp4`, text: "Download video" })))) : card(note("Your finished clips and previous takes will appear here.")));
 }
 
 function sceneDraft() {
   const value = (id, fallback) => content.querySelector(`#ava-${id}`)?.value ?? fallback;
-  return { name: scene.name, script: value("scene-script", scene.script), settings: {
+  return { settings: {
     provider: "h3", aspectRatio: value("ratio", scene.settings.aspectRatio), megapixels: Number(value("mp", scene.settings.megapixels)),
     steps: Number(value("steps", scene.settings.steps)), seed: Number(value("seed", scene.settings.seed)), refImageSize: value("quality", scene.settings.refImageSize) } };
 }
@@ -436,76 +319,67 @@ function generationSettings() {
     note("Applies to the next approved take. Saved takes keep their original settings."),
     row(field("Aspect ratio", ratio), field("H3 megapixels", mp), field("H3 steps", steps)),
     row(field("Seed (-1 = random)", seed), field("H3 reference size", quality)),
-    button("Save render settings", () => action("saveScene", sceneDraft()), "ava-primary"));
+    button("Save render settings", () => action("saveSettings", sceneDraft()), "ava-primary"));
 }
 
-function sceneEditor() {
-  const script = area(scene.script, 8);
-  script.id = "ava-scene-script";
-  async function save() {
-    await action("saveScene", sceneDraft());
-  }
-  return card(eyebrow("01 / PLAN"), heading("Build your scene", "Start with your script. Codex identifies references, then plans each clip."), field("Script / scene", script),
-    note(`FastH3 · ${scene.settings.aspectRatio} · ${scene.settings.megapixels} MP · ${scene.settings.steps} steps · configure in Settings`),
-    row(button("Save scene", save), button("1 · Identify references", async () => { await save(); await action("identify"); })),
-    note(scene.summary || "Identify slots, supply your references, then let Codex inspect them and plan clips."),
-    note("Codex combines consecutive actions and dialogue into fewer clips, up to 15 seconds each, while preserving natural timing."),
-    button(scene.clips.length ? "Replan / optimize unsubmitted clips" : "2 · Understand references & plan clips", async () => { await save(); await action("plan"); }, "ava-primary"));
+function planImporter() {
+  const json = area("", 12);
+  json.placeholder = '{"version":1,"scene":"Scene name","clips":[{"title":"Opening","duration":5,"references":[],"use_last_frame":false,"prompt":"Describe the clip."}]}';
+  const manifest = { project: state.project.name, references: state.project.library.filter(r => r.assets.length).map(r => ({ id: r.id, name: r.name, kind: r.kind, description: r.description,
+    images: r.assets.filter(a => a.kind === "image").map(a => a.name), voices: r.assets.filter(a => a.kind === "audio").map(a => ({ name: a.name, duration: a.duration })) })),
+    previous_clip: scene.clips.length ? { title: scene.clips.at(-1).title, last_frame_available: scene.clips.at(-1).status === "complete" && !!scene.clips.at(-1).frame } : null };
+  const manifestJSON = JSON.stringify(manifest, null, 2);
+  let requestId;
+  json.addEventListener("input", () => { requestId = null; });
+  return card(eyebrow("01 / IMPORT"), heading("Import a scene from ChatGPT", "Upload project references in Library, give ChatGPT the planning skill and reference manifest, then paste its clip JSON here."),
+    $("a", { href: api.apiURL(`${prefix}/scene-planning-skill`), download: "comfyui-scene-planner.md", text: "Download ChatGPT scene-planning skill" }),
+    $("details", {}, $("summary", { text: "Reference manifest for ChatGPT" }), $("pre", { text: manifestJSON }),
+      button("Download reference manifest", () => downloadJSON(manifest, `${state.project.name}-references.json`))),
+    field("Scene JSON", json),
+    note("Imports append clips. Existing clips and takes stay saved. Each clip includes duration, references, prompt and use_last_frame."),
+    button("Import clips", async () => {
+      const plan = JSON.parse(json.value);
+      requestId ||= globalThis.crypto?.randomUUID?.() || `import_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      await action("importPlan", { plan, requestId });
+    }, "ava-primary"));
 }
 
-function references() {
-  const project = state.project;
-  const name = input(), kind = select(["character", "location", "prop"], "character");
-  return $("details", { open: !scene.clips.length }, $("summary", { text: `Scene references (${scene.references.length})` }), card(
-    note("Empty slots are ignored. Add images and voice samples you actually want used. Choose references independently for each clip."),
-    row(field("New reference", name), field("Kind", kind)), button("Add reference slot", () => action("createReference", { name: name.value, kind: kind.value })),
-    ...scene.references.map(ref => {
-      const saved = select([{ id: "", name: "Choose a library entry" }, ...project.library], "");
-      return card($("h4", { text: `${ref.name} · ${ref.kind}` }), note(ref.description), assets(ref, true), uploadControl({ sceneId, referenceId: ref.id }),
-        field("Use saved library files", saved), button("Copy library files to this slot", () => {
-          if (!saved.value) throw new Error("Choose a library entry first");
-          return action("addLibraryReference", { referenceId: saved.value, slotId: ref.id });
-        }));
-    })
-  ));
+function downloadJSON(value, filename) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
+  const link = $("a", { href: url, download: filename }); link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function clipEditor(clip, index) {
-  const prompt = area(clip.prompt, 10), comments = area("", 3), length = input(clip.nextDuration ?? clip.duration, "number");
+  const prompt = area(clip.prompt, 10), length = input(clip.nextDuration ?? clip.duration, "number");
   length.min = 2; length.max = 15; length.step = 0.5;
-  const continuity = select(["auto", "on", "off"], clip.continuityMode);
+  const continuity = $("input", { type: "checkbox", checked: clip.continuityMode === "on" || clip.continuityMode === "auto" && clip.transition === "continue" });
   const checks = scene.references.filter(r => r.assets.length).map(ref => ({ ref, box: $("input", { type: "checkbox", checked: clip.referenceIds.includes(ref.id) }) }));
   async function save() {
-    await action("saveClip", { clipId: clip.id, prompt: prompt.value, referenceIds: checks.filter(c => c.box.checked).map(c => c.ref.id), continuityMode: continuity.value });
+    await action("saveClip", { clipId: clip.id, prompt: prompt.value, referenceIds: checks.filter(c => c.box.checked).map(c => c.ref.id), use_last_frame: continuity.checked, duration: Number(length.value) });
   }
-  const frameControls = clip.status === "complete" && $("details", {}, $("summary", { text: "Last frame & continuity" }),
-    clip.frame && $("img", { src: mediaUrl(clip.frame), alt: "Actual last frame / replacement", loading: "lazy" }),
-    uploadControl({ sceneId, clipId: clip.id }, "Replace last frame"), button("Restore extracted frame", () => action("restoreFrame", { clipId: clip.id })));
+  const frameControls = clip.frame && $("details", {}, $("summary", { text: "Saved last frame" }), $("img", { src: mediaUrl(clip.frame), alt: "Extracted last frame", loading: "lazy" }));
   const keys = $("details", {}, $("summary", { text: "Canvas node IDs / review key" }),
-    $("pre", { text: JSON.stringify({ project_id: projectId, scene_id: sceneId, clip_id: clip.id, review_key: clip.reviewKey }, null, 2) }));
+    $("pre", { text: JSON.stringify({ project_id: projectId, clip_id: clip.id, review_key: clip.reviewKey }, null, 2) }));
   const editor = card(eyebrow(`CLIP ${String(index + 1).padStart(2, "0")} / ${String(scene.clips.length).padStart(2, "0")}`), $("h3", { text: `${index + 1}. ${clip.title}` }), statusPanel(clip, true), note(`${clip.transition} · ${clip.actualDuration ? `${clip.actualDuration.toFixed(2)}s saved` : `${clip.duration}s planned`}`),
     clip.continuityOutdated && note("An earlier take or frame changed. This completed take is retained; review continuity before regenerating."),
     clip.error && $("p", { class: "ava-error", text: clip.error }),
     clip.video && $("video", { src: mediaUrl(clip.video), controls: true, preload: "metadata" }),
-    clip.frameAnalysis && $("details", {}, $("summary", { text: "Last-frame analysis & prompt optimization" }), note(clip.frameAnalysis)),
-    note(`Outline: ${clip.outline}`), field("Editable video prompt", prompt),
+    clip.sceneName && note(clip.sceneName), field("Editable video prompt", prompt),
     $("div", { class: "ava-checks" }, ...checks.map(({ ref, box }) => $("label", {}, box, document.createTextNode(ref.name)))),
-    field("Frame continuity", continuity),
-    row(field(clip.takeId ? "Duration for next take" : "Duration", length), button("Save duration", () => action("setDuration", { clipId: clip.id, duration: Number(length.value) }))),
-    clip.nextDuration !== undefined && note(`The submitted/saved take keeps ${clip.duration}s. Next take: ${clip.nextDuration}s.`),
-    row(button("Save prompt & references", save), button(index ? "Plan prompt from last frame" : "Plan prompt", async () => {
-      // Save existing edits before Codex sees the target. A blank outline prompt is planned directly.
-      await save();
-      await action("planPrompt", { clipId: clip.id });
-    })),
-    field("Revision comments", comments), button("Apply comments with Codex", async () => { await save(); await action("revisePrompt", { clipId: clip.id, comments: comments.value }); }),
+    field("Use previous clip's last frame", continuity),
+    clip.previousFrame ? card(note(`Opening frame from: ${clip.previousFrame.name}`), $("img", { src: mediaUrl(clip.previousFrame.assets[0]), alt: "Previous clip's last frame", loading: "lazy" })) : continuity.checked && note("Complete the preceding clip before reviewing this continuation."),
+    field(clip.takeId ? "Duration for next take" : "Duration", length),
+    clip.nextDuration !== undefined && note(`The saved take keeps ${clip.duration}s. Next take: ${clip.nextDuration}s.`),
+    button("Save prompt & references", save),
     button(clip.takeId ? "Approve prompt & regenerate this clip" : "Approve prompt & generate this clip", async () => {
-      await save();
-      const savedScene = await request(`/scene?${scopeQuery()}&sceneId=${encodeURIComponent(sceneId)}`);
-      const saved = savedScene.clips.find(c => c.id === clip.id);
-      if (!saved.reviewKey) throw new Error("Plan this prompt again after changing references, continuity or duration, then review it before generating.");
+      const result = await action("saveClip", { clipId: clip.id, prompt: prompt.value, referenceIds: checks.filter(c => c.box.checked).map(c => c.ref.id), use_last_frame: continuity.checked, duration: Number(length.value) });
+      const saved = result.workspace.clips.find(c => c.id === clip.id);
+      if (!saved.reviewKey || saved.reviewKey !== clip.reviewKey) {
+        dirty = false; await refresh(true);
+        throw new Error("Draft or preceding clip's last frame changed. Review the saved clip and selected frame, then approve again.");
+      }
       await action("approveGenerate", { clipId: clip.id, reviewKey: saved.reviewKey });
-    }, "ava-primary"),
+    }, "ava-primary", !active.has(clip.status)),
     active.has(clip.status) && row(button("Pause monitoring", () => action("pause")), button("Resume existing job / saving", () => action("resume", { clipId: clip.id }))),
     active.has(clip.status) && $("details", {}, $("summary", { text: "Recover an existing job" }), (() => {
       const job = input(clip.jobId || "");
@@ -518,27 +392,18 @@ function clipEditor(clip, index) {
     clip.versions?.length && $("details", {}, $("summary", { text: `Previous takes (${clip.versions.length})` }), ...clip.versions.map(v => card(note(`${v.status} · ${v.actualDuration || v.duration}s · ${v.takeId}`), note(`Completed at: ${timeText(v.timing?.completedAt)}`), v.video && $("video", { src: mediaUrl(v.video), controls: true, preload: "none" }), note(v.submittedPrompt || v.prompt)))), keys,
     button("Export this clip's H3 API graph", async () => {
       const result = await action("exportGraph", { clipId: clip.id });
-      const url = URL.createObjectURL(new Blob([JSON.stringify(result.graph, null, 2)], { type: "application/json" }));
-      const link = $("a", { href: url, download: `${scene.name}-${clip.id}-api.json` }); link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      downloadJSON(result.graph, `${state.project.name}-${clip.id}-api.json`);
     }));
   editor.classList.add("ava-clip");
   editor.dataset.avaKey = `clip:${scene.id}:${clip.id}`;
   return editor;
 }
 
-function studio() {
-  if (scene.clips.length) return null;
-  const prompt = area("", 5), seconds = input(15, "number");
-  return $("details", {}, $("summary", { text: "Video Studio · manual single clip" }), card(
-    note("Save the scene settings, supply references, then prepare a manual prompt. Review and generate it using the clip controls below."),
-    field("Manual prompt", prompt), field("Duration", seconds), button("Prepare Studio clip", () => action("manualClip", { prompt: prompt.value, duration: Number(seconds.value) }))));
-}
-
 function render() {
   if (!state.project) section = "agent";
   const detailsState = new Map([...workspace.querySelectorAll("details")].map((el, i) => [`${i}:${el.querySelector("summary")?.textContent}`, el.open]));
   const agent = $("section", { id: "ava-panel-agent", role: "tabpanel", ariaLabel: "Agent" },
-    ...(scene ? [scene.planning?.status === "failed" && $("p", { class: "ava-error", text: scene.planning.error }), sceneEditor(), references(), studio(), scene.clips.length && heading("Review & render", `${scene.clips.filter(c => c.status === "complete").length} of ${scene.clips.length} clips complete · approve each take when ready`), ...scene.clips.map(clipEditor)].filter(Boolean) : [card(heading("Your next video starts here", "Create a project and scene above, then give Codex your script."))]));
+    ...(scene ? [planImporter(), scene.clips.length && heading("Review & render", `${scene.clips.filter(c => c.status === "complete").length} of ${scene.clips.length} clips complete · approve each take when ready`), ...scene.clips.map(clipEditor)].filter(Boolean) : [card(heading("Your next video starts here", "Create a project above, then import your scene JSON from ChatGPT."))]));
   const libraryPanel = $("section", { id: "ava-panel-library", role: "tabpanel", ariaLabel: "Library" }, projectId ? library() : card(note("Create a project to build its reference library.")));
   const settingsPanel = $("section", { id: "ava-panel-settings", role: "tabpanel", ariaLabel: "Settings" }, ...(state.project ? [manageSelection(), connection()] : []), ...(scene ? [generationSettings()] : []),
     card(heading("Render timing", "Sampling ETA and actual take timestamps."), note("ETA covers only measured sampling steps. It is unavailable until a sampling rate can be measured, and stops when sampling finishes. Decoding and saving have no ETA. Elapsed time includes queue waiting; completion is recorded after video verification and final-frame extraction. Times use your browser's local timezone.")));
@@ -568,9 +433,9 @@ function mount() {
   navigation.hidden = true;
   livePanel = $("div", { class: "ava-monitor" });
   workspace = $("div", { class: "ava-workspace" }, $("header", { class: "ava-header" },
-    $("div", { class: "ava-brand" }, $("span", { class: "ava-mark", text: "a", ariaHidden: "true" }), $("div", {}, $("h2", { text: "AI Video Agent" }), $("span", { class: "ava-subtitle", text: "Codex plans. FastH3 creates." }))), row(
+    $("div", { class: "ava-brand" }, $("span", { class: "ava-mark", text: "a", ariaHidden: "true" }), $("div", {}, $("h2", { text: "AI Video Agent" }), $("span", { class: "ava-subtitle", text: "ChatGPT prompts. FastH3 creates." }))), row(
     button("Refresh", () => refresh(true)), openButton)), projectHost, navigation, message, livePanel, content,
-    $("footer", { text: "CODEX + FASTH3 / YOUR COMFYUI WORKSPACE" }));
+    $("footer", { text: "CHATGPT + FASTH3 / YOUR COMFYUI WORKSPACE" }));
   workspace.addEventListener("input", () => { dirty = true; });
   workspace.addEventListener("change", event => { if (event.target.tagName !== "SELECT" || event.target.closest("main")) dirty = true; });
   poller = setInterval(() => { if (!busy) refresh().catch(error => { message.textContent = error.message; }); }, 5000);
@@ -593,10 +458,10 @@ function openModal() {
 }
 
 app.registerExtension({
-  name: "AI.Video.Agent.Codex",
+  name: "AI.Video.Agent",
   setup() {
     mount();
-    app.extensionManager.registerSidebarTab({ id: "ai-video-agent", icon: "pi pi-video", title: "AI Video Agent", tooltip: "Codex video planning & reviewed generation", type: "custom", render(el) { sidebarHost = el; if (!modal?.open) el.append(workspace); } });
+    app.extensionManager.registerSidebarTab({ id: "ai-video-agent", icon: "pi pi-video", title: "AI Video Agent", tooltip: "Import scene JSON & review video generation", type: "custom", render(el) { sidebarHost = el; if (!modal?.open) el.append(workspace); } });
   },
   beforeRegisterNodeDef(nodeType, nodeData) {
     if (!["AVAShowText", "AVAQueueReviewedClip"].includes(nodeData.name)) return;

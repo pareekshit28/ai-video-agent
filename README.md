@@ -1,121 +1,24 @@
 # ComfyUI AI Video Agent
 
-Custom nodes and one **[workflow.json](workflow.json)** for script planning, reference inspection, editable prompts, per-clip review, native FastH3 generation and sequential frame continuity. Codex plans through the ChatGPT-signed-in installation on your PC. A small outbound PC helper connects it to this pod; H3 rendering stays inside ComfyUI.
+This ComfyUI custom-node package imports ChatGPT scene plans as JSON, keeps references and rendered media inside projects, and renders reviewed FastH3 clips. No planner model or desktop helper is needed on the pod. The MiniMax H3 text encoder is still required for render conditioning.
 
-## Install on the pod
+## Install
 
-Run in your existing ComfyUI installation, using the same Python environment that starts ComfyUI:
+Place this directory under `ComfyUI/custom_nodes/ComfyUI-AI-Video-Agent`, install `requirements.txt` into the ComfyUI Python environment, and restart ComfyUI. Install FFmpeg and FFprobe on the server. Use `AVA_STORAGE_DIR` for a persistent volume if the default ComfyUI output folder is not persistent. The included `workflow.json` contains model links and a reviewed clip canvas node.
 
-```bash
-cd /workspace/ComfyUI/custom_nodes  # adjust to your ComfyUI folder
-git clone --single-branch --branch codex/comfyui-custom-nodes https://github.com/pareekshit28/ai-video-agent.git ComfyUI-AI-Video-Agent
-python -m pip install -r ComfyUI-AI-Video-Agent/requirements.txt
+## Plan and render
+
+1. In the AI Video Agent sidebar, create a project. Projects have separate reference and video libraries. Existing episode/scene data is preserved and presented in one project workspace on first access.
+2. Add character, location or prop entries in Library, then upload the real images or voice samples. Download the reference manifest and [scene-planning skill](skills/comfyui-scene-planner/SKILL.md) from the agent. Give those and your script to ChatGPT. Attach the skill to a ChatGPT Project and instruct it to use it for every scene.
+3. Paste ChatGPT's JSON into **Import a scene**. Each clip must provide `duration`, `references`, `prompt` and `use_last_frame`. Imports append new clips; previous takes stay saved. Edit a clip's prompt, duration, references or continuity choice, save, review and approve the render.
+4. The completed video plays in the clip and Saved videos sections. Its extracted last frame stays with that saved clip. A clip with `use_last_frame: true` uses the immediately preceding clip's saved final frame at review and render time. If the preceding clip is regenerated, save and review the following clip again.
+
+Example:
+
+```json
+{"version":1,"scene":"Arrival","clips":[{"title":"At the door","duration":8,"references":[],"use_last_frame":false,"prompt":"A moving camera follows a traveler toward a house. She reaches the door and knocks twice. Gravel crunches beneath her feet; no dialogue."},{"title":"Answer","duration":5,"references":[],"use_last_frame":true,"prompt":"Continue from the supplied opening frame at the door. The door opens and the traveler says, \"You're home.\" softly, with synchronized lip movement."}]}
 ```
 
-Restart ComfyUI, then drag **workflow.json** onto the canvas. Use a recent ComfyUI build with MiniMax H3, Comfy Kitchen attention and sparse-attention support. FFmpeg and FFprobe must be installed for clip saving and final-frame extraction.
+Reference entries must exist in the selected project's library and contain files. Use exact IDs from the manifest. Each clip allows at most nine image files and three voice files; duration is 2–15 seconds. ChatGPT should choose camera movement and cuts to fit the scene. The app assigns numbered H3 media inputs at render time. Every GPU render still requires explicit per-clip approval.
 
-## Connect your PC's Codex
-
-1. Download the [desktop app for Windows or macOS](https://github.com/pareekshit28/ai-video-agent/releases/tag/helper-v0.9.0). Windows uses the `.exe`; Mac downloads contain a `.app` for Apple Silicon or Intel.
-2. Open **ComfyUI Codex Helper** and paste your pod's HTTPS ComfyUI URL. It connects automatically; **Connect** also retries immediately.
-3. Keep the app open while planning. Paste a replacement pod URL to disconnect the old pod and connect to the new one. The app remembers the URL and can connect when reopened.
-4. ComfyUI Settings shows **PC helper connected** and the models available through your Codex installation. Leave model selection at **Use PC's default Codex model**, or choose a model from the list.
-
-The desktop downloads bundle Python and the UI. Install Codex and sign in with ChatGPT on each computer (`codex login`). The same helper core supports Windows and macOS; only the supplied ComfyUI URL is needed to connect. Source users can run `python desktop_helper.py` or the optional console `python pc_helper.py --url "https://YOUR-POD-8188.proxy.runpod.net"`. No inbound computer port or RunPod management API key is required. See [desktop helper details](docs/CODEX_HELPER.md).
-
-## Models
-
-The workflow's **SETUP · direct model downloads & instructions** note contains every direct link, destination folder, and pod-terminal download command. Its node metadata also contains ComfyUI model-download entries. The machine-readable list is [models.json](models.json).
-
-Planning uses the PC helper and does not load an instruction checkpoint on the pod. The H3 render graph still requires its own `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` conditioning encoder; keep that file. It is part of H3 rendering and is not used by Codex.
-
-Reuse the H3 files already present on your pod; the workflow includes their links too:
-
-| Folder under `models/` | File |
-| --- | --- |
-| `diffusion_models/` | `fasth3_omniref_8step_pruned_int8_convrot.safetensors` |
-| `text_encoders/` | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` |
-| `vae/` | `minimax_h3_video_vae_int8_convrot.safetensors` |
-| `vae/` | `minimax_h3_audio_vae_fp32.safetensors` |
-
-Model weights are not stored in this repository or downloaded automatically when a node is queued.
-
-## Use
-
-Open **AI Video Agent** in ComfyUI's sidebar for the complete project flow:
-
-The workspace has three sections: **Agent** for scripts, scene references, prompt review and rendering; **Library** for reusable project references, saved videos and previous takes with download links; and **Settings** for the Codex model, installation checks and scene render settings. Unsaved inputs stay in place when switching sections. **Open workspace** expands the same UI into a larger window.
-
-1. Select or create a project at the top, choose an episode, then create a scene and paste its script.
-2. **Identify references** creates slots only. Supply the actual images and voice samples, or copy entries from the project library.
-3. **Understand references & plan clips** inspects supplied images and plans the fewest practical 2–15 second H3 clips, combining actions and dialogue when natural. The first prompt is ready for editing; later clips keep story outlines until their preceding clip finishes.
-4. Edit the prompt, reference choices, duration or continuity. Apply revision comments with Codex if needed. **Approve prompt & generate this clip** submits only that reviewed clip.
-5. The video is saved and verified at 24 FPS, trimmed to the requested duration, and its actual last decoded frame is extracted. Codex inspects that frame to prepare the following prompt, then pauses for review.
-
-Direct continuations use `MiniMaxH3AddGuide` at frame zero. Cuts use the preceding frame only as story context. You can replace/restore the last frame, stage a new duration while retaining the current take, and regenerate individual clips without deleting previous takes. Lost submission responses stop for recovery; resuming never implicitly creates a replacement render. Projects, references, videos, frames and request audits persist in ComfyUI's output directory under `ai_video_agent` by default. Set `AVA_STORAGE_DIR` to a RunPod volume folder if needed.
-
-### H3 prompt style and fewer clips
-
-Version 0.9.0 uses the URL-only desktop Codex helper and asks Codex for **one complete natural-language prompt string**. Section headings, shot labels, speaker IDs and dialogue tags are optional. The app no longer rejects prompts for missing H3 sections, section order or special shot/dialogue syntax. It checks that text is nonempty, at most 12000 characters and uses only real media bindings. Older section objects are still flattened into text for compatibility. Descriptive guidance preserves scripted dialogue, named references and frame continuity without enforcing a prose layout.
-
-Codex chooses the clip count and each clip's duration from the script and supplied references. It aims to use the fewest clips that preserve actions, exact dialogue and natural pacing, using 2–15 seconds per clip and favoring 12–15 seconds when useful. These are model estimates of speech, pauses and action; the app validates the returned limits, IDs and transitions rather than measuring speech duration. Durations remain editable before approval.
-
-Clip planning, reference discovery and prompt revisions run as background tasks: the request returns immediately and the workspace checks status with short reads. It shows elapsed time and reconnects to the same task after reload or a lost response, without rerunning Codex. Wait for planning to finish before editing the scene; a failed run preserves its saved drafts and takes. A ComfyUI restart marks unfinished planning as interrupted and requires an explicit retry.
-
-Use **Replan / optimize unsubmitted clips** to apply the fewer-clip policy before any takes are submitted. Existing rendered plans stay preserved; use a new scene to replan them. **Plan prompt** or **Apply comments with Codex** applies the new H3 format to one draft. See [H3 prompting notes and official sources](docs/H3_PROMPTING.md) for reference binding, examples and validation limits.
-
-### Projects, episodes and scenes
-
-The **Project → Episode → Scene** selectors sit above every workspace section and the render monitor. Each project owns its episodes, shared reference/video library and Codex model selection. Episodes contain separate scenes; each scene retains its own script, references, render settings, clips and takes.
-
-Version 0.6.0 adds **Create new project**, **Create new episode** and **Create new scene** beside their selectors. Projects and episodes ask for names and are selected immediately after creation. Scenes are created immediately with names such as **Scene 1** and selected automatically. A project must be selected to create an episode, and an episode must be selected to create a scene. These requirements are checked by both the UI and API. Creating an episode starts with no scenes.
-
-Use **Settings → Names & deletion** to rename or delete the selected project, episode or scene. A scene can be renamed before it has a script. Explicit scene renames are preserved during Codex reference discovery. Deletion moves saved data into `ai_video_agent/.trash` for recovery; deleting an episode includes its scenes and preserves the project library. Active or uncertain render jobs must be resolved before deleting their scene, episode or project. Deleting the last episode keeps the project and its library; create an episode before adding another scene. Cancelling a name/deletion dialog preserves unsaved edits.
-
-Switching projects restores that project's last selected episode and scene. Switching episodes restores the last selected scene in that episode; selections survive browser reloads. Scene requests, edits and uploads validate the selected episode. The pod's GPU queue remains shared, and an existing render continues when switching projects.
-
-All episodes share the selected project's library. Saved videos include their episode and scene names. Codex settings are saved per project; older pod-wide Codex settings provide the initial default until a project chooses its own model. Installation files and the physical GPU remain shared by the ComfyUI installation.
-
-Existing projects and scenes appear under **Episode 1** automatically. This compatibility mapping keeps original scene IDs, take histories and media paths intact. **Open workspace** is hidden while the expanded workspace is open and returns after closing it, including with Escape.
-
-### Render status and timing
-
-Version 0.9.1 shows a render monitor in every section, plus timing on each clip. It shows **In queue → Rendering → Saving video → Complete**, queue position, sampler steps, elapsed time, **Sampling ETA** and actual take timestamps. Status polls every five seconds; clocks and progress update in place. Structural updates also preserve unchanged media players, so another clip's progress, completion or prompt optimization does not reload a playing video.
-
-ETA uses only the current sampler's measured steps and rate. It is unavailable during queue waiting, model loading, decoding and saving; previous full-render/save estimates are ignored. When sampling completes or its progress becomes stale, the countdown disappears. Elapsed time still includes queue waiting. Actual completion is recorded after saving and final-frame extraction succeed.
-
-Submission, execution, saving and completion timestamps persist with each take and survive reloads. Completion is recorded only after video verification and final-frame extraction succeed. Regeneration archives the original take's clock and starts a new one. Older takes without timing show that completion time was not recorded. Displayed dates use the browser's local timezone. Render settings remain editable in **Settings** and apply to the next approved take.
-
-After a clip finishes, the next unsubmitted clip is optimized in a persisted background task. Codex first inspects the actual saved final frame, then adapts the next prompt to visible positions, posture, objects, lighting and scene state while preserving its planned duration and scripted dialogue. The completed clip remains playable during this work. **Last-frame analysis & prompt optimization** records the model's explanation when supplied. Each next clip still waits for explicit approval; later clips remain outlines until their own preceding frame exists. Failed optimization retains the completed take and prior draft and exposes a retry.
-
-The single workflow also exposes standalone canvas nodes:
-
-- **Codex · Script & Reference Planner** → JSON plan and first prompt. A supplied image batch needs one manifest entry per image, in order. Use `[]` with no images.
-- **Codex · Frame-Aware Prompt / Revision** → target prompt grounded in an optional preceding frame and the supplied context JSON.
-- **AI Video Agent · Generate Reviewed Clip** → copy the four saved IDs/key from **Canvas node IDs / review key** under a reviewed clip. Unmute the node and queue it once to submit the native H3 graph as a separate ComfyUI job.
-- **AI Video Agent · Reviewed Clip** → saved prompt/duration/steps for advanced graph use.
-- **AI Video Agent · Show Text** → displays node output.
-
-The workflow's lower row is muted initially. Enable it only for the specific revision or reviewed render you intend to run. Changing the prompt, settings, duration, reference bytes, prior frame or take invalidates its review key. A planning node can override the Codex model ID for that execution; blank uses the PC default. Settings saves the planner model per project.
-
-Use **Check installation** to see missing H3 files and nodes, plus the PC helper's connection status. `AVA_COMFY_URL` can override the loopback URL when using HTTPS internally or a port other than 8188 for the canvas render node. `FFMPEG_PATH` and `FFPROBE_PATH` override the media-tool executable paths.
-
-### RunPod proxy request errors
-
-For **Fetch timeout** during **Understand references & plan clips**, update to version 0.7.2 or later, restart ComfyUI and hard-refresh the browser. Planning no longer holds a single HTTP request open throughout Codex inference. Temporary status-read failures reconnect automatically; if the connection stays unavailable, the workspace reports that the task may still be running and asks you to refresh. It does not automatically resubmit a planning request or a render.
-
-Version 0.3.1 fixes a sidebar error reported as `Unexpected token 'U', "Use the wo"... is not valid JSON`. The browser's public ComfyUI URL can differ from the internal Host header after RunPod proxying. Same-origin browser requests now use browser Fetch Metadata, and rejected requests return JSON errors. The UI also displays plain-text proxy errors without trying to treat them as JSON.
-
-Update the custom-node folder with `git pull --ff-only`, restart ComfyUI, then hard-refresh the browser. If your proxy strips the browser's `Sec-Fetch-Site` header, set `AVA_PUBLIC_ORIGIN` to the exact public ComfyUI origin, for example `https://your-pod-8188.proxy.runpod.net`, and restart. Cross-origin browser requests remain blocked.
-
-## Validation
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-The optional browser-only regression uses Node.js, `@playwright/test` and FFmpeg: `node tests/test_polling.mjs`. It mocks HTTP responses and checks that timing, lifecycle and next-prompt updates preserve a playing video without starting another media request. It does not connect to ComfyUI or a GPU.
-
-Tests exercise URL-only connections, serial pod switching, request ownership, native H3 rendering calls with stubbed execution, reference/image ordering, approval and duration rules, H3 graph wiring, submission recovery, workflow metadata and real FFmpeg finalization. Browser integration exercises the real UI/routes/store with mocked Codex and Comfy execution. Desktop builds receive a UI startup check on each target platform. A live Codex request and a live GPU render are separate checks; H3 inference and ComfyUI's automatic model-download dialog still require target-pod validation. Direct download links and terminal commands are provided in the workflow independently of that dialog.
-
-Sources: [Codex app-server](https://learn.chatgpt.com/docs/app-server), [Codex authentication](https://learn.chatgpt.com/docs/auth), [H3 nodes](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_minimax_h3.py).
+The app runs CPU-only contract and browser fixture tests locally. Rendering on a RunPod GPU must be verified on the target pod.

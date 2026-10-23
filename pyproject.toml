@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-ai-video-agent"
-version = "0.9.1"
-description = "PC-connected Codex planning and reviewed sequential ComfyUI H3 video production"
+version = "1.0.0"
+description = "ChatGPT scene JSON imports, project libraries and reviewed ComfyUI H3 video production"
 requires-python = ">=3.10"
 dependencies = ["aiohttp>=3.10,<4", "Pillow>=10", "numpy>=1.26"]
 

@@ -1,0 +1,6 @@
+interface:
+  display_name: "ComfyUI Scene Planner"
+  short_description: "Plan scene JSON, clip prompts and frame continuity"
+  default_prompt: "Use $comfyui-scene-planner to plan this scene as clip JSON for my ComfyUI AI Video Agent."
+policy:
+  allow_implicit_invocation: true
