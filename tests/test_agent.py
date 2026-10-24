@@ -9,7 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -23,6 +23,7 @@ core = importlib.import_module(namespace.__name__ + ".core")
 engine_module = importlib.import_module(namespace.__name__ + ".engine")
 media = importlib.import_module(namespace.__name__ + ".media")
 nodes = importlib.import_module(namespace.__name__ + ".nodes")
+storage_lock = importlib.import_module(namespace.__name__ + ".storage_lock")
 
 
 class Fixture:
@@ -394,6 +395,143 @@ class CoreTests(Fixture, unittest.TestCase):
         self.assertEqual([], self.store.project(project["id"])["library"])
 
 
+class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.workers, self.servers, self.urls, self.requests = [], [], [], []
+        for name in ("pod-a", "pod-b"):
+            worker = engine_module.Engine(core.Store(self.store.root), Path(self.temp.name) / name / "input",
+                                          Path(self.temp.name) / name / "output", worker_id=name)
+            worker.watch = Mock()
+            self.workers.append(worker)
+            app = web.Application()
+
+            async def submit(request, worker_name=name):
+                body = await request.json()
+                self.requests.append((worker_name, body))
+                return web.json_response({"prompt_id": body["prompt_id"]})
+
+            app.router.add_post("/prompt", submit)
+            server = TestServer(app)
+            await server.start_server()
+            self.servers.append(server)
+            self.urls.append(str(server.make_url("")).rstrip("/"))
+        template = json.loads((PACKAGE / "templates/h3-api.json").read_text())
+        classes = {n["class_type"] for n in template.values()} | {"MiniMaxH3AddGuide", "LoadImage", "LoadAudio"}
+        self.modules = patch.dict(sys.modules, {
+            "nodes": types.SimpleNamespace(NODE_CLASS_MAPPINGS=dict.fromkeys(classes, object)),
+            "execution": types.SimpleNamespace(validate_prompt=AsyncMock(return_value=(True, None, None, {})))})
+        self.modules.start()
+        core.import_plan(self.store, self.scene, self.plan)
+        self.store.save_scene(self.scene)
+        self.other_scene = self.store.create_scene(self.project["id"], "Departure")
+        core.import_plan(self.store, self.other_scene, self.plan)
+        self.store.save_scene(self.other_scene)
+
+    async def asyncTearDown(self):
+        self.modules.stop()
+        for server in self.servers:
+            await server.close()
+
+    async def test_two_pods_render_separate_scenes_in_shared_storage(self):
+        first, second = self.workers
+        await first.submit(self.scene, self.scene["clips"][0], self.urls[0])
+        await second.submit(self.other_scene, self.other_scene["clips"][0], self.urls[1])
+        self.assertEqual(2, len(self.requests))
+        for index, scene in enumerate((self.scene, self.other_scene)):
+            saved = self.store.scene(scene["projectId"], scene["id"])
+            self.assertEqual("queued", saved["clips"][0]["status"])
+            self.assertEqual(self.workers[index].owner(self.urls[index]), saved["clips"][0]["jobOwner"])
+            self.assertTrue(self.workers[index].owns(saved["clips"][0], self.urls[index]))
+        before = self.store.read(self.store.scene_dir(self.project["id"], self.other_scene["id"]) + "/scene.json")
+        first.http = AsyncMock()
+        await first.monitor(self.project["id"], self.other_scene["id"], self.urls[0])
+        first.http.assert_not_awaited()
+        engine_module.Engine.watch(first, self.project["id"], self.other_scene["id"], self.urls[0])
+        self.assertNotIn(self.other_scene["id"], first.tasks)
+        self.assertEqual(before, self.store.read(self.store.scene_dir(self.project["id"], self.other_scene["id"]) + "/scene.json"))
+
+    async def test_shared_scene_reservation_allows_only_one_submission_across_pods(self):
+        stale = copy.deepcopy(self.scene)
+        results = await asyncio.gather(self.workers[0].submit(self.scene, self.scene["clips"][0], self.urls[0]),
+                                       self.workers[1].submit(stale, stale["clips"][0], self.urls[1]), return_exceptions=True)
+        self.assertEqual(1, len(self.requests))
+        errors = [result for result in results if isinstance(result, Exception)]
+        self.assertEqual(1, len(errors))
+        self.assertIn("in this scene", str(errors[0]))
+
+    async def test_unresolved_job_in_other_scene_does_not_block_submission(self):
+        self.scene["clips"][0].update(status="submission-unknown", jobOwner=self.workers[0].owner(self.urls[0]))
+        self.store.save_scene(self.scene)
+        await self.workers[1].submit(self.other_scene, self.other_scene["clips"][0], self.urls[1])
+        self.assertEqual("queued", self.other_scene["clips"][0]["status"])
+        self.assertEqual("submission-unknown", self.store.scene(self.project["id"], self.scene["id"])["clips"][0]["status"])
+
+    async def test_legacy_resume_requires_evidence_on_the_current_pod(self):
+        worker = self.workers[0]
+        clip = self.scene["clips"][0]
+        clip.update(status="queued", jobId="existing", takeId="take", submittedSettings=core.DEFAULTS.copy())
+        worker.http = AsyncMock(side_effect=[{}, {"queue_running": [], "queue_pending": []}])
+        with self.assertRaisesRegex(ValueError, "not found on this pod"):
+            await worker.claim_legacy_job(self.scene, clip, self.urls[0])
+        self.assertNotIn("jobOwner", clip)
+        worker.http = AsyncMock(return_value={"existing": {"outputs": {}}})
+        await worker.claim_legacy_job(self.scene, clip, self.urls[0])
+        self.assertTrue(worker.owns(clip, self.urls[0]))
+        restarted = engine_module.Engine(self.store, self.temp.name, self.temp.name, worker_id="pod-a")
+        self.assertTrue(restarted.owns(clip, self.urls[0]))
+        self.assertFalse(restarted.owns(clip, self.urls[1]))
+
+    async def test_foreign_job_cannot_be_checked_on_the_wrong_pod(self):
+        clip = self.scene["clips"][0]
+        clip["jobOwner"] = self.workers[0].owner(self.urls[0])
+        self.workers[1].http = AsyncMock()
+        with self.assertRaisesRegex(ValueError, "belongs to pod pod-a"):
+            await self.workers[1].check(self.scene, clip, self.urls[1])
+        self.workers[1].http.assert_not_awaited()
+
+    async def test_worker_identity_prefers_explicit_id_then_pod_id(self):
+        with patch.dict(engine_module.os.environ, {"AVA_WORKER_ID": "worker-a", "RUNPOD_POD_ID": "pod-id"}):
+            worker = engine_module.Engine(self.store, self.temp.name, self.temp.name)
+            self.assertEqual("worker-a", worker.worker_id)
+        with patch.dict(engine_module.os.environ, {"AVA_WORKER_ID": "", "RUNPOD_POD_ID": "pod-id"}):
+            worker = engine_module.Engine(self.store, self.temp.name, self.temp.name)
+            self.assertEqual("pod-id", worker.worker_id)
+
+
+class StorageLockTests(Fixture, unittest.IsolatedAsyncioTestCase):
+    async def test_another_process_waits_for_the_shared_file_lock(self):
+        script = """
+import asyncio, importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('storage_lock', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+async def run():
+    try:
+        async with module.StorageLock(Path(sys.argv[2]), timeout=0.15):
+            print('acquired', flush=True)
+            if len(sys.argv) > 3:
+                os._exit(0)
+    except ValueError:
+        print('busy')
+asyncio.run(run())
+"""
+        path = self.store.path(".locks/test.lock")
+
+        async def probe(crash=False):
+            process = await asyncio.create_subprocess_exec(sys.executable, "-c", script, str(PACKAGE / "storage_lock.py"), str(path), *(["crash"] if crash else []),
+                                                           stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            output, error = await asyncio.wait_for(process.communicate(), 10)
+            self.assertEqual(0, process.returncode, error.decode())
+            return output.decode().strip()
+
+        async with storage_lock.StorageLock(path):
+            self.assertEqual("busy", await probe())
+        self.assertEqual("acquired", await probe())
+        self.assertEqual("acquired", await probe(crash=True))
+        self.assertEqual("acquired", await probe())
+
+
 class RouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         route_table = web.RouteTableDef()
@@ -434,6 +572,46 @@ class RouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(library_before, state["project"]["library"])
         self.assertEqual(1, len(state["workspace"]["referenceSlots"]))
         self.assertEqual(200, (await self.client.get("/ava-agent/scene-planning-skill")).status)
+
+    async def test_foreign_job_is_visible_without_starting_local_monitoring(self):
+        clip = core.import_plan(self.store, self.scene, self.plan)[0]
+        clip.update(status="queued", jobId="foreign", takeId="foreign_take", submittedSettings=core.DEFAULTS.copy(),
+                    jobOwner={"workerId": "other-pod", "comfyUrl": "http://127.0.0.1:8188"})
+        self.scene["paused"] = False
+        self.store.save_scene(self.scene)
+        self.eng.watch = Mock()
+        before = self.store.read(self.store.scene_dir(self.project["id"], self.scene["id"]) + "/scene.json")
+        state = await (await self.client.get("/ava-agent/state", params={"projectId": self.project["id"]})).json()
+        self.assertFalse(state["workspace"]["clips"][0]["canManageJob"])
+        self.eng.watch.assert_not_called()
+        for command in ("pause", "resume", "recover", "acknowledgeMissingJob"):
+            response = await self.post(command, clipId=clip["id"], jobId="foreign", confirmed=True)
+            self.assertEqual(400, response.status, command)
+            self.assertIn("belongs to pod other-pod", (await response.json())["error"])
+        self.assertEqual(before, self.store.read(self.store.scene_dir(self.project["id"], self.scene["id"]) + "/scene.json"))
+
+    async def test_local_job_monitoring_restores_after_restart(self):
+        clip = core.import_plan(self.store, self.scene, self.plan)[0]
+        base = str(self.client.make_url("")).rstrip("/")
+        clip.update(status="queued", jobId="local", jobOwner=self.eng.owner(base))
+        self.scene["paused"] = False
+        self.store.save_scene(self.scene)
+        self.eng.watch = Mock()
+        state = await (await self.client.get("/ava-agent/state", params={"projectId": self.project["id"]})).json()
+        self.assertTrue(state["workspace"]["clips"][0]["canManageJob"])
+        self.eng.watch.assert_called_once_with(self.project["id"], self.scene["id"], base)
+
+    async def test_resuming_an_untracked_job_claims_only_a_known_local_job(self):
+        clip = core.import_plan(self.store, self.scene, self.plan)[0]
+        clip.update(status="queued", jobId="local", takeId="take", submittedSettings=core.DEFAULTS.copy())
+        self.store.save_scene(self.scene)
+        self.eng.http = AsyncMock(side_effect=[{}, {"queue_running": [], "queue_pending": []}])
+        response = await self.post("resume", clipId=clip["id"])
+        self.assertEqual(400, response.status)
+        self.eng.http = AsyncMock(return_value={"local": {"outputs": {}}})
+        response = await self.post("resume", clipId=clip["id"])
+        self.assertEqual(200, response.status)
+        self.assertTrue(self.eng.owns((await response.json())["workspace"]["clips"][0], str(self.client.make_url("")).rstrip("/")))
 
     async def test_scene_reference_save_updates_all_clip_prompts_and_review_keys(self):
         plan = copy.deepcopy(self.plan)

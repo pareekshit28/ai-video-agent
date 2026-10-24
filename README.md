@@ -23,4 +23,12 @@ Reference slots are descriptive until you fill them from the selected project's 
 
 Previously completed takes remain playable at their saved durations. To regenerate one, set its next-take duration to 10 seconds or less and save a locked-shot prompt for review.
 
+## Shared storage across pods
+
+Different scenes can submit independently. On separate ComfyUI pods, scenes within the same project can render at the same time. The active-job guard applies only to the scene being submitted. One scene still permits only one active or unresolved job.
+
+Update this package on every pod, restart ComfyUI, and point each pod's `AVA_STORAGE_DIR` at the same shared directory. Jobs record their submitting worker; other pods display the shared status without polling their own queues for those jobs or offering pause/recovery controls. Use the submitting pod to manage an active job. An older job without recorded ownership requires **Resume existing job / saving** on its original pod; the agent checks local queue/history or saved output before claiming it.
+
+Worker identity uses `AVA_WORKER_ID`, then `RUNPOD_POD_ID` when present, otherwise the machine hostname. If needed, set a distinct, stable `AVA_WORKER_ID` for each pod before starting ComfyUI, such as `render-pod-a` and `render-pod-b`. Keep it unchanged across ComfyUI restarts and never share an identity between live pods. Shared storage must support OS file locks; project and scene writes coordinate through the `.locks` directory, and the OS releases held locks if a process exits.
+
 The app runs CPU-only contract and browser fixture tests locally. Rendering on a RunPod GPU must be verified on the target pod.

@@ -580,7 +580,7 @@ def archive_take(clip):
     versions = clip.setdefault("versions", [])
     if clip.get("takeId"):
         versions.append({k: copy.deepcopy(v) for k, v in clip.items() if k != "versions"})
-    for key in ("jobId", "takeId", "source", "video", "frame", "extractedFrame", "error", "actualDuration", "submittedPrompt", "submittedSettings", "submittedReferences", "submittedFrame", "storageSceneId", "storageClipId", "approvedKey", "timing"):
+    for key in ("jobId", "jobOwner", "takeId", "source", "video", "frame", "extractedFrame", "error", "actualDuration", "submittedPrompt", "submittedSettings", "submittedReferences", "submittedFrame", "storageSceneId", "storageClipId", "approvedKey", "timing"):
         clip.pop(key, None)
     clip["duration"] = clip.pop("nextDuration", clip["duration"])
 

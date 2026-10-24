@@ -1,25 +1,69 @@
 """Sequential job lifecycle; every render requires an explicit clip approval."""
 import asyncio
 import copy
+from contextlib import asynccontextmanager
+import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
+import socket
 import time
 from urllib.parse import quote
 
 import aiohttp
 
 from . import core, media as video_media, timing
+from .storage_lock import StorageLock
 
 
 class Engine:
-    def __init__(self, store, input_dir, output_dir):
+    def __init__(self, store, input_dir, output_dir, worker_id=None):
         self.store, self.input_dir, self.output_dir = store, Path(input_dir), Path(output_dir).resolve()
         self.locks, self.tasks = {}, {}
-        self.submit_lock = asyncio.Lock()
+        self.worker_id = worker_id or os.getenv("AVA_WORKER_ID") or os.getenv("RUNPOD_POD_ID") or socket.gethostname()
 
-    def lock(self, scene_id):
-        return self.locks.setdefault(scene_id, asyncio.Lock())
+    @asynccontextmanager
+    async def lock(self, scene_id):
+        async with self.locks.setdefault(scene_id, asyncio.Lock()):
+            key = hashlib.sha256(scene_id.encode()).hexdigest()
+            async with StorageLock(self.store.path(f".locks/{key}.lock")):
+                yield
+
+    def owner(self, base_url):
+        return {"workerId": self.worker_id, "serverId": hashlib.sha256(base_url.rstrip("/").encode()).hexdigest()}
+
+    def owns(self, clip, base_url):
+        return clip.get("jobOwner") == self.owner(base_url)
+
+    def require_owner(self, clip, base_url):
+        if clip.get("jobOwner") and not self.owns(clip, base_url):
+            raise ValueError(f"This job belongs to pod {clip['jobOwner']['workerId']}. Open that pod to manage it. Other scenes can render on this pod.")
+
+    def saved_output(self, scene, clip):
+        directory = self.output_dir / "ai_video_agent/raw" / clip.get("storageSceneId", scene["id"])
+        candidates = [p for p in directory.glob(f"{clip.get('storageClipId', clip['id'])}-{clip['takeId']}_*")
+                      if p.suffix.lower() in (".mp4", ".webm", ".mov") and p.is_file()]
+        return candidates[0] if len(candidates) == 1 else None
+
+    async def claim_legacy_job(self, scene, clip, base_url):
+        """Explicit resume can adopt an older job only with evidence on this pod."""
+        self.require_owner(clip, base_url)
+        if clip.get("jobOwner"):
+            return
+        local = bool(clip.get("source") and self.store.path(clip["source"]["path"]).is_file())
+        if not local:
+            job_id = core.identifier(clip["jobId"])
+            history = await self.http("GET", base_url + "/history/" + quote(job_id))
+            local = job_id in history
+            if not local:
+                queue = await self.http("GET", base_url + "/queue")
+                local = any(row[1] == job_id for name in ("queue_running", "queue_pending") for row in queue.get(name, []))
+            if not local:
+                local = self.saved_output(scene, clip) is not None
+        if not local:
+            raise ValueError("This older job was not found on this pod. Resume it on the pod that submitted it, or recover a known job ID from this pod.")
+        clip["jobOwner"] = self.owner(base_url)
 
     async def http(self, method, url, **kwargs):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
@@ -37,9 +81,12 @@ class Engine:
         self.store.save_scene(scene)
 
     async def submit(self, scene, clip, base_url):
-        async with self.submit_lock:
-            if any(c["status"] in core.ACTIVE for p in self.store.projects() for s in self.store.scenes(p["id"]) for c in s["clips"]):
-                raise ValueError("Finish or recover the current job before approving another render")
+        async with self.lock("submit:" + scene["id"]):
+            current = self.store.scene(scene["projectId"], scene["id"])
+            if any(c["status"] in core.ACTIVE for c in current["clips"]):
+                raise ValueError("Finish or recover the current job in this scene before approving another clip. Other scenes can render independently.")
+            if current.get("updatedAt") != scene.get("updatedAt"):
+                raise ValueError("This scene changed on another pod. Refresh and review the clip again.")
             core.ensure_ready(self.store, scene, clip)
             reviewed_key = core.approval_key(self.store, scene, clip)
             take_id, prompt_id = core.uid(), str(__import__("uuid").uuid4())
@@ -58,7 +105,7 @@ class Engine:
             core.archive_take(clip)
             clip.update(takeId=take_id, status="submitting", approvedKey=reviewed_key, submittedPrompt=core.final_prompt(scene, clip),
                         submittedSettings=copy.deepcopy(scene["settings"]), submittedReferences=copy.deepcopy(core.selected(scene, clip)), submittedFrame=frame_reference, jobId=prompt_id,
-                        timing={"submittedAt": time.time()})
+                        timing={"submittedAt": time.time()}, jobOwner=self.owner(base_url))
             scene["paused"] = False
             self.store.save_scene(scene)  # Durable reservation BEFORE the only submit attempt.
             request_path = self.store.scene_dir(scene["projectId"], scene["id"]) + f"/requests/{take_id}.json"
@@ -82,6 +129,9 @@ class Engine:
             self.watch(scene["projectId"], scene["id"], base_url)
 
     def watch(self, project_id, scene_id, base_url):
+        scene = self.store.scene(project_id, scene_id)
+        if not any(c["status"] in core.ACTIVE and self.owns(c, base_url) for c in scene["clips"]):
+            return
         if scene_id not in self.tasks or self.tasks[scene_id].done():
             self.tasks[scene_id] = asyncio.create_task(self.monitor(project_id, scene_id, base_url))
 
@@ -91,7 +141,7 @@ class Engine:
                 async with self.lock(scene_id):
                     scene = self.store.scene(project_id, scene_id)
                     clip = next((c for c in scene["clips"] if c["status"] in core.ACTIVE), None)
-                    if not clip or scene.get("paused"):
+                    if not clip or scene.get("paused") or not self.owns(clip, base_url):
                         return
                     if clip["status"] in ("submission-unknown", "submitting", "recoverable"):
                         return
@@ -114,6 +164,7 @@ class Engine:
             raise
 
     async def check(self, scene, clip, base_url):
+        self.require_owner(clip, base_url)
         if clip["submittedSettings"]["provider"] != "h3":
             raise ValueError("This saved job uses an unsupported renderer. Its files are retained; use an H3 scene.")
         if not clip.get("source"):
@@ -127,11 +178,9 @@ class Engine:
                 if not (running or pending):
                     # Comfy history is in memory. A pod restart can lose history while
                     # leaving SaveVideo's unique take output on the mounted volume.
-                    directory = self.output_dir / "ai_video_agent/raw" / clip.get("storageSceneId", scene["id"])
-                    candidates = [p for p in directory.glob(f"{clip.get('storageClipId', clip['id'])}-{clip['takeId']}_*") if p.suffix.lower() in (".mp4", ".webm", ".mov") and p.is_file()]
-                    if len(candidates) != 1:
+                    saved = self.saved_output(scene, clip)
+                    if saved is None:
                         raise ValueError("Job is absent from queue/history and no unique saved take output was found. Recover the existing job ID; no resubmission occurred.")
-                    saved = candidates[0]
                     record = {"outputs": {"92": {"videos": [{"filename": saved.name, "subfolder": str(saved.parent.relative_to(self.output_dir)), "type": "output"}]}}}
                 else:
                     clip["status"] = "rendering" if running else "queued"

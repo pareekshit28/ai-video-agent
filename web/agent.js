@@ -242,7 +242,7 @@ function connection() {
   const result = $("pre", { class: "ava-diagnostics", text: diagnostics || "Check the pod's models, nodes and media tools." });
   return card(heading("RunPod setup", "FastH3 renders inside ComfyUI."),
     button("Check installation", async () => { diagnostics = JSON.stringify(await request(`/health?projectId=${encodeURIComponent(projectId)}`), null, 2); result.textContent = diagnostics; }), result,
-    note(`Storage on pod: ${state.storage}. Use a RunPod persistent volume.`));
+    note(`${state.workerId ? `This pod: ${state.workerId}. ` : ""}Storage: ${state.storage}. Use a RunPod persistent volume.`));
 }
 
 function projectControls() {
@@ -418,6 +418,8 @@ function clipEditor(clip, index) {
   const editor = card(eyebrow(`CLIP ${String(index + 1).padStart(2, "0")} / ${String(scene.clips.length).padStart(2, "0")}`), $("h3", { text: `${index + 1}. ${clip.title}` }), statusPanel(clip, true), note(`${clip.transition} · ${clip.actualDuration ? `${clip.actualDuration.toFixed(2)}s saved` : `${clip.duration}s planned`}`),
     clip.continuityOutdated && note("An earlier take or frame changed. This completed take is retained; review continuity before regenerating."),
     clip.error && $("p", { class: "ava-error", text: clip.error }),
+    active.has(clip.status) && clip.canManageJob === false && note(`Rendering on pod ${clip.jobOwner.workerId}. Open that pod to pause or recover this job. Other scenes can render here.`),
+    active.has(clip.status) && !clip.jobOwner && note("This older job has no recorded pod. Resume monitoring on the pod that submitted it."),
     clip.video && $("video", { src: mediaUrl(clip.video), controls: true, preload: "metadata" }),
     field("Editable H3 prompt", prompt),
     note("Each clip is 2–10 seconds in one static locked-off shot. Begin the scene prose with “Static locked-off shot.”"),
@@ -439,8 +441,8 @@ function clipEditor(clip, index) {
       }
       await action("approveGenerate", { clipId: clip.id, reviewKey: saved.reviewKey });
     }, "ava-primary", !active.has(clip.status)),
-    active.has(clip.status) && row(button("Pause monitoring", () => action("pause")), button("Resume existing job / saving", () => action("resume", { clipId: clip.id }))),
-    active.has(clip.status) && $("details", {}, $("summary", { text: "Recover an existing job" }), (() => {
+    active.has(clip.status) && clip.canManageJob !== false && row(button("Pause monitoring", () => action("pause", { clipId: clip.id })), button("Resume existing job / saving", () => action("resume", { clipId: clip.id }))),
+    active.has(clip.status) && clip.canManageJob !== false && $("details", {}, $("summary", { text: "Recover an existing job" }), (() => {
       const job = input(clip.jobId || "");
       return $("div", {}, field("ComfyUI prompt ID", job), button("Recover & monitor this job", () => action("recover", { clipId: clip.id, jobId: job.value })),
         button("I checked the queue: release missing job…", async () => {

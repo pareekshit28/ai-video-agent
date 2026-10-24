@@ -92,11 +92,11 @@ async def state(request):
     # Restore monitoring after a server restart, never resubmit a render.
     for watched_project in projects:
         for watched_scene in eng.store.scenes(watched_project["id"]):
-            if not watched_scene.get("paused") and any(c["status"] in core.ACTIVE for c in watched_scene["clips"]):
+            if not watched_scene.get("paused") and any(c["status"] in core.ACTIVE and eng.owns(c, base_url(request)) for c in watched_scene["clips"]):
                 eng.watch(watched_project["id"], watched_scene["id"], base_url(request))
     summaries = [{k: p[k] for k in ("id", "name", "createdAt")} for p in projects]
-    return web.json_response({"projects": summaries, "project": project, "scenes": scenes, "workspace": public_scene(eng, workspace) if workspace else None,
-                              "videos": videos, "storage": str(eng.store.root)}, headers={"Cache-Control": "no-store"})
+    return web.json_response({"projects": summaries, "project": project, "scenes": scenes, "workspace": public_scene(eng, workspace, base_url(request)) if workspace else None,
+                              "videos": videos, "storage": str(eng.store.root), "workerId": eng.worker_id}, headers={"Cache-Control": "no-store"})
 
 
 @PromptServer.instance.routes.get("/ava-agent/health")
@@ -110,7 +110,7 @@ async def health(request):
                 "vae": [template["119"]["inputs"]["vae_name"], template["120"]["inputs"]["vae_name"]]}
     missing_models = [name for kind, names in required.items() for name in names if name not in folder_paths.get_filename_list(kind)]
     result = {"missingNodes": missing, "missingModels": missing_models, "ffmpeg": bool(shutil.which(os.getenv("FFMPEG_PATH", "ffmpeg"))),
-              "ffprobe": bool(shutil.which(os.getenv("FFPROBE_PATH", "ffprobe")))}
+              "ffprobe": bool(shutil.which(os.getenv("FFPROBE_PATH", "ffprobe"))), "workerId": eng.worker_id}
     return web.json_response(result)
 
 
@@ -146,6 +146,7 @@ async def action(request):
                 selected_id = matching[0]
         scene = store.workspace(project_id, selected_id)
         async with eng.lock(scene["id"]):
+            scene = store.scene(project_id, scene["id"])
             project = store.project(project_id)
             if command == "renameProject":
                 project["name"] = core.text(body["name"], 120)
@@ -248,18 +249,22 @@ async def action(request):
                         raise ValueError("The saved clip or previous clip frame changed. Save, review it, and approve again.")
                     await eng.submit(scene, clip, base)
                 elif command == "pause":
+                    eng.require_owner(clip, base)
                     scene["paused"] = True
                 elif command in ("resume", "recover"):
+                    eng.require_owner(clip, base)
                     if clip["status"] not in core.ACTIVE or not clip.get("submittedSettings"):
                         raise ValueError("Only an unresolved submitted job can be recovered")
                     if command == "recover":
                         clip["jobId"] = core.identifier(body["jobId"])
                     if not clip.get("jobId"):
                         raise ValueError("Recover a known job ID first")
+                    await eng.claim_legacy_job(scene, clip, base)
                     clip.update(status="saving" if clip.get("source") else "queued")
                     clip.pop("error", None)
                     scene["paused"] = False
                 elif command == "acknowledgeMissingJob":
+                    eng.require_owner(clip, base)
                     if clip["status"] not in core.ACTIVE or body.get("confirmed") is not True:
                         raise ValueError("Explicitly confirm the old job cannot produce another result")
                     clip.update(status="failed", error="User checked the queue and released the unresolved submission")
@@ -272,15 +277,17 @@ async def action(request):
             store.save_scene(scene)
             if command in ("resume", "recover"):
                 eng.watch(project_id, scene["id"], base)
-            return web.json_response({"workspace": public_scene(eng, scene)})
+            return web.json_response({"workspace": public_scene(eng, scene, base_url(request))})
 
 
-def public_scene(eng, scene):
+def public_scene(eng, scene, base):
     from . import timing
     result = copy.deepcopy(scene)
     for field in ("references", "settings", "script", "summary", "imports", "planning", "episodeId"):
         result.pop(field, None)
     for clip in result["clips"]:
+        if clip["status"] in core.ACTIVE:
+            clip["canManageJob"] = not clip.get("jobOwner") or eng.owns(clip, base)
         clip["timing"] = timing.public(clip)
         clip["previousFrame"] = core.previous_frame(scene, clip)
         try:
