@@ -1,4 +1,4 @@
-"""CPU contract tests for project-only ChatGPT plan imports and saved frames."""
+"""CPU contract tests for project scenes, ChatGPT plan imports and saved frames."""
 import asyncio
 import copy
 import importlib
@@ -22,6 +22,7 @@ sys.modules[namespace.__name__] = namespace
 core = importlib.import_module(namespace.__name__ + ".core")
 engine_module = importlib.import_module(namespace.__name__ + ".engine")
 media = importlib.import_module(namespace.__name__ + ".media")
+nodes = importlib.import_module(namespace.__name__ + ".nodes")
 
 
 class Fixture:
@@ -130,11 +131,39 @@ class CoreTests(Fixture, unittest.TestCase):
         self.assertEqual(["actor"], [r["id"] for r in self.store.project(self.project["id"])["library"]])
         self.assertTrue(self.store.path(path).is_file())
 
-    def test_first_project_clip_cannot_request_continuity(self):
+    def test_first_scene_clip_cannot_request_continuity(self):
         plan = copy.deepcopy(self.plan)
         plan["clips"][0]["use_last_frame"] = True
-        with self.assertRaisesRegex(ValueError, "first project clip"):
+        with self.assertRaisesRegex(ValueError, "first scene clip"):
             core.import_plan(self.store, self.scene, plan)
+
+    def test_scenes_are_independent_and_share_only_project_library(self):
+        second = self.store.create_scene(self.project["id"], "Departure")
+        self.assertEqual([self.scene["id"], second["id"]], [s["id"] for s in self.store.scenes(self.project["id"])])
+        self.assertEqual([], second["clips"])
+        core.import_plan(self.store, second, self.plan)
+        self.store.save_scene(second)
+        self.assertEqual([], self.store.workspace(self.project["id"])["clips"])
+        self.assertEqual(2, len(self.store.workspace(self.project["id"], second["id"])["clips"]))
+        self.assertEqual(["actor"], [r["id"] for r in self.store.project(self.project["id"])["library"]])
+        other = self.store.create_project("Other")
+        with self.assertRaisesRegex(ValueError, "Scene does not belong"):
+            self.store.workspace(other["id"], second["id"])
+
+    def test_canvas_reviewed_clip_resolves_its_scene(self):
+        second = self.store.create_scene(self.project["id"], "Departure")
+        second["references"] = [copy.deepcopy(self.ref)]
+        clip = core.import_plan(self.store, second, self.plan)[0]
+        clip["referenceSlots"] = core.bind_slots(second, clip, [
+            {"tag": "Image 1", "referenceId": "actor", "assetPath": self.ref["assets"][0]["path"]}])
+        clip["referenceIds"] = ["actor"]
+        clip["promptContext"] = core.prompt_context(self.store, second, clip)
+        self.store.save_scene(second)
+        key = core.approval_key(self.store, second, clip)
+        with patch.object(nodes, "store", return_value=self.store):
+            prompt, seconds, steps = nodes.ReviewedClip().run(self.project["id"], clip["id"], key)
+        self.assertIn("Static locked-off shot", prompt)
+        self.assertEqual((5, 8), (seconds, steps))
 
     def test_bad_media_binding_and_duration_rejected(self):
         self.assertEqual(10, core.duration(10))
@@ -224,6 +253,7 @@ class CoreTests(Fixture, unittest.TestCase):
         legacy = self.store.workspace(project["id"])
         saved = self.store.project(project["id"])
         saved.pop("workspaceId")
+        saved.pop("sceneIds")
         saved["episodes"] = [{"id": "episode_1", "name": "Episode 1"}]
         self.store.write(f"projects/{project['id']}/project.json", saved)
         legacy["clips"] = [{"id": "old", "title": "Saved", "duration": 2, "referenceIds": [], "status": "complete", "versions": [],
@@ -238,6 +268,7 @@ class CoreTests(Fixture, unittest.TestCase):
         first = self.store.workspace(project["id"])
         saved = self.store.project(project["id"])
         saved.pop("workspaceId")
+        saved.pop("sceneIds")
         self.store.write(f"projects/{project['id']}/project.json", saved)
         first["clips"] = [{"id": "same", "title": "First", "duration": 2, "referenceIds": [], "status": "complete", "versions": [],
                            "takeId": "take_a", "frame": {"path": f"projects/{project['id']}/a.jpg"}, "video": {"path": f"projects/{project['id']}/a.mp4"}}]
@@ -250,6 +281,7 @@ class CoreTests(Fixture, unittest.TestCase):
         second_clip = next(c for c in migrated["clips"] if c["title"] == "Second")
         self.assertEqual("another", second_clip["storageSceneId"])
         self.assertEqual("same", second_clip["storageClipId"])
+        self.assertEqual([migrated["id"]], [s["id"] for s in self.store.scenes(project["id"])])
         self.assertEqual([], self.store.project(project["id"])["library"])
 
 
@@ -279,7 +311,7 @@ class RouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
     async def post(self, command, **values):
         return await self.client.post("/ava-agent/action", json={"projectId": self.project["id"], "action": command, **values})
 
-    async def test_import_retry_is_idempotent_and_state_is_project_only(self):
+    async def test_import_retry_is_idempotent_and_state_has_scenes(self):
         first = await self.post("importPlan", plan=self.plan, requestId="one")
         self.assertEqual(200, first.status)
         second = await self.post("importPlan", plan=self.plan, requestId="one")
@@ -287,9 +319,37 @@ class RouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
         state = await (await self.client.get("/ava-agent/state?projectId=" + self.project["id"])).json()
         self.assertEqual(2, len(state["workspace"]["clips"]))
         self.assertNotIn("episodes", state)
-        self.assertNotIn("scenes", state)
+        self.assertEqual([self.scene["id"]], [s["id"] for s in state["scenes"]])
         self.assertNotIn("planner", state)
         self.assertEqual(200, (await self.client.get("/ava-agent/scene-planning-skill")).status)
+
+    async def test_create_scene_selects_clip_scope_and_keeps_project_videos(self):
+        created = await (await self.post("createScene", name="Departure")).json()
+        scene_id = created["scene"]["id"]
+        response = await self.post("importPlan", sceneId=scene_id, plan=self.plan, requestId="one")
+        self.assertEqual(200, response.status)
+        default = await (await self.client.get("/ava-agent/state", params={"projectId": self.project["id"]})).json()
+        selected = await (await self.client.get("/ava-agent/state", params={"projectId": self.project["id"], "sceneId": scene_id})).json()
+        self.assertEqual([], default["workspace"]["clips"])
+        self.assertEqual(2, len(selected["workspace"]["clips"]))
+        self.assertEqual(["Scene 1", "Departure"], [s["name"] for s in selected["scenes"]])
+        saved_scene = self.store.workspace(self.project["id"], scene_id)
+        clip = saved_scene["clips"][0]
+        self.frame("scene_take", clip)
+        self.store.save_scene(saved_scene)
+        videos = await (await self.client.get("/ava-agent/state", params={"projectId": self.project["id"]})).json()
+        self.assertEqual("Departure", videos["videos"][0]["sceneName"])
+        other = self.store.create_project("Other")
+        denied = await self.client.post("/ava-agent/action", json={"action": "saveSettings", "projectId": other["id"], "sceneId": scene_id, "settings": core.DEFAULTS})
+        self.assertEqual(400, denied.status)
+
+    async def test_library_reference_in_another_scene_cannot_be_removed(self):
+        second = self.store.create_scene(self.project["id"], "Departure")
+        clip = core.import_plan(self.store, second, self.plan)[0]
+        clip["referenceIds"] = [self.ref["id"]]
+        self.store.save_scene(second)
+        response = await self.post("removeLibrary", referenceId=self.ref["id"])
+        self.assertEqual(400, response.status)
 
     async def test_save_approve_is_review_bound(self):
         await self.post("importPlan", plan=self.plan, requestId="one")

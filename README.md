@@ -8,9 +8,9 @@ Place this directory under `ComfyUI/custom_nodes/ComfyUI-AI-Video-Agent`, instal
 
 ## Plan and render
 
-1. In the AI Video Agent sidebar, create a project. Projects have separate reference and video libraries. Existing episode/scene data is preserved and presented in one project workspace on first access.
+1. In the AI Video Agent sidebar, create a project, then select its initial scene or use **Create new scene**. Scenes keep their clips and continuity separate. The reference library and saved videos belong to the project. Existing episode/scene data is preserved in the initial scene on first access.
 2. Give ChatGPT your scene and the [scene-planning skill](skills/comfyui-scene-planner/SKILL.md). It identifies the needed character, location and prop image/audio slots without knowing what is already in your library. Attach the skill to a ChatGPT Project and instruct it to use it for every scene.
-3. Paste ChatGPT's JSON into **Import a scene**. Each clip provides `duration`, ordered `references` slots, `prompt` and `use_last_frame`. The agent shows each slot; select a matching item and file from this project's Characters, Locations or Props library. Create or upload the needed library item if absent. Edit the prompt, duration or continuity choice, then save, review and approve the render. Imports append clips and keep previous takes.
+3. Select the intended scene and paste ChatGPT's JSON into **Import clips**. Each clip provides `duration`, ordered `references` slots, `prompt` and `use_last_frame`. The agent shows each slot; select a matching item and file from this project's Characters, Locations or Props library. Create or upload the needed library item if absent. Edit the prompt, duration or continuity choice, then save, review and approve the render. Imports append clips only to the selected scene and keep previous takes. Last-frame continuity uses the immediately preceding clip in that scene.
 4. The completed video plays in the clip and Saved videos sections. Its extracted last frame stays with that saved clip. A clip with `use_last_frame: true` uses the immediately preceding clip's saved final frame at review and render time. If the preceding clip is regenerated, save and review the following clip again.
 
 Example:

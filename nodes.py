@@ -27,8 +27,12 @@ class ReviewedClip:
 
     def run(self, project_id, clip_id, review_key):
         state = store()
-        scene = state.workspace(project_id)
-        clip = next(c for c in scene["clips"] if c["id"] == clip_id)
+        state.workspace(project_id)
+        matches = [(scene, clip) for scene in state.scenes(project_id)
+                   for clip in scene["clips"] if clip["id"] == clip_id]
+        if len(matches) != 1:
+            raise ValueError("Reviewed clip was not found uniquely in this project")
+        scene, clip = matches[0]
         core.ensure_ready(state, scene, clip)
         if not review_key or review_key != core.approval_key(state, scene, clip):
             raise ValueError("Save and review this clip in the AI Video Agent workspace, then copy its review key")

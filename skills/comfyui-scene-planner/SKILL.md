@@ -35,11 +35,11 @@ After the header, begin scene prose with the exact sentence `Static locked-off s
 
 Prefer one clip if the complete scene fits naturally in one locked shot lasting 2–10 seconds. Otherwise use the fewest natural 2–10 second clips, each with a single fixed composition. Split at a useful beat without rushing or omitting action or dialogue. Write complete prompts for later clips now; the user can revise them after rendering the preceding clip.
 
-Set `use_last_frame` to `true` only when continuous action should start from the immediately preceding clip's saved final frame. Continue its physical state without replaying completed action or dialogue. If the frame has not been shown to you, do not invent observed pose, gaze or objects. Set it to `false` for a new composition, time jump or incompatible predecessor. The first clip of a project must use `false`; the first clip of an appended scene can use `true` if the project's previous clip is its intended predecessor.
+Set `use_last_frame` to `true` only when continuous action should start from the immediately preceding clip in the same scene's saved final frame. Continue its physical state without replaying completed action or dialogue. If the frame has not been shown to you, do not invent observed pose, gaze or objects. Set it to `false` for a new composition, time jump or incompatible predecessor. The first clip of every new scene must use `false`; an appended import can use `true` for its first clip when that scene already has a preceding clip.
 
 ## Output contract
 
-When the scene is sufficiently specified, return JSON only, with no Markdown fence. `version` is integer `1`; `clips` contains 1–40 objects. `scene` and `title` are optional labels. Each clip requires `duration` (number, 2–10), `references` (ordered array of `{tag,name,type}` slots), `use_last_frame` (boolean) and `prompt` (nonempty string, at most 12000 characters). Escape newlines and dialogue quotes as valid JSON. A clip with no references has no declaration header and begins directly with `Static locked-off shot.`
+When the scene is sufficiently specified, return JSON only, with no Markdown fence. The user creates or selects a scene under their project before importing; the JSON `scene` label does not create or select one. `version` is integer `1`; `clips` contains 1–40 objects. `scene` and `title` are optional labels. Each clip requires `duration` (number, 2–10), `references` (ordered array of `{tag,name,type}` slots), `use_last_frame` (boolean) and `prompt` (nonempty string, at most 12000 characters). Escape newlines and dialogue quotes as valid JSON. A clip with no references has no declaration header and begins directly with `Static locked-off shot.`
 
 ```json
 {

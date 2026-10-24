@@ -28,6 +28,7 @@ const note = text => $("p", { class: "ava-note", text });
 const mediaUrl = asset => api.apiURL(`${prefix}/media?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(asset.path)}`);
 
 let workspace, message, content, projectHost, navigation, livePanel, openButton, projectId = localStorage.getItem("ava-project") || "";
+let sceneId = projectId ? localStorage.getItem(`ava-scene-${projectId}`) || "" : "";
 let state, scene, busy = false, dirty = false, modal, poller, refreshing = false, sidebarHost, diagnostics;
 let renderedSnapshot = "", sceneReceivedAt = Date.now() / 1000;
 let refreshDone = Promise.resolve();
@@ -202,15 +203,21 @@ async function run(work) {
   finally { busy = false; content.inert = false; projectHost.inert = false; workspace.setAttribute("aria-busy", "false"); workspace.querySelectorAll("button").forEach(b => { b.disabled = b.dataset.unavailable === "true"; }); }
 }
 async function action(command, values = {}) {
-  return request("/action", { action: command, projectId, ...values });
+  return request("/action", { action: command, projectId, sceneId, ...values });
 }
 async function chooseProject(id) {
   await refreshDone;
-  projectId = id; scene = null; diagnostics = null;
+  projectId = id; sceneId = id ? localStorage.getItem(`ava-scene-${id}`) || "" : ""; scene = null; diagnostics = null;
   localStorage.setItem("ava-project", id);
   if (!id) switchSection("agent");
 }
-const scopeQuery = () => new URLSearchParams({ projectId }).toString();
+async function chooseScene(id) {
+  await refreshDone;
+  sceneId = id; scene = null;
+  localStorage.setItem(`ava-scene-${projectId}`, id);
+  switchSection("agent");
+}
+const scopeQuery = () => new URLSearchParams({ projectId, ...(sceneId ? { sceneId } : {}) }).toString();
 
 async function refresh(force = false) {
   if (refreshing) { await refreshDone; if (force) return refresh(true); return; }
@@ -218,8 +225,9 @@ async function refresh(force = false) {
   let finish; refreshDone = new Promise(resolve => { finish = resolve; });
   try {
     state = await request(`/state${projectId ? `?${scopeQuery()}` : ""}`);
-    if (projectId && !state.projects.some(p => p.id === projectId)) { projectId = ""; diagnostics = null; localStorage.removeItem("ava-project"); }
+    if (projectId && !state.projects.some(p => p.id === projectId)) { projectId = ""; sceneId = ""; diagnostics = null; localStorage.removeItem("ava-project"); }
     scene = state.workspace;
+    if (scene && projectId) { sceneId = scene.id; localStorage.setItem(`ava-scene-${projectId}`, sceneId); }
     sceneReceivedAt = Date.now() / 1000;
     if (message.textContent === "Loading…") message.textContent = "Ready";
     const running = scene?.clips.find(c => active.has(c.status));
@@ -240,10 +248,16 @@ function connection() {
 function projectControls() {
   const projects = select([{ id: "", name: "Select project" }, ...state.projects], projectId);
   projects.onchange = () => run(() => chooseProject(projects.value));
+  const scenes = state.project ? select(state.scenes || [], sceneId) : null;
+  if (scenes) scenes.onchange = () => run(() => chooseScene(scenes.value));
   return card(eyebrow("PROJECT"), row(field("Project", projects), button("Create new project", async () => {
     const name = prompt("New project name", `Project ${state.projects.length + 1}`);
     if (name === null) return false;
     const result = await action("createProject", { name }); await chooseProject(result.project.id); switchSection("agent");
+  })), state.project && row(field("Scene", scenes), button("Create new scene", async () => {
+    const name = prompt("New scene name", `Scene ${(state.scenes || []).length + 1}`);
+    if (name === null) return false;
+    const result = await action("createScene", { name }); await chooseScene(result.scene.id);
   })));
 }
 
@@ -329,7 +343,7 @@ function planImporter() {
   json.placeholder = '{"version":1,"scene":"Scene name","clips":[{"title":"Opening","duration":5,"references":[{"tag":"Image 1","name":"Mara","type":"character"}],"use_last_frame":false,"prompt":"Image 1: Mara (character)\\n\\nStatic locked-off shot. Mara enters the frame..."}]}';
   let requestId;
   json.addEventListener("input", () => { requestId = null; });
-  return card(eyebrow("01 / IMPORT"), heading("Import a scene from ChatGPT", "Give ChatGPT the scene and planning skill. Import its clip JSON, then fill each reference slot from this project's library."),
+  return card(eyebrow("01 / IMPORT"), heading(`Import clips into ${scene.name}`, "Give ChatGPT the scene and planning skill. Import its clip JSON into this scene, then fill each reference slot from this project's library."),
     $("a", { href: api.apiURL(`${prefix}/scene-planning-skill`), download: "comfyui-scene-planner.md", text: "Download ChatGPT scene-planning skill" }),
     field("Scene JSON", json),
     note("ChatGPT identifies required character, location and prop references without seeing your library. Imports append clips and retain saved takes."),

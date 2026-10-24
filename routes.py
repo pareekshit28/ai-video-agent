@@ -71,23 +71,32 @@ async def state(request):
     projects = eng.store.projects()
     project_id = request.query.get("projectId")
     project = next((p for p in projects if p["id"] == project_id), None)
-    workspace, videos = None, []
+    workspace, videos, scenes = None, [], []
     if project:
         async with eng.lock(project_id):
-            workspace = eng.store.workspace(project_id)
+            eng.store.workspace(project_id)
+            all_scenes = eng.store.scenes(project_id)
+            requested_scene = request.query.get("sceneId")
+            selected_id = requested_scene if requested_scene in {s["id"] for s in all_scenes} else None
+            workspace = eng.store.workspace(project_id, selected_id)
             project = eng.store.project(project_id)
             workspace["references"] = [copy.deepcopy(r) for r in project["library"] if r["kind"] != "last-frame"]
-            for clip in workspace["clips"]:
-                for take in [clip, *clip.get("versions", [])]:
-                    if take.get("video"):
-                        videos.append({k: take.get(k) for k in ("id", "title", "video", "duration", "actualDuration", "timing", "sceneName")})
+            scenes = [{"id": s["id"], "name": s["name"], "createdAt": s["createdAt"],
+                       "clipCount": len(s["clips"]), "completeCount": sum(c["status"] == "complete" for c in s["clips"])} for s in all_scenes]
+            for saved_scene in all_scenes:
+                for clip in saved_scene["clips"]:
+                    for take in [clip, *clip.get("versions", [])]:
+                        if take.get("video"):
+                            video = {k: take.get(k) for k in ("id", "title", "video", "duration", "actualDuration", "timing")}
+                            video["sceneName"] = saved_scene["name"]
+                            videos.append(video)
     # Restore monitoring after a server restart, never resubmit a render.
     for watched_project in projects:
         for watched_scene in eng.store.scenes(watched_project["id"]):
             if not watched_scene.get("paused") and any(c["status"] in core.ACTIVE for c in watched_scene["clips"]):
                 eng.watch(watched_project["id"], watched_scene["id"], base_url(request))
     summaries = [{k: p[k] for k in ("id", "name", "createdAt")} for p in projects]
-    return web.json_response({"projects": summaries, "project": project, "workspace": public_scene(eng, workspace) if workspace else None,
+    return web.json_response({"projects": summaries, "project": project, "scenes": scenes, "workspace": public_scene(eng, workspace) if workspace else None,
                               "videos": videos, "storage": str(eng.store.root)}, headers={"Cache-Control": "no-store"})
 
 
@@ -127,13 +136,21 @@ async def action(request):
         return web.json_response({"project": store.create_project(body.get("name"))})
     project_id = core.identifier(body.get("projectId"))
     async with eng.lock(project_id):
-        scene = store.workspace(project_id)
+        if command == "createScene":
+            created = store.create_scene(project_id, body.get("name"))
+            return web.json_response({"scene": {"id": created["id"], "name": created["name"]}})
+        selected_id = body.get("sceneId")
+        if not selected_id and body.get("clipId"):
+            matching = [saved["id"] for saved in store.scenes(project_id)
+                        if any(clip["id"] == body["clipId"] for clip in saved["clips"])]
+            if len(matching) == 1:
+                selected_id = matching[0]
+        scene = store.workspace(project_id, selected_id)
         async with eng.lock(scene["id"]):
             project = store.project(project_id)
             scene["references"] = [copy.deepcopy(r) for r in project["library"] if r["kind"] != "last-frame"]
             if command == "renameProject":
                 project["name"] = core.text(body["name"], 120)
-                scene["name"] = project["name"]
                 store.write(f"projects/{project_id}/project.json", project)
             elif command == "deleteProject":
                 store.trash_project(project_id)
@@ -148,11 +165,12 @@ async def action(request):
                     item = next(r for r in project["library"] if r["id"] == body["referenceId"])
                     if item["kind"] == "last-frame":
                         raise ValueError("Last frames are retained with their rendered takes")
-                    check_mutable(scene)
+                    for saved in store.scenes(project_id):
+                        check_mutable(saved)
                     if command == "cloneLibrary":
                         project["library"].append({**copy.deepcopy(item), "id": core.uid(), "name": (item["name"] + " (copy)")[:120]})
                     else:
-                        if any(item["id"] in c["referenceIds"] for c in scene["clips"]):
+                        if any(item["id"] in c["referenceIds"] for saved in store.scenes(project_id) for c in saved["clips"]):
                             raise ValueError("This reference is used by saved clips. Deselect it before removing it.")
                         project["library"].remove(item)
                 store.write(f"projects/{project_id}/project.json", project)
@@ -191,7 +209,7 @@ async def action(request):
                     if type(body.get("use_last_frame")) is not bool:
                         raise ValueError("use_last_frame must be true or false")
                     if body["use_last_frame"] and not core.previous(scene, clip):
-                        raise ValueError("The first project clip has no preceding clip for continuity")
+                        raise ValueError("The first scene clip has no preceding clip for continuity")
                     prompt = core.text(body["prompt"], 12000)
                     if "referenceSlots" in clip:
                         core.slot_prompt_body(prompt, slots)
@@ -258,9 +276,11 @@ async def upload(request):
     eng = engine()
     project_id = core.identifier(request.query["projectId"])
     async with eng.lock(project_id):
-        scene = eng.store.workspace(project_id)
+        eng.store.workspace(project_id)
+        scene = eng.store.workspace(project_id, request.query.get("sceneId"))
         async with eng.lock(scene["id"]):
-            check_mutable(scene)
+            for saved in eng.store.scenes(project_id):
+                check_mutable(saved)
             project = eng.store.project(project_id)
             ref = next(r for r in project["library"] if r["id"] == request.query["referenceId"])
             if ref["kind"] == "last-frame" or len(ref["assets"]) >= 12:
