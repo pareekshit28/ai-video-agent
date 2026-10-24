@@ -361,16 +361,31 @@ function sceneReferences() {
     const candidates = state.project.library.filter(ref => ref.kind === slot.type && ref.assets.some(asset => asset.kind === mediaKind));
     const librarySelect = select([{ id: "", name: `Not supplied · ${slot.type}` }, ...candidates], slot.referenceId || "");
     const assetSelect = $("select");
+    const preview = $("div", { class: "ava-slot-preview", role: "group", ariaLabel: `${slot.tag} file preview`, hidden: true });
+    function updatePreview() {
+      const host = librarySelect.closest(".ava-slot")?.querySelector(".ava-slot-preview") || preview;
+      const ref = candidates.find(item => item.id === librarySelect.value);
+      const files = ref?.assets.filter(asset => asset.kind === mediaKind) || [];
+      const shown = assetSelect.value ? files.filter(asset => asset.path === assetSelect.value) : files;
+      host.hidden = !shown.length;
+      host.replaceChildren(...(shown.length ? [
+        !assetSelect.value && note("Preview the files below, then choose one in File."),
+        assets({ ...ref, assets: shown })
+      ].filter(Boolean) : []));
+      if (host.isConnected) activateMedia(host);
+    }
     function updateAssets(changed = false) {
       const ref = candidates.find(item => item.id === librarySelect.value);
       const files = ref?.assets.filter(asset => asset.kind === mediaKind) || [];
       const current = files.length === 1 ? files[0].path : !changed && files.some(asset => asset.path === slot.assetPath) ? slot.assetPath : "";
       assetSelect.replaceChildren(...[{ path: "", name: `Select ${mediaKind} file` }, ...files].map(asset => $("option", { value: asset.path, text: asset.name, selected: asset.path === current })));
+      updatePreview();
     }
     librarySelect.addEventListener("change", () => updateAssets(true));
+    assetSelect.addEventListener("change", updatePreview);
     updateAssets();
     const view = card($("h4", { text: `${slot.tag} · ${slot.name}` }), note(`${slot.type} · ${mediaKind}`),
-      field("Library item", librarySelect), field("File", assetSelect),
+      field("Library item", librarySelect), field("File", assetSelect), preview,
       !candidates.length && note(`Add a ${slot.type} item with an ${mediaKind} file in the project Library when needed.`));
     view.classList.add("ava-slot");
     return { slot, librarySelect, assetSelect, view };
