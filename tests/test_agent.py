@@ -150,6 +150,29 @@ class CoreTests(Fixture, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Scene does not belong"):
             self.store.workspace(other["id"], second["id"])
 
+    def test_project_owns_references_and_render_settings(self):
+        second = self.store.create_scene(self.project["id"], "Departure")
+        for scene in (self.scene, second):
+            saved = self.store.read(self.store.scene_dir(self.project["id"], scene["id"]) + "/scene.json")
+            self.assertNotIn("references", saved)
+            self.assertNotIn("settings", saved)
+        updated = self.store.project(self.project["id"])
+        updated["settings"]["steps"] = 12
+        self.store.write(f"projects/{self.project['id']}/project.json", updated)
+        self.assertEqual(12, self.store.workspace(self.project["id"])["settings"]["steps"])
+        self.assertEqual(12, self.store.workspace(self.project["id"], second["id"])["settings"]["steps"])
+        self.assertEqual(["actor"], [r["id"] for r in self.store.workspace(self.project["id"], second["id"])["references"]])
+
+    def test_existing_scene_settings_move_to_project(self):
+        project = self.store.project(self.project["id"])
+        project.pop("settings")
+        self.store.write(f"projects/{self.project['id']}/project.json", project)
+        path = self.store.scene_dir(self.project["id"], self.scene["id"]) + "/scene.json"
+        saved = self.store.read(path)
+        saved["settings"] = {**core.DEFAULTS, "steps": 16}
+        self.store.write(path, saved)
+        self.assertEqual(16, self.store.project(self.project["id"])["settings"]["steps"])
+
     def test_canvas_reviewed_clip_resolves_its_scene(self):
         second = self.store.create_scene(self.project["id"], "Departure")
         second["references"] = [copy.deepcopy(self.ref)]
@@ -342,6 +365,19 @@ class RouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
         other = self.store.create_project("Other")
         denied = await self.client.post("/ava-agent/action", json={"action": "saveSettings", "projectId": other["id"], "sceneId": scene_id, "settings": core.DEFAULTS})
         self.assertEqual(400, denied.status)
+
+    async def test_settings_apply_across_scenes_and_scene_response_only_has_clips(self):
+        created = await (await self.post("createScene", name="Departure")).json()
+        scene_id = created["scene"]["id"]
+        response = await self.post("saveSettings", sceneId=scene_id, settings={**core.DEFAULTS, "steps": 12})
+        self.assertEqual(200, response.status)
+        state = await (await self.client.get("/ava-agent/state", params={"projectId": self.project["id"]})).json()
+        self.assertEqual(12, state["project"]["settings"]["steps"])
+        self.assertEqual(12, self.store.workspace(self.project["id"])["settings"]["steps"])
+        self.assertEqual(12, self.store.workspace(self.project["id"], scene_id)["settings"]["steps"])
+        self.assertEqual(["actor"], [r["id"] for r in state["project"]["library"]])
+        for field in ("references", "settings", "script", "summary", "imports"):
+            self.assertNotIn(field, state["workspace"])
 
     async def test_library_reference_in_another_scene_cannot_be_removed(self):
         second = self.store.create_scene(self.project["id"], "Departure")

@@ -92,10 +92,17 @@ class Store:
     def project(self, project_id):
         project = self.read(f"projects/{identifier(project_id)}/project.json")
         project.setdefault("library", [])
+        changed = False
         # Older versions indexed extracted frames as library entries. Keep the clip files
         # and take history, but remove those redundant reference entries once.
         if any(r.get("kind") == "last-frame" for r in project["library"]):
             project["library"] = [r for r in project["library"] if r.get("kind") != "last-frame"]
+            changed = True
+        if project.get("workspaceId") and "settings" not in project:
+            saved = self.read(self.scene_dir(project_id, project["workspaceId"]) + "/scene.json")
+            project["settings"] = settings(saved.get("settings", DEFAULTS))
+            changed = True
+        if changed:
             self.write(f"projects/{identifier(project_id)}/project.json", project)
         return project
 
@@ -103,6 +110,13 @@ class Store:
         scene = self.read(self.scene_dir(project_id, scene_id) + "/scene.json")
         if scene["projectId"] != project_id:
             raise ValueError("Workspace does not belong to this project")
+        project = self.project(project_id)
+        if project.get("workspaceId"):
+            scene["references"] = copy.deepcopy(project["library"])
+            scene["settings"] = copy.deepcopy(project["settings"])
+        else:
+            scene.setdefault("references", copy.deepcopy(project["library"]))
+            scene.setdefault("settings", copy.deepcopy(project.get("settings", DEFAULTS)))
         return scene
 
     def scene_dir(self, project_id, scene_id):
@@ -110,7 +124,8 @@ class Store:
 
     def save_scene(self, scene):
         scene["updatedAt"] = time.time()
-        self.write(self.scene_dir(scene["projectId"], scene["id"]) + "/scene.json", scene)
+        stored = {k: v for k, v in scene.items() if k not in ("references", "settings")}
+        self.write(self.scene_dir(scene["projectId"], scene["id"]) + "/scene.json", stored)
 
     def projects(self):
         return sorted([self.project(p.parent.name) for p in self.root.glob("projects/*/project.json")], key=lambda p: p.get("createdAt", 0), reverse=True)
@@ -125,7 +140,7 @@ class Store:
 
     def create_project(self, name=None):
         name = next_name("Project", self.projects()) if name is None else name
-        project = {"id": uid(), "name": text(name, 120), "createdAt": time.time(), "library": []}
+        project = {"id": uid(), "name": text(name, 120), "createdAt": time.time(), "library": [], "settings": DEFAULTS.copy()}
         self.write(f"projects/{project['id']}/project.json", project)
         self.workspace(project["id"])
         return self.project(project["id"])
@@ -142,8 +157,8 @@ class Store:
                 raise ValueError("Scene does not belong to this project")
             return self.scene(project_id, chosen)
         old = self.scenes(project_id)
-        scene = {"id": uid(), "projectId": project_id, "name": project["name"] if old else "Scene 1", "script": "",
-                 "summary": "", "references": [], "clips": [], "settings": DEFAULTS.copy(),
+        scene = {"id": uid(), "projectId": project_id, "name": project["name"] if old else "Scene 1",
+                 "references": [], "clips": [], "settings": copy.deepcopy(project.get("settings", DEFAULTS)),
                  "createdAt": time.time(), "paused": True}
         if len(old) == 1:
             scene = old[0]
@@ -183,6 +198,7 @@ class Store:
                 existing = next(r for r in project["library"] if r["id"] == ref["id"])
                 if not existing.get("assets"):
                     existing["assets"] = copy.deepcopy(ref["assets"])
+        project["settings"] = copy.deepcopy(scene["settings"])
         project["workspaceId"] = scene["id"]
         project["sceneIds"] = [scene["id"]]
         project.pop("episodes", None)
@@ -195,8 +211,8 @@ class Store:
         self.workspace(project_id)
         project = self.project(project_id)
         name = next_name("Scene", self.scenes(project_id)) if name is None else name
-        scene = {"id": uid(), "projectId": project_id, "name": text(name, 120), "script": "",
-                 "summary": "", "references": [], "clips": [], "settings": DEFAULTS.copy(),
+        scene = {"id": uid(), "projectId": project_id, "name": text(name, 120),
+                 "references": copy.deepcopy(project["library"]), "clips": [], "settings": copy.deepcopy(project["settings"]),
                  "createdAt": time.time(), "paused": True}
         self.save_scene(scene)
         project["sceneIds"].append(scene["id"])
@@ -399,8 +415,7 @@ def import_plan(store, scene, result):
         clean.append({"id": uid(), "title": text(value.get("title", f"Clip {index + 1}"), 150), "duration": seconds,
             "referenceIds": [], "referenceSlots": slots, "transition": "continue" if value["use_last_frame"] else "cut",
             "continuityMode": "on" if value["use_last_frame"] else "off", "outline": prompt, "prompt": prompt,
-            "status": "awaiting-approval", "versions": [], "batchId": batch,
-            "sceneName": text(result.get("scene", "Imported scene"), 150)})
+            "status": "awaiting-approval", "versions": [], "batchId": batch})
     candidate = {**scene, "clips": [*scene["clips"], *clean]}
     for clip in clean:
         clip["promptContext"] = prompt_context(store, candidate, clip)

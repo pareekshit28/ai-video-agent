@@ -80,7 +80,6 @@ async def state(request):
             selected_id = requested_scene if requested_scene in {s["id"] for s in all_scenes} else None
             workspace = eng.store.workspace(project_id, selected_id)
             project = eng.store.project(project_id)
-            workspace["references"] = [copy.deepcopy(r) for r in project["library"] if r["kind"] != "last-frame"]
             scenes = [{"id": s["id"], "name": s["name"], "createdAt": s["createdAt"],
                        "clipCount": len(s["clips"]), "completeCount": sum(c["status"] == "complete" for c in s["clips"])} for s in all_scenes]
             for saved_scene in all_scenes:
@@ -148,7 +147,6 @@ async def action(request):
         scene = store.workspace(project_id, selected_id)
         async with eng.lock(scene["id"]):
             project = store.project(project_id)
-            scene["references"] = [copy.deepcopy(r) for r in project["library"] if r["kind"] != "last-frame"]
             if command == "renameProject":
                 project["name"] = core.text(body["name"], 120)
                 store.write(f"projects/{project_id}/project.json", project)
@@ -191,8 +189,11 @@ async def action(request):
                     core.import_plan(store, scene, result)
                     imports[request_id] = digest
             elif command == "saveSettings":
-                check_mutable(scene)
-                scene["settings"] = core.settings(body["settings"])
+                for saved in store.scenes(project_id):
+                    check_mutable(saved)
+                project["settings"] = core.settings(body["settings"])
+                scene["settings"] = copy.deepcopy(project["settings"])
+                store.write(f"projects/{project_id}/project.json", project)
             else:
                 clip = find_clip(scene, body["clipId"])
                 base = base_url(request)
@@ -258,6 +259,8 @@ async def action(request):
 def public_scene(eng, scene):
     from . import timing
     result = copy.deepcopy(scene)
+    for field in ("references", "settings", "script", "summary", "imports", "planning", "episodeId"):
+        result.pop(field, None)
     for clip in result["clips"]:
         clip["timing"] = timing.public(clip)
         clip["previousFrame"] = core.previous_frame(scene, clip)

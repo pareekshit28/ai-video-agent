@@ -258,12 +258,12 @@ function projectControls() {
     const name = prompt("New scene name", `Scene ${(state.scenes || []).length + 1}`);
     if (name === null) return false;
     const result = await action("createScene", { name }); await chooseScene(result.scene.id);
-  })));
+  })), state.project && note("Scenes contain clips only. References, saved videos and render settings belong to the project."));
 }
 
 function manageSelection() {
   const project = state.project, name = input(project.name);
-  return card(heading("Project settings", "References and videos belong to this project."),
+  return card(heading("Project settings", "References, saved videos and render settings belong to this project."),
     field("Project name", name), row(button("Rename project", () => action("renameProject", { name: name.value })),
       button("Delete project…", async () => {
         if (!confirm(`Delete “${project.name}” and its clips? Saved data goes to recovery trash.`)) return false;
@@ -320,19 +320,20 @@ function savedVideos() {
 
 function sceneDraft() {
   const value = (id, fallback) => content.querySelector(`#ava-${id}`)?.value ?? fallback;
+  const opts = state.project.settings;
   return { settings: {
-    provider: "h3", aspectRatio: value("ratio", scene.settings.aspectRatio), megapixels: Number(value("mp", scene.settings.megapixels)),
-    steps: Number(value("steps", scene.settings.steps)), seed: Number(value("seed", scene.settings.seed)), refImageSize: value("quality", scene.settings.refImageSize) } };
+    provider: "h3", aspectRatio: value("ratio", opts.aspectRatio), megapixels: Number(value("mp", opts.megapixels)),
+    steps: Number(value("steps", opts.steps)), seed: Number(value("seed", opts.seed)), refImageSize: value("quality", opts.refImageSize) } };
 }
 
 function generationSettings() {
-  const opts = scene.settings;
+  const opts = state.project.settings;
   const ratio = select(["16:9", "9:16", "1:1"], opts.aspectRatio), mp = input(opts.megapixels, "number"), steps = input(opts.steps, "number"), seed = input(opts.seed, "number");
   mp.min = 0.25; mp.max = 4; mp.step = 0.25; steps.min = 1; steps.max = 100;
   const quality = select(["match", "max"], opts.refImageSize);
   for (const [id, el] of Object.entries({ ratio, mp, steps, seed, quality })) el.id = `ava-${id}`;
-  return card(heading("Render settings", `FastH3 · ${scene.name}`),
-    note("Applies to the next approved take. Saved takes keep their original settings."),
+  return card(heading("Project render settings", `FastH3 · ${state.project.name}`),
+    note("Applies to the next approved take in any scene. Saved takes keep their original settings."),
     row(field("Aspect ratio", ratio), field("H3 megapixels", mp), field("H3 steps", steps)),
     row(field("Seed (-1 = random)", seed), field("H3 reference size", quality)),
     button("Save render settings", () => action("saveSettings", sceneDraft()), "ava-primary"));
@@ -364,7 +365,7 @@ function clipEditor(clip, index) {
   length.min = 2; length.max = 10; length.step = 0.5;
   const continuity = $("input", { type: "checkbox", checked: clip.continuityMode === "on" || clip.continuityMode === "auto" && clip.transition === "continue" });
   const hasSlots = Array.isArray(clip.referenceSlots);
-  const checks = hasSlots ? [] : scene.references.filter(r => r.assets.length).map(ref => ({ ref, box: $("input", { type: "checkbox", checked: clip.referenceIds.includes(ref.id) }) }));
+  const checks = hasSlots ? [] : state.project.library.filter(r => r.assets.length).map(ref => ({ ref, box: $("input", { type: "checkbox", checked: clip.referenceIds.includes(ref.id) }) }));
   const slots = (clip.referenceSlots || []).map(slot => {
     const mediaKind = slot.tag.startsWith("Image") ? "image" : "audio";
     const candidates = state.project.library.filter(ref => ref.kind === slot.type && ref.assets.some(asset => asset.kind === mediaKind));
@@ -398,7 +399,7 @@ function clipEditor(clip, index) {
     clip.continuityOutdated && note("An earlier take or frame changed. This completed take is retained; review continuity before regenerating."),
     clip.error && $("p", { class: "ava-error", text: clip.error }),
     clip.video && $("video", { src: mediaUrl(clip.video), controls: true, preload: "metadata" }),
-    clip.sceneName && note(clip.sceneName), field("Editable H3 prompt", prompt),
+    field("Editable H3 prompt", prompt),
     note("Each clip is 2–10 seconds in one static locked-off shot. Begin the scene prose with “Static locked-off shot.”"),
     hasSlots ? $("div", {}, heading("Reference slots", "Choose a matching library item and one file for every slot. H3 receives files in tag order."),
       ...slots.map(({ view }) => view), !slots.length && note("This clip needs no reference files."))
@@ -442,7 +443,7 @@ function render() {
   const agent = $("section", { id: "ava-panel-agent", role: "tabpanel", ariaLabel: "Agent" },
     ...(scene ? [planImporter(), scene.clips.length && heading("Review & render", `${scene.clips.filter(c => c.status === "complete").length} of ${scene.clips.length} clips complete · approve each take when ready`), ...scene.clips.map(clipEditor)].filter(Boolean) : [card(heading("Your next video starts here", "Create a project above, then import your scene JSON from ChatGPT."))]));
   const libraryPanel = $("section", { id: "ava-panel-library", role: "tabpanel", ariaLabel: "Library" }, projectId ? library() : card(note("Create a project to build its reference library.")));
-  const settingsPanel = $("section", { id: "ava-panel-settings", role: "tabpanel", ariaLabel: "Settings" }, ...(state.project ? [manageSelection(), connection()] : []), ...(scene ? [generationSettings()] : []),
+  const settingsPanel = $("section", { id: "ava-panel-settings", role: "tabpanel", ariaLabel: "Settings" }, ...(state.project ? [manageSelection(), generationSettings(), connection()] : []),
     card(heading("Render timing", "Sampling ETA and actual take timestamps."), note("ETA covers only measured sampling steps. It is unavailable until a sampling rate can be measured, and stops when sampling finishes. Decoding and saving have no ETA. Elapsed time includes queue waiting; completion is recorded after video verification and final-frame extraction. Times use your browser's local timezone.")));
   patchChildren(projectHost, [projectControls()]);
   navigation.hidden = !state.project;
