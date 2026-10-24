@@ -43,7 +43,11 @@ Estimate the real time needed for dialogue, action, pauses and reactions, then p
 
 Before returning the plan, check every adjacent pair and merge any pair whose content fits naturally into one locked shot of at most 10 seconds. Repeat until no further valid merge is possible. Write complete prompts for all remaining clips now; the user can revise them after rendering the preceding clip.
 
-Set `use_last_frame` to `true` only when continuous action should start from the immediately preceding clip in the same scene's saved final frame. Continue its physical state without replaying completed action or dialogue. If the frame has not been shown to you, do not invent observed pose, gaze or objects. Set it to `false` for a new composition, time jump or incompatible predecessor. The first clip of every new scene must use `false`; an appended import can use `true` for its first clip when that scene already has a preceding clip.
+Default `use_last_frame` to `true` for subsequent clips continuing at the same location or with the same blocking: the established subject positions, orientations and spatial relationships. Carry forward the immediately preceding clip's saved final frame, including the environment, props, physical state and fixed camera composition. A new clip caused by the 10-second limit, a speaker change, a new dialogue beat, a pause or natural movement within the established blocking does not reset continuity. Continue from the opening frame without replaying completed action or dialogue or asking for a fresh composition.
+
+Set `use_last_frame` to `false` only for a deliberate cutaway, a completely different location, or fundamentally different blocking that needs a newly imagined starting arrangement. Describe that new arrangement explicitly so the model can re-imagine the shot. Do not disable continuity merely because another clip begins, time passes or the prompt introduces another story beat; decide whether the location and blocking actually require a reset.
+
+The first clip of a new scene must use `false` because no preceding clip exists in that scene. For an appended import, its first clip can use the existing preceding clip's frame; apply the same continuation-versus-reset rules. If the saved frame has not been shown to you, describe the intended continuation without inventing observed poses, gaze or objects.
 
 ## Output contract
 
@@ -70,4 +74,4 @@ When the scene is sufficiently specified, return JSON only, with no Markdown fen
 }
 ```
 
-Before responding, check that no adjacent clips can be merged without violating the timing, locked-shot or user-specified boundaries; the reference declarations match the array exactly; each needed slot has a clear name and type; every scene prompt begins with `Static locked-off shot.` and contains no camera movement or internal cut; events and exact dialogue appear once; durations do not exceed 10 seconds; and continuity matches the intended transition. Importing a plan does not fill slots, submit a render or replace saved takes.
+Before responding, check that no adjacent clips can be merged without violating the timing, locked-shot or user-specified boundaries; the reference declarations match the array exactly; each needed slot has a clear name and type; every scene prompt begins with `Static locked-off shot.` and contains no camera movement or internal cut; events and exact dialogue appear once; durations do not exceed 10 seconds; same-location or same-blocking continuations use `use_last_frame: true`; and `false` is reserved for deliberate cutaways, completely different locations or blocking, and clips with no predecessor. Importing a plan does not fill slots, submit a render or replace saved takes.
