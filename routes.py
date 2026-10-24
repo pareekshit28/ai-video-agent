@@ -168,8 +168,8 @@ async def action(request):
                     if command == "cloneLibrary":
                         project["library"].append({**copy.deepcopy(item), "id": core.uid(), "name": (item["name"] + " (copy)")[:120]})
                     else:
-                        if any(item["id"] in c["referenceIds"] for saved in store.scenes(project_id) for c in saved["clips"]):
-                            raise ValueError("This reference is used by saved clips. Deselect it before removing it.")
+                        if any(core.reference_used(saved, item["id"]) for saved in store.scenes(project_id)):
+                            raise ValueError("This reference is selected by a scene. Deselect it before removing it.")
                         project["library"].remove(item)
                 store.write(f"projects/{project_id}/project.json", project)
                 return web.json_response({"ok": True})
@@ -194,16 +194,30 @@ async def action(request):
                 project["settings"] = core.settings(body["settings"])
                 scene["settings"] = copy.deepcopy(project["settings"])
                 store.write(f"projects/{project_id}/project.json", project)
+            elif command == "saveSceneReferences":
+                check_mutable(scene)
+                scene["referenceSlots"] = core.bind_scene_slots(scene, body.get("referenceSlots"))
+                for clip in scene["clips"]:
+                    if not any("slotId" in slot for slot in clip.get("referenceSlots", [])):
+                        continue
+                    clip["promptContext"] = core.prompt_context(store, scene, clip)
+                    clip.pop("approvedKey", None)
             else:
                 clip = find_clip(scene, body["clipId"])
                 base = base_url(request)
                 if command == "saveClip":
                     check_mutable(scene, clip)
                     if "referenceSlots" in clip:
-                        slots = core.bind_slots(scene, clip, body.get("referenceSlots"))
-                        refs = list(dict.fromkeys(s["referenceId"] for s in slots if s["referenceId"]))
+                        slots = clip["referenceSlots"]
+                        if "referenceSlots" in body:
+                            check_mutable(scene)
+                            slots = core.bind_slots(scene, clip, body["referenceSlots"])
+                            for affected in scene["clips"]:
+                                affected["promptContext"] = core.prompt_context(store, scene, affected)
+                                affected.pop("approvedKey", None)
+                        refs = []
                     else:
-                        refs = body["referenceIds"]
+                        refs = body.get("referenceIds", clip.get("referenceIds", []))
                         available = {r["id"] for r in scene["references"] if r.get("assets")}
                         if not isinstance(refs, list) or any(not isinstance(r, str) for r in refs) or len(set(refs)) != len(refs) or not set(refs) <= available:
                             raise ValueError("Select only supplied project references")
@@ -211,7 +225,12 @@ async def action(request):
                         raise ValueError("use_last_frame must be true or false")
                     if body["use_last_frame"] and not core.previous(scene, clip):
                         raise ValueError("The first scene clip has no preceding clip for continuity")
-                    prompt = core.text(body["prompt"], 12000)
+                    if "promptBody" in body and "referenceSlots" in clip:
+                        prose = core.text(body["promptBody"], 12000)
+                        declarations = "\n".join(f"{s['tag']}: {s['name']} ({s['type']})" for s in slots)
+                        prompt = core.text((declarations + "\n\n" if declarations else "") + prose, 12000)
+                    else:
+                        prompt = core.text(body["prompt"], 12000)
                     if "referenceSlots" in clip:
                         core.slot_prompt_body(prompt, slots)
                     else:
@@ -264,6 +283,18 @@ def public_scene(eng, scene):
     for clip in result["clips"]:
         clip["timing"] = timing.public(clip)
         clip["previousFrame"] = core.previous_frame(scene, clip)
+        try:
+            if "referenceSlots" in clip:
+                clip["promptBody"] = core.slot_prompt_body(clip["prompt"], clip["referenceSlots"])
+            else:
+                clip["promptBody"] = clip["prompt"]
+            bound = core.resolved_slots(scene, clip)
+            clip["providedReferences"] = [s["name"] for s, _, _ in bound] if "referenceSlots" in clip else [r["name"] for r in core.selected(scene, clip)]
+            clip["omittedReferences"] = [s["name"] for s in core.clip_slots(scene, clip)
+                                         if not s.get("referenceId") or not s.get("assetPath")]
+            clip["renderPrompt"] = core.final_prompt(scene, clip)
+        except (ValueError, FileNotFoundError) as error:
+            clip["referenceError"] = str(error)
         try:
             core.ensure_ready(eng.store, scene, clip)
             clip["reviewKey"] = core.approval_key(eng.store, scene, clip)

@@ -258,7 +258,7 @@ function projectControls() {
     const name = prompt("New scene name", `Scene ${(state.scenes || []).length + 1}`);
     if (name === null) return false;
     const result = await action("createScene", { name }); await chooseScene(result.scene.id);
-  })), state.project && note("Scenes contain clips only. References, saved videos and render settings belong to the project."));
+  })), state.project && note("Each scene has its clips and shared reference selections. Library items, saved videos and render settings belong to the project."));
 }
 
 function manageSelection() {
@@ -341,10 +341,10 @@ function generationSettings() {
 
 function planImporter() {
   const json = area("", 12);
-  json.placeholder = '{"version":1,"scene":"Scene name","clips":[{"title":"Opening","duration":5,"references":[{"tag":"Image 1","name":"Mara","type":"character"}],"use_last_frame":false,"prompt":"Image 1: Mara (character)\\n\\nStatic locked-off shot. Mara enters the frame..."}]}';
+  json.placeholder = '{"version":1,"scene":"Scene name","references":[{"tag":"Image 1","name":"Mara","type":"character"}],"clips":[{"title":"Opening","duration":5,"references":["Image 1"],"use_last_frame":false,"prompt":"Image 1: Mara (character)\\n\\nStatic locked-off shot. Mara enters the frame..."}]}';
   let requestId;
   json.addEventListener("input", () => { requestId = null; });
-  return card(eyebrow("01 / IMPORT"), heading(`Import clips into ${scene.name}`, "Give ChatGPT the scene and planning skill. Import its clip JSON into this scene, then fill each reference slot from this project's library."),
+  return card(eyebrow("01 / IMPORT"), heading(`Import clips into ${scene.name}`, "Import ChatGPT's JSON, then select reference files once for the scene. Importing creates scene slots and keeps the project library unchanged."),
     $("a", { href: api.apiURL(`${prefix}/scene-planning-skill`), download: "comfyui-scene-planner.md", text: "Download ChatGPT scene-planning skill" }),
     field("Scene JSON", json),
     note("ChatGPT identifies required character, location and prop references without seeing your library. Imports append clips and retain saved takes."),
@@ -355,21 +355,11 @@ function planImporter() {
     }, "ava-primary"));
 }
 
-function downloadJSON(value, filename) {
-  const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
-  const link = $("a", { href: url, download: filename }); link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-function clipEditor(clip, index) {
-  const prompt = area(clip.prompt, 10), length = input(clip.nextDuration ?? clip.duration, "number");
-  length.min = 2; length.max = 10; length.step = 0.5;
-  const continuity = $("input", { type: "checkbox", checked: clip.continuityMode === "on" || clip.continuityMode === "auto" && clip.transition === "continue" });
-  const hasSlots = Array.isArray(clip.referenceSlots);
-  const checks = hasSlots ? [] : state.project.library.filter(r => r.assets.length).map(ref => ({ ref, box: $("input", { type: "checkbox", checked: clip.referenceIds.includes(ref.id) }) }));
-  const slots = (clip.referenceSlots || []).map(slot => {
+function sceneReferences() {
+  const slots = (scene.referenceSlots || []).map(slot => {
     const mediaKind = slot.tag.startsWith("Image") ? "image" : "audio";
     const candidates = state.project.library.filter(ref => ref.kind === slot.type && ref.assets.some(asset => asset.kind === mediaKind));
-    const librarySelect = select([{ id: "", name: `Select ${slot.type} library item` }, ...candidates], slot.referenceId || "");
+    const librarySelect = select([{ id: "", name: `Not supplied · ${slot.type}` }, ...candidates], slot.referenceId || "");
     const assetSelect = $("select");
     function updateAssets(changed = false) {
       const ref = candidates.find(item => item.id === librarySelect.value);
@@ -379,15 +369,30 @@ function clipEditor(clip, index) {
     }
     librarySelect.addEventListener("change", () => updateAssets(true));
     updateAssets();
-    const view = card($("h4", { text: `${slot.tag} · ${slot.name}` }), note(`Required type: ${slot.type} · ${mediaKind} file`),
+    const view = card($("h4", { text: `${slot.tag} · ${slot.name}` }), note(`${slot.type} · ${mediaKind}`),
       field("Library item", librarySelect), field("File", assetSelect),
-      !candidates.length && note(`No ${slot.type} item with an ${mediaKind} file is in this project yet. Add one in Library.`));
+      !candidates.length && note(`Add a ${slot.type} item with an ${mediaKind} file in the project Library when needed.`));
     view.classList.add("ava-slot");
     return { slot, librarySelect, assetSelect, view };
   });
-  const draft = () => ({ clipId: clip.id, prompt: prompt.value,
-    ...(hasSlots ? { referenceSlots: slots.map(({ slot, librarySelect, assetSelect }) => ({ tag: slot.tag, referenceId: librarySelect.value, assetPath: assetSelect.value })) }
-      : { referenceIds: checks.filter(c => c.box.checked).map(c => c.ref.id) }),
+  if (!slots.length) return null;
+  return card(heading("Scene reference slots", "Choose files once. Clips reuse the relevant scene slots. Unfilled slots are omitted from each clip's H3 prompt and inputs."),
+    ...slots.map(s => s.view), button("Save scene references", () => action("saveSceneReferences", {
+      referenceSlots: slots.map(({ slot, librarySelect, assetSelect }) => ({ id: slot.id, referenceId: librarySelect.value, assetPath: assetSelect.value }))
+    }), "ava-primary"));
+}
+
+function downloadJSON(value, filename) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
+  const link = $("a", { href: url, download: filename }); link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function clipEditor(clip, index) {
+  const prompt = area(clip.promptBody ?? clip.prompt, 10), length = input(clip.nextDuration ?? clip.duration, "number");
+  length.min = 2; length.max = 10; length.step = 0.5;
+  const continuity = $("input", { type: "checkbox", checked: clip.continuityMode === "on" || clip.continuityMode === "auto" && clip.transition === "continue" });
+  const hasSlots = Array.isArray(clip.referenceSlots);
+  const draft = () => ({ clipId: clip.id, [hasSlots ? "promptBody" : "prompt"]: prompt.value,
     use_last_frame: continuity.checked, duration: Number(length.value) });
   async function save() {
     await action("saveClip", draft());
@@ -401,14 +406,15 @@ function clipEditor(clip, index) {
     clip.video && $("video", { src: mediaUrl(clip.video), controls: true, preload: "metadata" }),
     field("Editable H3 prompt", prompt),
     note("Each clip is 2–10 seconds in one static locked-off shot. Begin the scene prose with “Static locked-off shot.”"),
-    hasSlots ? $("div", {}, heading("Reference slots", "Choose a matching library item and one file for every slot. H3 receives files in tag order."),
-      ...slots.map(({ view }) => view), !slots.length && note("This clip needs no reference files."))
-      : $("div", { class: "ava-checks" }, ...checks.map(({ ref, box }) => $("label", {}, box, document.createTextNode(ref.name)))),
+    note(clip.providedReferences?.length ? `Scene references supplied: ${clip.providedReferences.join(", ")}` : "No reference files supplied for this clip."),
+    clip.omittedReferences?.length && note(`Unfilled slots omitted: ${clip.omittedReferences.join(", ")}`),
+    clip.referenceError && $("p", { class: "ava-error", text: clip.referenceError }),
+    clip.renderPrompt && $("details", {}, $("summary", { text: "H3 render prompt" }), $("pre", { text: clip.renderPrompt })),
     field("Use previous clip's last frame", continuity),
     clip.previousFrame ? card(note(`Opening frame from: ${clip.previousFrame.name}`), $("img", { src: mediaUrl(clip.previousFrame.assets[0]), alt: "Previous clip's last frame", loading: "lazy" })) : continuity.checked && note("Complete the preceding clip before reviewing this continuation."),
     field(clip.takeId ? "Duration for next take" : "Duration", length),
     clip.nextDuration !== undefined && note(`The saved take keeps ${clip.duration}s. Next take: ${clip.nextDuration}s.`),
-    button("Save prompt & references", save),
+    button("Save prompt", save),
     button(clip.takeId ? "Approve prompt & regenerate this clip" : "Approve prompt & generate this clip", async () => {
       const result = await action("saveClip", draft());
       const saved = result.workspace.clips.find(c => c.id === clip.id);
@@ -441,7 +447,7 @@ function render() {
   if (!state.project) section = "agent";
   const detailsState = new Map([...workspace.querySelectorAll("details")].map((el, i) => [`${i}:${el.querySelector("summary")?.textContent}`, el.open]));
   const agent = $("section", { id: "ava-panel-agent", role: "tabpanel", ariaLabel: "Agent" },
-    ...(scene ? [planImporter(), scene.clips.length && heading("Review & render", `${scene.clips.filter(c => c.status === "complete").length} of ${scene.clips.length} clips complete · approve each take when ready`), ...scene.clips.map(clipEditor)].filter(Boolean) : [card(heading("Your next video starts here", "Create a project above, then import your scene JSON from ChatGPT."))]));
+    ...(scene ? [planImporter(), sceneReferences(), scene.clips.length && heading("Review & render", `${scene.clips.filter(c => c.status === "complete").length} of ${scene.clips.length} clips complete · approve each take when ready`), ...scene.clips.map(clipEditor)].filter(Boolean) : [card(heading("Your next video starts here", "Create a project above, then import your scene JSON from ChatGPT."))]));
   const libraryPanel = $("section", { id: "ava-panel-library", role: "tabpanel", ariaLabel: "Library" }, projectId ? library() : card(note("Create a project to build its reference library.")));
   const settingsPanel = $("section", { id: "ava-panel-settings", role: "tabpanel", ariaLabel: "Settings" }, ...(state.project ? [manageSelection(), generationSettings(), connection()] : []),
     card(heading("Render timing", "Sampling ETA and actual take timestamps."), note("ETA covers only measured sampling steps. It is unavailable until a sampling rate can be measured, and stops when sampling finishes. Decoding and saving have no ETA. Elapsed time includes queue waiting; completion is recorded after video verification and final-frame extraction. Times use your browser's local timezone.")));

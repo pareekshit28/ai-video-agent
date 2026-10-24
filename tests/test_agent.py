@@ -67,7 +67,8 @@ class CoreTests(Fixture, unittest.TestCase):
         self.assertEqual(2, len(clips))
         self.assertEqual([], clips[0]["referenceIds"])
         self.assertEqual("Image 1", clips[0]["referenceSlots"][0]["tag"])
-        self.assertEqual("", clips[0]["referenceSlots"][0]["referenceId"])
+        self.assertEqual("", self.scene["referenceSlots"][0]["referenceId"])
+        self.assertEqual(clips[0]["referenceSlots"][0]["slotId"], clips[1]["referenceSlots"][0]["slotId"])
         before = copy.deepcopy(self.scene["clips"])
         bad = copy.deepcopy(self.plan)
         bad["clips"][1]["references"][0]["tag"] = "Image 2"
@@ -82,9 +83,95 @@ class CoreTests(Fixture, unittest.TestCase):
         workspace = self.store.workspace(other["id"])
         imported = core.import_plan(self.store, workspace, self.plan)
         self.assertEqual("Actor", imported[0]["referenceSlots"][0]["name"])
-        with self.assertRaisesRegex(ValueError, "Fill Image 1"):
-            core.ensure_ready(self.store, workspace, imported[0])
+        core.ensure_ready(self.store, workspace, imported[0])
+        self.assertNotIn("<Picture", core.final_prompt(workspace, imported[0]))
         self.assertEqual([], self.store.project(other["id"])["library"])
+
+    def test_global_slots_apply_to_all_relevant_clips_without_library_writes(self):
+        plan = {"version": 1, "references": [{"tag": "Image 1", "name": "Actor", "type": "character"}],
+                "clips": [{"duration": 5, "use_last_frame": False, "references": ["Image 1"],
+                           "prompt": "Image 1: Actor (character)\n\nStatic locked-off shot. Actor opens the door."},
+                          {"duration": 4, "use_last_frame": False,
+                           "prompt": "Image 1: Actor (character)\n\nStatic locked-off shot. Actor waves."}]}
+        before = copy.deepcopy(self.store.project(self.project["id"])["library"])
+        first, second = core.import_plan(self.store, self.scene, plan)
+        self.assertEqual(1, len(self.scene["referenceSlots"]))
+        slot = self.scene["referenceSlots"][0]
+        self.scene["referenceSlots"] = core.bind_scene_slots(self.scene, [
+            {"id": slot["id"], "referenceId": "actor", "assetPath": self.ref["assets"][0]["path"]}])
+        for clip in (first, second):
+            self.assertEqual("actor", core.resolved_slots(self.scene, clip)[0][1]["id"])
+            self.assertIn("<Picture 1>: Actor", core.final_prompt(self.scene, clip))
+            self.assertNotIn("referenceId", clip["referenceSlots"][0])
+        appended = core.import_plan(self.store, self.scene, plan)
+        self.assertEqual(1, len(self.scene["referenceSlots"]))
+        self.assertIn("<Picture 1>: Actor", core.final_prompt(self.scene, appended[0]))
+        self.assertEqual(before, self.store.project(self.project["id"])["library"])
+
+    def test_per_clip_imports_reuse_subject_slots_when_local_tags_differ(self):
+        plan = copy.deepcopy(self.plan)
+        plan["clips"][1].update(use_last_frame=False, references=[
+            {"tag": "Image 1", "name": "Hall", "type": "location"},
+            {"tag": "Image 2", "name": "Actor", "type": "character"}],
+            prompt="Image 1: Hall (location)\nImage 2: Actor (character)\n\nStatic locked-off shot. Actor waves in the hallway.")
+        first, second = core.import_plan(self.store, self.scene, plan)
+        self.assertEqual(2, len(self.scene["referenceSlots"]))
+        self.assertEqual(first["referenceSlots"][0]["slotId"], second["referenceSlots"][1]["slotId"])
+        self.bind_actor(first)
+        self.assertIn("<Picture 1>: Actor", core.final_prompt(self.scene, second))
+        self.assertNotIn("<Picture 2>", core.final_prompt(self.scene, second))
+
+    def test_unfilled_slots_are_omitted_and_h3_inputs_are_compacted(self):
+        voice_path = f"projects/{self.project['id']}/voice.wav"
+        self.store.path(voice_path).write_bytes(b"voice fixture")
+        self.scene["references"][0]["assets"].append({"path": voice_path, "name": "voice.wav", "kind": "audio"})
+        refs = [{"tag": "Image 1", "name": "Missing location", "type": "location"},
+                {"tag": "Image 2", "name": "Actor", "type": "character"},
+                {"tag": "Audio 1", "name": "Missing ambience", "type": "location"},
+                {"tag": "Audio 2", "name": "Actor voice", "type": "character"}]
+        prompt = "\n".join(f"{s['tag']}: {s['name']} ({s['type']})" for s in refs) + "\n\nStatic locked-off shot. Actor says hello."
+        clip = core.import_plan(self.store, self.scene, {"version": 1, "references": refs,
+            "clips": [{"duration": 4, "use_last_frame": False, "prompt": prompt}]})[0]
+        self.scene["referenceSlots"] = core.bind_scene_slots(self.scene, [
+            {"id": s["id"], "referenceId": "actor" if s["name"].startswith("Actor") else "",
+             "assetPath": voice_path if s["tag"] == "Audio 2" else self.ref["assets"][0]["path"] if s["tag"] == "Image 2" else ""}
+            for s in self.scene["referenceSlots"]])
+        clip["promptContext"] = core.prompt_context(self.store, self.scene, clip)
+        core.ensure_ready(self.store, self.scene, clip)
+        graph = core.build_h3(self.store, self.scene, clip, Path(self.temp.name) / "input", "partial")
+        actual = graph["138"]["inputs"]["value"]
+        self.assertIn("<Picture 1>: Actor", actual)
+        self.assertIn("<Audio 1>: Actor voice", actual)
+        for missing in ("Missing location", "Missing ambience", "<Picture 2>", "<Audio 2>", "Image 2"):
+            self.assertNotIn(missing, actual)
+        inputs = graph["136"]["inputs"]
+        self.assertEqual(["ava_image_0", 0], inputs["ref_images.ref_image_0"])
+        self.assertEqual(["ava_audio_0", 0], inputs["ref_audios.ref_audio_0"])
+        self.assertNotIn("ref_images.ref_image_1", inputs)
+        self.assertNotIn("ref_audios.ref_audio_1", inputs)
+
+    def test_clip_subset_uses_global_order_and_excludes_unused_bound_references(self):
+        refs = [{"tag": "Image 1", "name": "Actor", "type": "character"},
+                {"tag": "Image 2", "name": "Hall", "type": "location"}]
+        plan = {"version": 1, "references": refs, "clips": [{"duration": 4, "use_last_frame": False,
+            "references": [], "prompt": "Static locked-off shot. The hallway is empty."}]}
+        clip = core.import_plan(self.store, self.scene, plan)[0]
+        self.assertEqual([], core.resolved_slots(self.scene, clip))
+        bad = copy.deepcopy(plan)
+        bad["clips"][0]["references"] = ["Image 2", "Image 1"]
+        with self.assertRaisesRegex(ValueError, "scene reference order"):
+            core.import_plan(self.store, self.scene, bad)
+
+    def test_existing_clip_bindings_stay_in_their_previous_format(self):
+        clip = {"id": "old", "referenceIds": ["actor"], "referenceSlots": [
+            {"tag": "Image 1", "name": "Actor", "type": "character", "referenceId": "actor", "assetPath": self.ref["assets"][0]["path"]}],
+            "prompt": self.plan["clips"][0]["prompt"], "status": "complete", "duration": 5, "versions": []}
+        self.scene["clips"] = [clip]
+        self.store.save_scene(self.scene)
+        restored = self.store.workspace(self.project["id"])
+        self.assertEqual([], restored["referenceSlots"])
+        self.assertEqual(clip["referenceSlots"], restored["clips"][0]["referenceSlots"])
+        self.assertIn("<Picture 1>: Actor", core.final_prompt(restored, restored["clips"][0]))
 
     def test_continuity_uses_immediately_previous_clip_and_invalidates_review(self):
         first, second = core.import_plan(self.store, self.scene, self.plan)
@@ -228,8 +315,7 @@ class CoreTests(Fixture, unittest.TestCase):
                            {"tag": "Audio 1", "name": "Actor voice", "type": "character"}],
             "prompt": "Image 1: Actor (character)\nImage 2: Station (location)\nAudio 1: Actor voice (character)\n\nStatic locked-off shot. Actor crosses Station and speaks in the supplied voice."}]}
         clip = core.import_plan(self.store, self.scene, plan)[0]
-        with self.assertRaisesRegex(ValueError, "Fill Image 1"):
-            core.ensure_ready(self.store, self.scene, clip)
+        core.ensure_ready(self.store, self.scene, clip)
         with self.assertRaisesRegex(ValueError, "Image 1 requires a character"):
             core.bind_slots(self.scene, clip, [{"tag": "Image 1", "referenceId": "station", "assetPath": location_path},
                                                {"tag": "Image 2"}, {"tag": "Audio 1"}])
@@ -335,6 +421,7 @@ class RouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
         return await self.client.post("/ava-agent/action", json={"projectId": self.project["id"], "action": command, **values})
 
     async def test_import_retry_is_idempotent_and_state_has_scenes(self):
+        library_before = copy.deepcopy(self.store.project(self.project["id"])["library"])
         first = await self.post("importPlan", plan=self.plan, requestId="one")
         self.assertEqual(200, first.status)
         second = await self.post("importPlan", plan=self.plan, requestId="one")
@@ -344,7 +431,35 @@ class RouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("episodes", state)
         self.assertEqual([self.scene["id"]], [s["id"] for s in state["scenes"]])
         self.assertNotIn("planner", state)
+        self.assertEqual(library_before, state["project"]["library"])
+        self.assertEqual(1, len(state["workspace"]["referenceSlots"]))
         self.assertEqual(200, (await self.client.get("/ava-agent/scene-planning-skill")).status)
+
+    async def test_scene_reference_save_updates_all_clip_prompts_and_review_keys(self):
+        plan = copy.deepcopy(self.plan)
+        plan["clips"][1]["use_last_frame"] = False
+        await self.post("importPlan", plan=plan, requestId="one")
+        initial = self.store.workspace(self.project["id"])
+        old_keys = [core.approval_key(self.store, initial, c) for c in initial["clips"]]
+        response = await self.post("saveSceneReferences", referenceSlots=[{
+            "id": initial["referenceSlots"][0]["id"], "referenceId": "actor", "assetPath": self.ref["assets"][0]["path"]}])
+        self.assertEqual(200, response.status)
+        workspace = (await response.json())["workspace"]
+        for index, clip in enumerate(workspace["clips"]):
+            self.assertIn("<Picture 1>: Actor", clip["renderPrompt"])
+            self.assertNotIn("Image 1:", clip["promptBody"])
+            self.assertTrue(clip["reviewKey"])
+            self.assertNotEqual(old_keys[index], clip["reviewKey"])
+        exported = await (await self.post("exportGraph", clipId=workspace["clips"][0]["id"])).json()
+        self.assertEqual(workspace["clips"][0]["renderPrompt"], exported["graph"]["138"]["inputs"]["value"])
+        saved = await self.post("saveClip", clipId=workspace["clips"][0]["id"],
+            promptBody="Static locked-off shot. Actor waves.", duration=5, use_last_frame=False)
+        self.assertEqual(200, saved.status)
+        removed = await self.post("saveSceneReferences", referenceSlots=[{"id": workspace["referenceSlots"][0]["id"], "referenceId": "", "assetPath": ""}])
+        self.assertEqual(200, removed.status)
+        for clip in (await removed.json())["workspace"]["clips"]:
+            self.assertNotIn("<Picture", clip["renderPrompt"])
+            self.assertEqual(["Actor"], clip["omittedReferences"])
 
     async def test_create_scene_selects_clip_scope_and_keeps_project_videos(self):
         created = await (await self.post("createScene", name="Departure")).json()
@@ -412,7 +527,7 @@ class RouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
                                    referenceSlots=[{"tag": "Image 1", "referenceId": "other_actor", "assetPath": f"projects/{other['id']}/actor.png"}],
                                    use_last_frame=False, duration=5)
         self.assertEqual(400, response.status)
-        self.assertEqual("", self.store.workspace(self.project["id"])["clips"][0]["referenceSlots"][0]["referenceId"])
+        self.assertEqual("", self.store.workspace(self.project["id"])["referenceSlots"][0]["referenceId"])
 
     async def test_project_media_cannot_cross_into_another_project(self):
         other = self.store.create_project("Other")

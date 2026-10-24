@@ -117,12 +117,14 @@ class Store:
         else:
             scene.setdefault("references", copy.deepcopy(project["library"]))
             scene.setdefault("settings", copy.deepcopy(project.get("settings", DEFAULTS)))
+        scene.setdefault("referenceSlots", [])
         return scene
 
     def scene_dir(self, project_id, scene_id):
         return f"projects/{identifier(project_id)}/scenes/{identifier(scene_id)}"
 
     def save_scene(self, scene):
+        scene.setdefault("referenceSlots", [])
         scene["updatedAt"] = time.time()
         stored = {k: v for k, v in scene.items() if k not in ("references", "settings")}
         self.write(self.scene_dir(scene["projectId"], scene["id"]) + "/scene.json", stored)
@@ -173,6 +175,10 @@ class Store:
                     ref["id"] = uid()
                     mapping[original] = ref["id"]
                     scene["references"].append(ref)
+                for slot in saved.get("referenceSlots", []):
+                    slot = copy.deepcopy(slot)
+                    slot["referenceId"] = mapping.get(slot.get("referenceId"), "")
+                    scene.setdefault("referenceSlots", []).append(slot)
                 for clip in saved["clips"]:
                     clip = copy.deepcopy(clip)
                     original_clip_id = clip["id"]
@@ -228,7 +234,55 @@ class Store:
 
 
 def selected(scene, clip):
+    if "referenceSlots" in clip:
+        refs = {r["id"]: r for _, r, _ in resolved_slots(scene, clip)}
+        return list(refs.values())
     return [r for ref_id in clip["referenceIds"] for r in scene["references"] if r["id"] == ref_id and r.get("assets")]
+
+
+def slot_identity(slot, occurrence):
+    return (slot["tag"].split()[0], slot["name"].strip().casefold(), slot["type"], occurrence)
+
+
+def merge_scene_slots(scene, slots):
+    """Reuse the same named file requirement across clips and appended imports."""
+    shared, linked, counts = scene.setdefault("referenceSlots", []), [], {}
+    for source in slots:
+        base = (source["tag"].split()[0], source["name"].strip().casefold(), source["type"])
+        counts[base] = counts.get(base, 0) + 1
+        identity = slot_identity(source, counts[base])
+        chosen = next((s for s in shared if slot_identity(s, s.get("occurrence", 1)) == identity), None)
+        if chosen is None:
+            chosen = {"id": uid(),
+                      "tag": source["tag"], "name": source["name"], "type": source["type"],
+                      "occurrence": counts[base], "referenceId": "", "assetPath": ""}
+            shared.append(chosen)
+        linked.append({k: source[k] for k in ("tag", "name", "type")} | {"slotId": chosen["id"]})
+    # Global UI tags can change on append; stable IDs keep clip links intact.
+    shared.sort(key=lambda s: s["tag"].startswith("Audio"))
+    totals = {"Image": 0, "Audio": 0}
+    for slot in shared:
+        kind = slot["tag"].split()[0]
+        totals[kind] += 1
+        slot["tag"] = f"{kind} {totals[kind]}"
+    return linked
+
+
+def clip_slots(scene, clip):
+    shared = {s["id"]: s for s in scene.get("referenceSlots", [])}
+    result = []
+    for spec in clip.get("referenceSlots", []):
+        if spec.get("slotId") and spec["slotId"] not in shared:
+            raise ValueError("A clip's shared reference slot was not found in this scene")
+        slot = shared.get(spec.get("slotId"), spec)
+        result.append({**spec, "referenceId": slot.get("referenceId", ""), "assetPath": slot.get("assetPath", "")})
+    return result
+
+
+def reference_used(scene, reference_id):
+    return any(s.get("referenceId") == reference_id for s in scene.get("referenceSlots", [])) or any(
+        reference_id in c.get("referenceIds", []) or any(s.get("referenceId") == reference_id for s in clip_slots(scene, c))
+        for c in scene["clips"])
 
 
 def parse_slots(value):
@@ -273,14 +327,13 @@ def slot_prompt_body(prompt, slots):
     return body
 
 
-def bind_slots(scene, clip, requested):
-    slots = clip["referenceSlots"]
+def validate_bindings(scene, slots, requested, key="tag"):
     if not isinstance(requested, list) or len(requested) != len(slots):
         raise ValueError("Submit every reference slot in its original order")
     library = {r["id"]: r for r in scene["references"] if r.get("kind") in REFERENCE_TYPES}
     bound = []
     for original, item in zip(slots, requested):
-        if not isinstance(item, dict) or item.get("tag") != original["tag"]:
+        if not isinstance(item, dict) or item.get(key) != original[key]:
             raise ValueError("Reference slot tags and order cannot change")
         reference_id, asset_path = item.get("referenceId") or "", item.get("assetPath") or ""
         if not isinstance(reference_id, str) or not isinstance(asset_path, str):
@@ -301,10 +354,27 @@ def bind_slots(scene, clip, requested):
     return bound
 
 
+def bind_scene_slots(scene, requested):
+    return validate_bindings(scene, scene["referenceSlots"], requested, key="id")
+
+
+def bind_slots(scene, clip, requested):
+    """Compatibility for older clients: a clip selection updates its shared scene slot."""
+    bound = validate_bindings(scene, clip["referenceSlots"], requested)
+    if any("slotId" not in s for s in bound):
+        return bound
+    shared = {s["id"]: s for s in scene["referenceSlots"]}
+    for slot in bound:
+        shared[slot["slotId"]].update(referenceId=slot["referenceId"], assetPath=slot["assetPath"])
+    return [{k: s[k] for k in ("tag", "name", "type", "slotId")} for s in bound]
+
+
 def resolved_slots(scene, clip):
     library = {r["id"]: r for r in scene["references"]}
     result = []
-    for slot in clip["referenceSlots"]:
+    for slot in clip_slots(scene, clip):
+        if not slot.get("referenceId") or not slot.get("assetPath"):
+            continue
         ref = library.get(slot.get("referenceId"))
         media_kind = "image" if slot["tag"].startswith("Image") else "audio"
         asset = next((a for a in ref.get("assets", []) if a["path"] == slot.get("assetPath") and a["kind"] == media_kind), None) if ref else None
@@ -361,7 +431,7 @@ def prompt_context(store, scene, clip):
     if "referenceSlots" in clip:
         library = {r["id"]: r for r in scene["references"]}
         refs = []
-        for slot in clip["referenceSlots"]:
+        for slot in clip_slots(scene, clip):
             ref = library.get(slot.get("referenceId"))
             asset = next((a for a in ref.get("assets", []) if a["path"] == slot.get("assetPath")), None) if ref else None
             refs.append({"slot": slot, "library": {k: ref[k] for k in ("id", "name", "kind", "description") if k in ref} if ref else None,
@@ -400,6 +470,9 @@ def import_plan(store, scene, result):
     source = result.get("clips")
     if not isinstance(source, list) or not 1 <= len(source) <= 40:
         raise ValueError("Scene JSON must contain 1–40 clips")
+    candidate = {**scene, "referenceSlots": copy.deepcopy(scene.get("referenceSlots", [])), "clips": list(scene["clips"])}
+    global_definitions = parse_slots(result["references"]) if "references" in result else None
+    global_links = merge_scene_slots(candidate, global_definitions) if global_definitions is not None else None
     clean, batch = [], uid()
     for index, value in enumerate(source):
         if not isinstance(value, dict):
@@ -409,17 +482,27 @@ def import_plan(store, scene, result):
             raise ValueError("Each clip needs use_last_frame: true or false")
         if value["use_last_frame"] and not scene["clips"] and index == 0:
             raise ValueError("The first scene clip has no preceding clip for continuity")
-        slots = parse_slots(value.get("references"))
+        if global_definitions is not None:
+            requested = value.get("references", [s["tag"] for s in global_definitions])
+            tags = [s["tag"] for s in global_definitions]
+            if not isinstance(requested, list) or any(not isinstance(tag, str) or tag not in tags for tag in requested):
+                raise ValueError("Clip references must list tags from the scene's references")
+            if requested != [tag for tag in tags if tag in requested]:
+                raise ValueError("Clip reference tags must be unique and follow the scene reference order")
+            slots = [s for s in global_links if s["tag"] in requested]
+        else:
+            slots = merge_scene_slots(candidate, parse_slots(value.get("references")))
         prompt = text(value.get("prompt"), 12000)
         slot_prompt_body(prompt, slots)
         clean.append({"id": uid(), "title": text(value.get("title", f"Clip {index + 1}"), 150), "duration": seconds,
             "referenceIds": [], "referenceSlots": slots, "transition": "continue" if value["use_last_frame"] else "cut",
             "continuityMode": "on" if value["use_last_frame"] else "off", "outline": prompt, "prompt": prompt,
             "status": "awaiting-approval", "versions": [], "batchId": batch})
-    candidate = {**scene, "clips": [*scene["clips"], *clean]}
+    candidate["clips"] = [*scene["clips"], *clean]
     for clip in clean:
         clip["promptContext"] = prompt_context(store, candidate, clip)
     scene["clips"] = candidate["clips"]
+    scene["referenceSlots"] = candidate["referenceSlots"]
     return clean
 
 
@@ -431,8 +514,11 @@ def final_prompt(scene, clip):
                  "location": "Preserve the setting's architecture and layout.",
                  "prop": "Preserve the prop's shape and material."}
         lines = []
+        counts = {"Image": 0, "Audio": 0}
         for slot, _, asset in bound:
-            kind, number = slot["tag"].split()
+            kind = slot["tag"].split()[0]
+            counts[kind] += 1
+            number = counts[kind]
             tag = f"<{'Picture' if kind == 'Image' else 'Audio'} {number}>"
             detail = roles[slot["type"]] if asset["kind"] == "image" else "Use the supplied audio as the reference for this named sound or voice."
             lines.append(f"{tag}: {slot['name']} ({slot['type']}). {detail}")
