@@ -1,11 +1,11 @@
 ---
 name: comfyui-scene-planner
-description: Plan or revise a scene as importable FastH3 clip JSON, identifying needed character, location and prop reference slots without access to the ComfyUI library. Use whenever planning a scene for this agent.
+description: Plan or revise a scene as importable FastH3 JSON using the fewest feasible 2–10 second locked-shot clips and shared character, location and prop reference slots, without access to the ComfyUI library. Use whenever planning a scene for this agent.
 ---
 
 # ComfyUI scene planner
 
-Plan every clip and write its complete FastH3 prompt in ChatGPT. Return one JSON object the user can paste into the ComfyUI AI Video Agent. The agent shows shared scene reference slots; the user selects project-library files once for all relevant clips. Importing a scene never creates library items. Unfilled slots are optional and omitted from render prompts and inputs.
+Minimize the number of clips needed to faithfully cover the scene, and write every clip's complete FastH3 prompt in ChatGPT. Return one JSON object the user can paste into the ComfyUI AI Video Agent. The agent shows shared scene reference slots; the user selects project-library files once for all relevant clips. Importing a scene never creates library items. Unfilled slots are optional and omitted from render prompts and inputs.
 
 Use this skill for every scene planned for this agent. In a ChatGPT Project, attach this file and instruct ChatGPT to use it whenever planning or revising a scene for the ComfyUI AI Video Agent.
 
@@ -37,7 +37,11 @@ After the header, begin scene prose with the exact sentence `Static locked-off s
 
 ## Plan clips and continuity
 
-Prefer one clip if the complete scene fits naturally in one locked shot lasting 2–10 seconds. Otherwise use the fewest natural 2–10 second clips, each with a single fixed composition. Split at a useful beat without rushing or omitting action or dialogue. Write complete prompts for later clips now; the user can revise them after rendering the preceding clip.
+Treat the smallest feasible clip count as a primary planning objective. First try to fit the complete scene into one 2–10 second locked shot. Choose a fixed composition that can hold multiple actions, reactions and dialogue lines; action and speech may happen together when natural. Do not automatically add establishing shots, cutaways, separate reaction shots or a new clip for every sentence, speaker or beat.
+
+Estimate the real time needed for dialogue, action, pauses and reactions, then pack consecutive compatible beats into each clip. Extend a clip toward the 10-second maximum when needed before creating another. Split only when the remaining content cannot fit naturally within 10 seconds or an essential location, time or fixed-composition change requires it. Preserve all requested action and exact dialogue in order; do not rush speech, truncate the scene, invent filler or add padding to justify a duration. Honor any clip boundaries explicitly requested by the user.
+
+Before returning the plan, check every adjacent pair and merge any pair whose content fits naturally into one locked shot of at most 10 seconds. Repeat until no further valid merge is possible. Write complete prompts for all remaining clips now; the user can revise them after rendering the preceding clip.
 
 Set `use_last_frame` to `true` only when continuous action should start from the immediately preceding clip in the same scene's saved final frame. Continue its physical state without replaying completed action or dialogue. If the frame has not been shown to you, do not invent observed pose, gaze or objects. Set it to `false` for a new composition, time jump or incompatible predecessor. The first clip of every new scene must use `false`; an appended import can use `true` for its first clip when that scene already has a preceding clip.
 
@@ -66,4 +70,4 @@ When the scene is sufficiently specified, return JSON only, with no Markdown fen
 }
 ```
 
-Before responding, check that the reference declarations match the array exactly, each needed slot has a clear name and type, every scene prompt begins with `Static locked-off shot.` and contains no camera movement or internal cut, events and exact dialogue appear once, durations do not exceed 10 seconds, and continuity matches the intended transition. Importing a plan does not fill slots, submit a render or replace saved takes.
+Before responding, check that no adjacent clips can be merged without violating the timing, locked-shot or user-specified boundaries; the reference declarations match the array exactly; each needed slot has a clear name and type; every scene prompt begins with `Static locked-off shot.` and contains no camera movement or internal cut; events and exact dialogue appear once; durations do not exceed 10 seconds; and continuity matches the intended transition. Importing a plan does not fill slots, submit a render or replace saved takes.
