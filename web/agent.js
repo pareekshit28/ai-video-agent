@@ -341,7 +341,7 @@ function generationSettings() {
 
 function planImporter() {
   const json = area("", 12);
-  json.placeholder = '{"version":1,"scene":"Scene name","references":[{"tag":"Image 1","name":"Mara","type":"character"}],"clips":[{"title":"Opening","duration":5,"references":["Image 1"],"use_last_frame":false,"prompt":"Image 1: Mara (character)\\n\\nStatic locked-off shot. Mara enters the frame..."}]}';
+  json.placeholder = '{"version":1,"scene":"Scene name","references":[{"tag":"Image 1","name":"Mara","type":"character"}],"clips":[{"title":"Opening","duration":5,"references":["Image 1"],"use_last_frame":false,"static_shot":false,"prompt":"Image 1: Mara (character)\\n\\nMara enters the frame..."}]}';
   let requestId;
   json.addEventListener("input", () => { requestId = null; });
   return card(eyebrow("01 / IMPORT"), heading(`Import clips into ${scene.name}`, "Import ChatGPT's JSON, then select reference files once for the scene. Importing creates scene slots and keeps the project library unchanged."),
@@ -406,9 +406,10 @@ function clipEditor(clip, index) {
   const prompt = area(clip.promptBody ?? clip.prompt, 10), length = input(clip.nextDuration ?? clip.duration, "number");
   length.min = 2; length.max = 10; length.step = 0.5;
   const continuity = $("input", { type: "checkbox", checked: clip.continuityMode === "on" || clip.continuityMode === "auto" && clip.transition === "continue" });
+  const staticShot = $("input", { type: "checkbox", checked: clip.staticShot === true });
   const hasSlots = Array.isArray(clip.referenceSlots);
   const draft = () => ({ clipId: clip.id, [hasSlots ? "promptBody" : "prompt"]: prompt.value,
-    use_last_frame: continuity.checked, duration: Number(length.value) });
+    use_last_frame: continuity.checked, static_shot: staticShot.checked, duration: Number(length.value) });
   async function save() {
     await action("saveClip", draft());
   }
@@ -422,7 +423,8 @@ function clipEditor(clip, index) {
     active.has(clip.status) && !clip.jobOwner && note("This older job has no recorded pod. Resume monitoring on the pod that submitted it."),
     clip.video && $("video", { src: mediaUrl(clip.video), controls: true, preload: "metadata" }),
     field("Editable H3 prompt", prompt),
-    note("Each clip is 2–10 seconds in one static locked-off shot. Begin the scene prose with “Static locked-off shot.”"),
+    field("Static shot (locked camera)", staticShot),
+    note("Each clip is 2–10 seconds. Use a static shot for stationary character blocking; leave it unchecked when characters move through the scene. The checkbox controls the camera instruction; no prose prefix is required."),
     note(clip.providedReferences?.length ? `Scene references supplied: ${clip.providedReferences.join(", ")}` : "No reference files supplied for this clip."),
     clip.omittedReferences?.length && note(`Unfilled slots omitted: ${clip.omittedReferences.join(", ")}`),
     clip.referenceError && $("p", { class: "ava-error", text: clip.referenceError }),

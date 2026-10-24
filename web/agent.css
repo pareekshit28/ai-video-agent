@@ -81,6 +81,7 @@
 .ava-workspace video { width: 100%; max-height: 460px; background: #080a0d; border: 1px solid var(--ava-border); border-radius: 12px; margin: 8px 0; }
 .ava-workspace img { max-width: 100%; max-height: 240px; object-fit: contain; border-radius: 8px; }
 .ava-workspace audio { width: 100%; }
+.ava-workspace input[type=checkbox] { width: auto; align-self: flex-start; accent-color: var(--ava-accent); }
 .ava-workspace a { color: var(--ava-accent); text-underline-offset: 3px; }
 .ava-assets { display: flex; flex-wrap: wrap; gap: 12px; }
 .ava-assets > .ava-card { max-width: 260px; }

@@ -226,6 +226,9 @@ async def action(request):
                         raise ValueError("use_last_frame must be true or false")
                     if body["use_last_frame"] and not core.previous(scene, clip):
                         raise ValueError("The first scene clip has no preceding clip for continuity")
+                    static_choice = body.get("static_shot", core.static_shot(clip))
+                    if type(static_choice) is not bool:
+                        raise ValueError("static_shot must be true or false")
                     if "promptBody" in body and "referenceSlots" in clip:
                         prose = core.text(body["promptBody"], 12000)
                         declarations = "\n".join(f"{s['tag']}: {s['name']} ({s['type']})" for s in slots)
@@ -238,7 +241,7 @@ async def action(request):
                         h3_prompt.validate(prompt, [])
                     seconds = core.duration(body["duration"])
                     clip["nextDuration" if clip.get("takeId") else "duration"] = seconds
-                    clip.update(prompt=prompt, referenceIds=refs, continuityMode="on" if body["use_last_frame"] else "off")
+                    clip.update(prompt=prompt, referenceIds=refs, staticShot=static_choice, continuityMode="on" if body["use_last_frame"] else "off")
                     if "referenceSlots" in clip:
                         clip["referenceSlots"] = slots
                     clip["promptContext"] = core.prompt_context(store, scene, clip)
@@ -286,6 +289,7 @@ def public_scene(eng, scene, base):
     for field in ("references", "settings", "script", "summary", "imports", "planning", "episodeId"):
         result.pop(field, None)
     for clip in result["clips"]:
+        clip["staticShot"] = core.static_shot(clip)
         if clip["status"] in core.ACTIVE:
             clip["canManageJob"] = not clip.get("jobOwner") or eng.owns(clip, base)
         clip["timing"] = timing.public(clip)
@@ -294,7 +298,7 @@ def public_scene(eng, scene, base):
             if "referenceSlots" in clip:
                 clip["promptBody"] = core.slot_prompt_body(clip["prompt"], clip["referenceSlots"])
             else:
-                clip["promptBody"] = clip["prompt"]
+                clip["promptBody"] = h3_prompt.scene_prose(clip["prompt"])
             bound = core.resolved_slots(scene, clip)
             clip["providedReferences"] = [s["name"] for s, _, _ in bound] if "referenceSlots" in clip else [r["name"] for r in core.selected(scene, clip)]
             clip["omittedReferences"] = [s["name"] for s in core.clip_slots(scene, clip)

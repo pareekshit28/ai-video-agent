@@ -104,7 +104,7 @@ class Engine:
             frame_reference = copy.deepcopy(core.previous_frame(scene, clip))
             core.archive_take(clip)
             clip.update(takeId=take_id, status="submitting", approvedKey=reviewed_key, submittedPrompt=core.final_prompt(scene, clip),
-                        submittedSettings=copy.deepcopy(scene["settings"]), submittedReferences=copy.deepcopy(core.selected(scene, clip)), submittedFrame=frame_reference, jobId=prompt_id,
+                        submittedSettings=copy.deepcopy(scene["settings"]), submittedStaticShot=core.static_shot(clip), submittedReferences=copy.deepcopy(core.selected(scene, clip)), submittedFrame=frame_reference, jobId=prompt_id,
                         timing={"submittedAt": time.time()}, jobOwner=self.owner(base_url))
             scene["paused"] = False
             self.store.save_scene(scene)  # Durable reservation BEFORE the only submit attempt.

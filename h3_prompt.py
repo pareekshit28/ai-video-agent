@@ -1,13 +1,13 @@
 """Plain H3 prompt guidance and checks for the host's actual media bindings."""
 import re
 
-VERSION = "h3-import-2026-10-24.1"
+VERSION = "h3-import-2026-10-24.2"
 # These names only preserve ordering when flattening older section-object output.
 BASE_FIELDS = ("integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
 REF_FIELDS = ("subject_definitions", "summary", "retention_analysis", "detailed_description", "overall_soundscape", "non_diegetic_music")
 SUBJECT = re.compile(r"<Subject\s+(\d+)>")
 ASSET = re.compile(r"<(?:Picture|Audio|Video)\s*\d+>", re.I)
-CAMERA_MOVE = re.compile(r"\b(?:moving camera|tracking shot|dolly shot|crane shot|handheld(?: camera| shot)?|camera (?:moves|tracks|follows|glides|pans|tilts|zooms|orbits|dollies|pushes|pulls)|(?:pan|tilt|zoom|dolly|crane|orbit|reframe) (?:to|across|toward|towards|in|out)|cut to|jump cut|whip pan)\b", re.I)
+STATIC_DECLARATION = re.compile(r"^\s*Static locked-off shot\.\s*", re.I)
 LOCKED_CAMERA = "Camera constraint: one static locked-off shot from a fixed camera for the entire clip. No camera movement, reframing, zoom or internal cut."
 
 RULES = """H3 PROMPT GUIDANCE (apply to every imported clip prompt):
@@ -29,16 +29,20 @@ comments. Fit action, natural speech, pauses and reactions into the clip's reque
 
 Use supplied images as authority for appearance and setting when actually available. Refer to characters,
 places and props by their planned names. A voice sample supplies timbre, not its recorded words or appearance.
-Every clip is a single static locked-off shot lasting 2–10 seconds. Start the scene prose with
-"Static locked-off shot." Keep the camera position, framing and focal length fixed throughout;
-show change through subject motion and performance, not camera movement, zoom or an internal cut.
-Use a new clip for a new fixed composition. Give dialogue and action natural time within this limit.
+Every clip lasts 2–10 seconds. Provide a boolean static_shot independently of the prose.
+Generally use true when character blocking stays in place, allowing natural speech, expressions
+and small gestures. Use false when characters walk, run or otherwise move through the scene;
+do not call those clips static or locked-off in the prose. The user can edit this choice in a checkbox.
+The host adds the fixed-camera instruction only for static_shot: true. Other clips can describe
+subject and camera movement as appropriate. No mandatory prose prefix is required.
 
 For a continuation, begin from the supplied Opening Frame at zero seconds. When an actual frame is
 provided, inspect it and preserve observed pose, lighting and prop state, then continue the next action
 without replaying prior beats or lines. This is a frame-zero guide, separate from numbered identity
 references. If the frame has not been rendered, describe continuation without claiming to observe it.
-For a deliberate cut/time jump, disable frame continuity. Do not invent
+Default frame continuity on for the same location or blocking, and disable it for a deliberate
+cutaway, completely different location or fundamentally different blocking. The first clip of a
+new scene has no predecessor. Frame continuity does not require static_shot: true. Do not invent
 unseen prior events, ending-frame constraints or source-video editing inputs. Each final prompt must
 stand alone with the selected references and starting state. Plan every clip prompt in the scene JSON;
 review it against the immediately preceding clip's saved last frame before approving its render. Keep saved takes unchanged.
@@ -75,16 +79,22 @@ def normalize(prompt, references, duration=None):
 
 
 def validate(prompt, references, duration=None):
-    """Check the fixed-camera contract and real media bindings."""
+    """Check prompt text and real media bindings without prescribing camera behavior."""
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 12000:
         raise ValueError("H3 prompt must be nonempty and at most 12000 characters")
     if ASSET.search(prompt) or re.search(r"(?mi)^\s*Reference\s*:?\s*$", prompt):
         raise ValueError("Leave media indices and Reference to the host")
-    if not prompt.strip().startswith("Static locked-off shot."):
-        raise ValueError("Start each clip's scene prose with 'Static locked-off shot.'")
-    if CAMERA_MOVE.search(prompt):
-        raise ValueError("Each clip must be one static locked-off shot without camera movement or an internal cut")
     allowed = {r.get("subjectLabel") for r in references if r.get("subjectLabel")}
     if any(match.group(0) not in allowed for match in SUBJECT.finditer(prompt)):
         raise ValueError("Use only the selected references' supplied Subject labels")
     return prompt
+
+
+def scene_prose(prompt):
+    """Separate the former fixed prefix from prose; the checkbox now controls it."""
+    return STATIC_DECLARATION.sub("", prompt, count=1).strip()
+
+
+def declared_static(prompt):
+    # Backward compatibility for old JSON and saved clips without the new boolean.
+    return any(STATIC_DECLARATION.match(line) for line in prompt.splitlines())

@@ -318,7 +318,7 @@ def slot_prompt_body(prompt, slots):
         expected = f"{slot['tag']}: {slot['name']} ({slot['type']})"
         if index >= len(lines) or lines[index].strip() != expected:
             raise ValueError(f"Prompt reference {index + 1} must be exactly: {expected}")
-    body = "\n".join(lines[len(slots):]).strip()
+    body = h3_prompt.scene_prose("\n".join(lines[len(slots):]).strip())
     if not body:
         raise ValueError("Write the clip action after the ordered reference declarations")
     if SLOT_TAG.search(body):
@@ -405,6 +405,14 @@ def continuation(clip):
     return clip.get("continuityMode", "auto") == "on" or (clip.get("continuityMode", "auto") == "auto" and clip.get("transition") == "continue")
 
 
+def static_shot(clip):
+    if "staticShot" not in clip:
+        return h3_prompt.declared_static(clip.get("prompt", ""))
+    if type(clip["staticShot"]) is not bool:
+        raise ValueError("static_shot must be true or false")
+    return clip["staticShot"]
+
+
 def fingerprint(store, value):
     """Include media bytes, so replacing an image in place invalidates approval."""
     def content(v):
@@ -438,7 +446,7 @@ def prompt_context(store, scene, clip):
                          "asset": asset})
     else:
         refs = selected(scene, clip)
-    return fingerprint(store, {"duration": clip.get("nextDuration", clip["duration"]), "settings": planning_settings,
+    return fingerprint(store, {"duration": clip.get("nextDuration", clip["duration"]), "settings": planning_settings, "staticShot": static_shot(clip),
                               "refs": refs, "continuation": continuation(clip),
                               "frame": ({k: v for k, v in frame.items() if k in ("id", "takeId", "assets")} if (frame := previous_frame(scene, clip)) else None)})
 
@@ -453,7 +461,7 @@ def ensure_ready(store, scene, clip):
     if continuation(clip) and not previous_frame(scene, clip):
         raise ValueError("Complete the immediately preceding clip and save its last frame, or turn continuity off.")
     if clip.get("promptContext") != prompt_context(store, scene, clip):
-        raise ValueError("References, duration, settings or previous clip frame changed. Save and review this prompt again.")
+        raise ValueError("References, duration, settings, static-shot choice or previous clip frame changed. Save and review this prompt again.")
     if "referenceSlots" in clip:
         slot_prompt_body(clip["prompt"], clip["referenceSlots"])
         resolved_slots(scene, clip)
@@ -493,10 +501,13 @@ def import_plan(store, scene, result):
         else:
             slots = merge_scene_slots(candidate, parse_slots(value.get("references")))
         prompt = text(value.get("prompt"), 12000)
+        static_choice = value.get("static_shot", h3_prompt.declared_static(prompt))
+        if type(static_choice) is not bool:
+            raise ValueError("static_shot must be true or false")
         slot_prompt_body(prompt, slots)
         clean.append({"id": uid(), "title": text(value.get("title", f"Clip {index + 1}"), 150), "duration": seconds,
             "referenceIds": [], "referenceSlots": slots, "transition": "continue" if value["use_last_frame"] else "cut",
-            "continuityMode": "on" if value["use_last_frame"] else "off", "outline": prompt, "prompt": prompt,
+            "continuityMode": "on" if value["use_last_frame"] else "off", "staticShot": static_choice, "outline": prompt, "prompt": prompt,
             "status": "awaiting-approval", "versions": [], "batchId": batch})
     candidate["clips"] = [*scene["clips"], *clean]
     for clip in clean:
@@ -507,6 +518,7 @@ def import_plan(store, scene, result):
 
 
 def final_prompt(scene, clip):
+    camera = h3_prompt.LOCKED_CAMERA + "\n" if static_shot(clip) else ""
     if "referenceSlots" in clip:
         body = slot_prompt_body(clip["prompt"], clip["referenceSlots"])
         bound = resolved_slots(scene, clip)
@@ -524,7 +536,7 @@ def final_prompt(scene, clip):
             lines.append(f"{tag}: {slot['name']} ({slot['type']}). {detail}")
         if continuation(clip):
             lines.append("Opening Frame: the preceding clip's saved final frame anchors frame zero. Continue its physical state without replaying completed action.")
-        return "Reference\n" + ("\n".join(lines) or "No supplied appearance or audio reference inputs.") + "\n\n" + h3_prompt.LOCKED_CAMERA + "\n" + body
+        return "Reference\n" + ("\n".join(lines) or "No supplied appearance or audio reference inputs.") + "\n\n" + camera + body
     if TAGS.search(clip["prompt"]):
         raise ValueError("Use reference names in the editable prompt; input tags are assigned automatically")
     images, audios = media(scene, clip)
@@ -536,7 +548,7 @@ def final_prompt(scene, clip):
     bindings += [f"<Audio {i+1}>: {a['referenceName']}'s supplied voice timbre, not the sample's spoken words." for i, a in enumerate(audios)]
     if continuation(clip):
         bindings.append("Opening Frame: the supplied frame-zero guide anchors the opening composition and state. Continue the preceding action without resetting it. This guide is separate from the numbered reference images.")
-    return "Reference\n" + ("\n".join(bindings) or "No supplied appearance or voice reference inputs.") + "\n\n" + h3_prompt.LOCKED_CAMERA + "\n" + clip["prompt"]
+    return "Reference\n" + ("\n".join(bindings) or "No supplied appearance or voice reference inputs.") + "\n\n" + camera + h3_prompt.scene_prose(clip["prompt"])
 
 
 def build_h3(store, scene, clip, input_dir, take_id):
@@ -580,7 +592,7 @@ def archive_take(clip):
     versions = clip.setdefault("versions", [])
     if clip.get("takeId"):
         versions.append({k: copy.deepcopy(v) for k, v in clip.items() if k != "versions"})
-    for key in ("jobId", "jobOwner", "takeId", "source", "video", "frame", "extractedFrame", "error", "actualDuration", "submittedPrompt", "submittedSettings", "submittedReferences", "submittedFrame", "storageSceneId", "storageClipId", "approvedKey", "timing"):
+    for key in ("jobId", "jobOwner", "takeId", "source", "video", "frame", "extractedFrame", "error", "actualDuration", "submittedPrompt", "submittedSettings", "submittedStaticShot", "submittedReferences", "submittedFrame", "storageSceneId", "storageClipId", "approvedKey", "timing"):
         clip.pop(key, None)
     clip["duration"] = clip.pop("nextDuration", clip["duration"])
 

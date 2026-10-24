@@ -273,7 +273,7 @@ class CoreTests(Fixture, unittest.TestCase):
         key = core.approval_key(self.store, second, clip)
         with patch.object(nodes, "store", return_value=self.store):
             prompt, seconds, steps = nodes.ReviewedClip().run(self.project["id"], clip["id"], key)
-        self.assertIn("Static locked-off shot", prompt)
+        self.assertIn(core.h3_prompt.LOCKED_CAMERA, prompt)
         self.assertEqual((5, 8), (seconds, steps))
 
     def test_bad_media_binding_and_duration_rejected(self):
@@ -284,18 +284,60 @@ class CoreTests(Fixture, unittest.TestCase):
         bad["clips"][0]["prompt"] = "Use <Picture 1>"
         with self.assertRaises(ValueError): core.import_plan(self.store, self.scene, bad)
 
-    def test_import_rejects_long_or_moving_shots(self):
+    def test_import_allows_moving_prose_without_static_prefix_but_limits_duration(self):
         bad = copy.deepcopy(self.plan)
         bad["clips"][0]["duration"] = 11
         with self.assertRaisesRegex(ValueError, "2–10 seconds"):
             core.import_plan(self.store, self.scene, bad)
         bad = copy.deepcopy(self.plan)
         bad["clips"][0]["prompt"] = "Image 1: Actor (character)\n\nA camera follows Actor."
-        with self.assertRaisesRegex(ValueError, "Static locked-off shot"):
-            core.import_plan(self.store, self.scene, bad)
-        bad["clips"][0]["prompt"] = "Image 1: Actor (character)\n\nStatic locked-off shot. A tracking shot follows Actor."
-        with self.assertRaisesRegex(ValueError, "camera movement"):
-            core.import_plan(self.store, self.scene, bad)
+        bad["clips"][0]["static_shot"] = False
+        moving = core.import_plan(self.store, self.scene, bad)[0]
+        self.assertFalse(moving["staticShot"])
+        core.ensure_ready(self.store, self.scene, moving)
+        self.assertIn("A camera follows Actor.", core.final_prompt(self.scene, moving))
+        self.assertNotIn(core.h3_prompt.LOCKED_CAMERA, core.final_prompt(self.scene, moving))
+
+    def test_static_choice_controls_the_camera_instruction_and_approval(self):
+        plan = {"version": 1, "references": [], "clips": [{"duration": 4, "references": [], "static_shot": True,
+                "use_last_frame": False, "prompt": "Actor stays seated and speaks softly."}]}
+        clip = core.import_plan(self.store, self.scene, plan)[0]
+        self.assertTrue(clip["staticShot"])
+        self.assertIn(core.h3_prompt.LOCKED_CAMERA, core.final_prompt(self.scene, clip))
+        key = core.approval_key(self.store, self.scene, clip)
+        clip["staticShot"] = False
+        self.assertNotEqual(key, core.approval_key(self.store, self.scene, clip))
+        with self.assertRaisesRegex(ValueError, "static-shot choice"):
+            core.ensure_ready(self.store, self.scene, clip)
+        clip["promptContext"] = core.prompt_context(self.store, self.scene, clip)
+        core.ensure_ready(self.store, self.scene, clip)
+        self.assertNotIn(core.h3_prompt.LOCKED_CAMERA, core.final_prompt(self.scene, clip))
+
+    def test_static_boolean_validation_and_legacy_declaration_override(self):
+        for value in ("false", 0, None):
+            bad = copy.deepcopy(self.plan)
+            bad["clips"][0]["static_shot"] = value
+            with self.assertRaisesRegex(ValueError, "static_shot must be"):
+                core.import_plan(self.store, self.scene, bad)
+        plan = copy.deepcopy(self.plan)
+        plan["clips"][0]["static_shot"] = False
+        clip = core.import_plan(self.store, self.scene, plan)[0]
+        actual = core.final_prompt(self.scene, clip)
+        self.assertNotIn("static", actual.lower())
+        self.assertIn("Actor walks into frame", actual)
+        legacy = core.import_plan(self.store, self.scene, self.plan)[0]
+        self.assertTrue(legacy["staticShot"])
+
+    def test_frame_continuity_does_not_require_a_static_shot(self):
+        plan = copy.deepcopy(self.plan)
+        plan["clips"][1]["static_shot"] = False
+        first, second = core.import_plan(self.store, self.scene, plan)
+        self.frame("prior", first)
+        second["promptContext"] = core.prompt_context(self.store, self.scene, second)
+        graph = core.build_h3(self.store, self.scene, second, Path(self.temp.name) / "input", "moving")
+        self.assertEqual(["ava_frame_guide", 0], graph["126"]["inputs"]["conditioning"])
+        self.assertIn("Opening Frame", graph["138"]["inputs"]["value"])
+        self.assertNotIn("static", graph["138"]["inputs"]["value"].lower())
 
     def test_ordered_slots_bind_exact_files_to_h3(self):
         location_path = f"projects/{self.project['id']}/station.png"
@@ -458,6 +500,20 @@ class EngineTests(Fixture, unittest.IsolatedAsyncioTestCase):
         errors = [result for result in results if isinstance(result, Exception)]
         self.assertEqual(1, len(errors))
         self.assertIn("in this scene", str(errors[0]))
+
+    async def test_submission_preserves_static_choice_with_its_render_prompt(self):
+        clip = self.scene["clips"][0]
+        clip["staticShot"] = False
+        clip["promptContext"] = core.prompt_context(self.store, self.scene, clip)
+        self.store.save_scene(self.scene)
+        await self.workers[0].submit(self.scene, clip, self.urls[0])
+        saved = self.store.scene(self.scene["projectId"], self.scene["id"])["clips"][0]
+        self.assertIs(False, saved["submittedStaticShot"])
+        self.assertNotIn("static", saved["submittedPrompt"].lower())
+        self.assertEqual(saved["submittedPrompt"], self.requests[0][1]["prompt"]["138"]["inputs"]["value"])
+        core.archive_take(saved)
+        self.assertIs(False, saved["versions"][-1]["submittedStaticShot"])
+        self.assertNotIn("submittedStaticShot", saved)
 
     async def test_unresolved_job_in_other_scene_does_not_block_submission(self):
         self.scene["clips"][0].update(status="submission-unknown", jobOwner=self.workers[0].owner(self.urls[0]))
@@ -692,6 +748,32 @@ class RouteTests(Fixture, unittest.IsolatedAsyncioTestCase):
         rejected = await self.post("approveGenerate", clipId=clip["id"], reviewKey="wrong")
         self.assertEqual(400, rejected.status)
         self.assertTrue(review)
+
+    async def test_static_checkbox_saves_preview_and_invalidates_old_approval(self):
+        plan = {"version": 1, "references": [], "clips": [{"duration": 5, "references": [], "static_shot": False,
+                "use_last_frame": False, "prompt": "The camera follows Actor across the station."}]}
+        response = await self.post("importPlan", plan=plan, requestId="static-choice")
+        self.assertEqual(200, response.status)
+        clip = (await response.json())["workspace"]["clips"][0]
+        self.assertIs(False, clip["staticShot"])
+        self.assertNotIn("static", clip["renderPrompt"].lower())
+        old_key = clip["reviewKey"]
+        for choice in (True, False):
+            response = await self.post("saveClip", clipId=clip["id"], promptBody=clip["promptBody"],
+                                       duration=5, use_last_frame=False, static_shot=choice)
+            self.assertEqual(200, response.status)
+            clip = (await response.json())["workspace"]["clips"][0]
+            self.assertIs(choice, clip["staticShot"])
+            self.assertEqual(choice, core.h3_prompt.LOCKED_CAMERA in clip["renderPrompt"])
+            self.assertNotEqual(old_key, clip["reviewKey"])
+            rejected = await self.post("approveGenerate", clipId=clip["id"], reviewKey=old_key)
+            self.assertEqual(400, rejected.status)
+            old_key = clip["reviewKey"]
+        invalid = await self.post("saveClip", clipId=clip["id"], promptBody=clip["promptBody"],
+                                  duration=5, use_last_frame=False, static_shot="false")
+        self.assertEqual(400, invalid.status)
+        self.assertIn("static_shot must be", (await invalid.json())["error"])
+        self.assertIs(False, self.store.workspace(self.project["id"])["clips"][0]["staticShot"])
 
     async def test_slot_selection_rejects_other_project_item(self):
         await self.post("importPlan", plan=self.plan, requestId="one")

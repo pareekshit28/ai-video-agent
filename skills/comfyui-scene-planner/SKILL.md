@@ -1,6 +1,6 @@
 ---
 name: comfyui-scene-planner
-description: Plan or revise a scene as importable FastH3 JSON using the fewest feasible 2–10 second locked-shot clips and shared character, location and prop reference slots, without access to the ComfyUI library. Use whenever planning a scene for this agent.
+description: Plan or revise a scene as importable FastH3 JSON using the fewest feasible 2–10 second clips, per-clip static-shot choices and shared character, location and prop reference slots, without access to the ComfyUI library. Use whenever planning a scene for this agent.
 ---
 
 # ComfyUI scene planner
@@ -26,24 +26,26 @@ Image 1: Mara (character)
 Image 2: Riverside station (location)
 Audio 1: Mara voice (character)
 
-Static locked-off shot. From a fixed view of Riverside station, Mara crosses the platform and stops near the camera. She says, "The train is here," softly, with synchronized lip movement. Footsteps and distant train noise sit under her speech.
+At Riverside station, Mara crosses the platform and stops near the camera. She says, "The train is here," softly, with synchronized lip movement. Footsteps and distant train noise sit under her speech.
 ```
 
 The declaration header identifies each input's subject, type and order. Keep file-dependent instructions out of the scene prose: do not claim a supplied image or voice exists, tell H3 to match an unprovided file, or use Image/Audio tags in the prose. Describe the story by subject names so it remains coherent without reference files. Use a clear audio slot name to identify voice, ambience or a prop sound; do not turn sample speech into extra scripted dialogue.
 
 The renderer keeps only slots that have a selected library file, then assigns contiguous H3 `<Picture N>` and `<Audio N>` tags and attaches files in that same relative order. An unfilled slot contributes no declaration, tag or file to that clip. Named characters and objects can still appear in the story without a supplied identity reference. The UI shows editable prose and the resulting H3 prompt preview. Do not write raw `<Picture N>`, `<Audio N>`, `<Video N>` or a `Reference` section yourself, or make an appearance image a compulsory starting composition.
 
-After the header, begin scene prose with the exact sentence `Static locked-off shot.` Each clip uses one fixed camera position, framing and focal length throughout: no pan, tilt, track, dolly, orbit, zoom, handheld motion, reframing or cut within the clip. Describe a useful composition and let subjects move and perform within it. A new clip may use a different locked composition. Write clear English prose for style, subjects, setting, framing, lighting, ordered action, reactions and end state. Preserve the exact dialogue, language, speaker and order from the scene. Identify delivery and whether speech has visible synchronized lips or is off-screen. Include appropriate ambience and physical sounds; add narration, subtitles or music only if requested. Keep action, dialogue, pauses and reactions feasible within the clip duration.
+Set `static_shot` separately for each clip. Generally use `true` when character blocking stays in place: seated or standing dialogue, small gestures, head turns and lip movement can remain static. Use `false` when characters walk, run, cross the setting or otherwise change their positions during the clip. For a moving clip, do not call the shot static or locked-off in its prose. Choose framing and any camera motion that serve the action; `false` permits motion without requiring the camera to move. The agent exposes an editable **Static shot (locked camera)** checkbox and adds a fixed-camera instruction only when checked. No special prose prefix is required, and the agent does not reject prose for camera movement.
+
+Write clear English prose for style, subjects, setting, framing, lighting, ordered action, reactions and end state. Preserve the exact dialogue, language, speaker and order from the scene. Identify delivery and whether speech has visible synchronized lips or is off-screen. Include appropriate ambience and physical sounds; add narration, subtitles or music only if requested. Keep action, dialogue, pauses and reactions feasible within the clip duration.
 
 ## Plan clips and continuity
 
-Treat the smallest feasible clip count as a primary planning objective. First try to fit the complete scene into one 2–10 second locked shot. Choose a fixed composition that can hold multiple actions, reactions and dialogue lines; action and speech may happen together when natural. Do not automatically add establishing shots, cutaways, separate reaction shots or a new clip for every sentence, speaker or beat.
+Treat the smallest feasible clip count as a primary planning objective. First try to fit the complete scene into one 2–10 second clip. Choose framing that can hold multiple actions, reactions and dialogue lines; action and speech may happen together when natural. Do not automatically add establishing shots, cutaways, separate reaction shots or a new clip for every sentence, speaker or beat.
 
-Estimate the real time needed for dialogue, action, pauses and reactions, then pack consecutive compatible beats into each clip. Extend a clip toward the 10-second maximum when needed before creating another. Split only when the remaining content cannot fit naturally within 10 seconds or an essential location, time or fixed-composition change requires it. Preserve all requested action and exact dialogue in order; do not rush speech, truncate the scene, invent filler or add padding to justify a duration. Honor any clip boundaries explicitly requested by the user.
+Estimate the real time needed for dialogue, action, pauses and reactions, then pack consecutive compatible beats into each clip. Extend a clip toward the 10-second maximum when needed before creating another. Split only when the remaining content cannot fit naturally within 10 seconds or an essential location, time or shot change requires it. Preserve all requested action and exact dialogue in order; do not rush speech, truncate the scene, invent filler or add padding to justify a duration. Honor any clip boundaries explicitly requested by the user.
 
-Before returning the plan, check every adjacent pair and merge any pair whose content fits naturally into one locked shot of at most 10 seconds. Repeat until no further valid merge is possible. Write complete prompts for all remaining clips now; the user can revise them after rendering the preceding clip.
+Before returning the plan, check every adjacent pair and merge any pair whose content fits naturally into one continuous clip of at most 10 seconds. Reassess `static_shot` for the merged action. Repeat until no further valid merge is possible. Write complete prompts for all remaining clips now; the user can revise them after rendering the preceding clip.
 
-Default `use_last_frame` to `true` for subsequent clips continuing at the same location or with the same blocking: the established subject positions, orientations and spatial relationships. Carry forward the immediately preceding clip's saved final frame, including the environment, props, physical state and fixed camera composition. A new clip caused by the 10-second limit, a speaker change, a new dialogue beat, a pause or natural movement within the established blocking does not reset continuity. Continue from the opening frame without replaying completed action or dialogue or asking for a fresh composition.
+Default `use_last_frame` to `true` for subsequent clips continuing at the same location or with the same blocking: the established subject positions, orientations and spatial relationships. Carry forward the immediately preceding clip's saved final frame, including the environment, props, physical state and opening composition. A new clip caused by the 10-second limit, a speaker change, a new dialogue beat, a pause or natural movement within the established blocking does not reset continuity. Continue from the opening frame without replaying completed action or dialogue or asking for a fresh composition. This frame guides the start only: `use_last_frame` is independent of `static_shot`, and a continuing clip can contain character or camera motion.
 
 Set `use_last_frame` to `false` only for a deliberate cutaway, a completely different location, or fundamentally different blocking that needs a newly imagined starting arrangement. Describe that new arrangement explicitly so the model can re-imagine the shot. Do not disable continuity merely because another clip begins, time passes or the prompt introduces another story beat; decide whether the location and blocking actually require a reset.
 
@@ -51,7 +53,7 @@ The first clip of a new scene must use `false` because no preceding clip exists 
 
 ## Output contract
 
-When the scene is sufficiently specified, return JSON only, with no Markdown fence. The user creates or selects a scene under their project before importing; the JSON `scene` label does not create or select one. `version` is integer `1`; top-level `references` is the ordered array of `{tag,name,type}` scene slots; `clips` contains 1–40 objects. `scene` and clip `title` are optional labels. Each clip requires `duration` (number, 2–10), `references` (ordered array of scene tag strings), `use_last_frame` (boolean) and `prompt` (nonempty string, at most 12000 characters). Escape newlines and dialogue quotes as valid JSON. A clip with no references has no declaration header and begins directly with `Static locked-off shot.`
+When the scene is sufficiently specified, return JSON only, with no Markdown fence. The user creates or selects a scene under their project before importing; the JSON `scene` label does not create or select one. `version` is integer `1`; top-level `references` is the ordered array of `{tag,name,type}` scene slots; `clips` contains 1–40 objects. `scene` and clip `title` are optional labels. Each clip requires `duration` (number, 2–10), `references` (ordered array of scene tag strings), `static_shot` (boolean), `use_last_frame` (boolean) and `prompt` (nonempty string, at most 12000 characters). Escape newlines and dialogue quotes as valid JSON. A clip with no references has no declaration header and begins directly with scene prose.
 
 ```json
 {
@@ -67,11 +69,12 @@ When the scene is sufficiently specified, return JSON only, with no Markdown fen
       "title": "At the platform",
       "duration": 8,
       "references": ["Image 1", "Image 2", "Audio 1"],
+      "static_shot": false,
       "use_last_frame": false,
-      "prompt": "Image 1: Mara (character)\nImage 2: Riverside station (location)\nAudio 1: Mara voice (character)\n\nStatic locked-off shot. From a fixed view of Riverside station, Mara crosses the platform and stops near the camera. She says, \"The train is here,\" softly, with synchronized lip movement. Footsteps and distant train noise accompany her."
+      "prompt": "Image 1: Mara (character)\nImage 2: Riverside station (location)\nAudio 1: Mara voice (character)\n\nAt Riverside station, Mara crosses the platform and stops near the camera. She says, \"The train is here,\" softly, with synchronized lip movement. Footsteps and distant train noise accompany her."
     }
   ]
 }
 ```
 
-Before responding, check that no adjacent clips can be merged without violating the timing, locked-shot or user-specified boundaries; the reference declarations match the array exactly; each needed slot has a clear name and type; every scene prompt begins with `Static locked-off shot.` and contains no camera movement or internal cut; events and exact dialogue appear once; durations do not exceed 10 seconds; same-location or same-blocking continuations use `use_last_frame: true`; and `false` is reserved for deliberate cutaways, completely different locations or blocking, and clips with no predecessor. Importing a plan does not fill slots, submit a render or replace saved takes.
+Before responding, check that no adjacent clips can be merged without violating the timing or user-specified boundaries; the reference declarations match the array exactly; each needed slot has a clear name and type; `static_shot` reflects the character blocking and moving clips are not described as static; events and exact dialogue appear once; durations do not exceed 10 seconds; same-location or same-blocking continuations use `use_last_frame: true`; and continuity `false` is reserved for deliberate cutaways, completely different locations or blocking, and clips with no predecessor. Importing a plan does not fill slots, submit a render or replace saved takes.
