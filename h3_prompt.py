@@ -1,12 +1,14 @@
 """Plain H3 prompt guidance and checks for the host's actual media bindings."""
 import re
 
-VERSION = "h3-import-2026-10-23.2"
+VERSION = "h3-import-2026-10-24.1"
 # These names only preserve ordering when flattening older section-object output.
 BASE_FIELDS = ("integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
 REF_FIELDS = ("subject_definitions", "summary", "retention_analysis", "detailed_description", "overall_soundscape", "non_diegetic_music")
 SUBJECT = re.compile(r"<Subject\s+(\d+)>")
 ASSET = re.compile(r"<(?:Picture|Audio|Video)\s*\d+>", re.I)
+CAMERA_MOVE = re.compile(r"\b(?:moving camera|tracking shot|dolly shot|crane shot|handheld(?: camera| shot)?|camera (?:moves|tracks|follows|glides|pans|tilts|zooms|orbits|dollies|pushes|pulls)|(?:pan|tilt|zoom|dolly|crane|orbit|reframe) (?:to|across|toward|towards|in|out)|cut to|jump cut|whip pan)\b", re.I)
+LOCKED_CAMERA = "Camera constraint: one static locked-off shot from a fixed camera for the entire clip. No camera movement, reframing, zoom or internal cut."
 
 RULES = """H3 PROMPT GUIDANCE (apply to every imported clip prompt):
 Identify needed Image and Audio slots without assuming access to the user's project library.
@@ -27,9 +29,10 @@ comments. Fit action, natural speech, pauses and reactions into the clip's reque
 
 Use supplied images as authority for appearance and setting when actually available. Refer to characters,
 places and props by their planned names. A voice sample supplies timbre, not its recorded words or appearance.
-Choose framing, camera movement and cuts to serve the scene and user direction. There is no
-fixed-camera or static-shot default. Describe the intended motion and cuts clearly in ordinary prose,
-keeping them achievable within the duration.
+Every clip is a single static locked-off shot lasting 2–10 seconds. Start the scene prose with
+"Static locked-off shot." Keep the camera position, framing and focal length fixed throughout;
+show change through subject motion and performance, not camera movement, zoom or an internal cut.
+Use a new clip for a new fixed composition. Give dialogue and action natural time within this limit.
 
 For a continuation, begin from the supplied Opening Frame at zero seconds. When an actual frame is
 provided, inspect it and preserve observed pose, lighting and prop state, then continue the next action
@@ -72,11 +75,15 @@ def normalize(prompt, references, duration=None):
 
 
 def validate(prompt, references, duration=None):
-    """Check nonempty text and real media bindings, without enforcing a prose layout."""
+    """Check the fixed-camera contract and real media bindings."""
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 12000:
         raise ValueError("H3 prompt must be nonempty and at most 12000 characters")
     if ASSET.search(prompt) or re.search(r"(?mi)^\s*Reference\s*:?\s*$", prompt):
         raise ValueError("Leave media indices and Reference to the host")
+    if not prompt.strip().startswith("Static locked-off shot."):
+        raise ValueError("Start each clip's scene prose with 'Static locked-off shot.'")
+    if CAMERA_MOVE.search(prompt):
+        raise ValueError("Each clip must be one static locked-off shot without camera movement or an internal cut")
     allowed = {r.get("subjectLabel") for r in references if r.get("subjectLabel")}
     if any(match.group(0) not in allowed for match in SUBJECT.finditer(prompt)):
         raise ValueError("Use only the selected references' supplied Subject labels")

@@ -209,7 +209,7 @@
   },
   "132": {
     "inputs": {
-      "value": 15
+      "value": 10
     },
     "class_type": "PrimitiveFloat",
     "_meta": {

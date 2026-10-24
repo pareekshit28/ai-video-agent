@@ -39,9 +39,9 @@ class Fixture:
         self.scene["references"] = [copy.deepcopy(self.ref)]
         self.plan = {"version": 1, "scene": "Arrival", "clips": [
             {"title": "Door", "duration": 5, "references": [{"tag": "Image 1", "name": "Actor", "type": "character"}], "use_last_frame": False,
-             "prompt": "Image 1: Actor (character)\n\nA moving camera follows Actor opening the door."},
+             "prompt": "Image 1: Actor (character)\n\nStatic locked-off shot. Actor walks into frame and opens the door."},
             {"title": "Greeting", "duration": 4, "references": [{"tag": "Image 1", "name": "Actor", "type": "character"}], "use_last_frame": True,
-             "prompt": "Image 1: Actor (character)\n\nContinue from the opening frame. Actor says hello."}]}
+             "prompt": "Image 1: Actor (character)\n\nStatic locked-off shot. Continue from the opening frame. Actor says hello."}]}
 
     def tearDown(self):
         self.temp.cleanup()
@@ -109,6 +109,7 @@ class CoreTests(Fixture, unittest.TestCase):
         graph = core.build_h3(self.store, self.scene, second, Path(self.temp.name) / "input", "new_take")
         self.assertEqual(["ava_frame_guide", 0], graph["126"]["inputs"]["conditioning"])
         self.assertIn("Opening Frame", graph["138"]["inputs"]["value"])
+        self.assertIn("one static locked-off shot", graph["138"]["inputs"]["value"])
 
     def test_retake_keeps_old_video_and_frame_with_clip(self):
         first = core.import_plan(self.store, self.scene, self.plan)[0]
@@ -136,11 +137,25 @@ class CoreTests(Fixture, unittest.TestCase):
             core.import_plan(self.store, self.scene, plan)
 
     def test_bad_media_binding_and_duration_rejected(self):
-        for value in (True, 1, 16, float("nan")):
+        self.assertEqual(10, core.duration(10))
+        for value in (True, 1, 10.1, 15, float("nan")):
             with self.assertRaises(ValueError): core.duration(value)
         bad = copy.deepcopy(self.plan)
         bad["clips"][0]["prompt"] = "Use <Picture 1>"
         with self.assertRaises(ValueError): core.import_plan(self.store, self.scene, bad)
+
+    def test_import_rejects_long_or_moving_shots(self):
+        bad = copy.deepcopy(self.plan)
+        bad["clips"][0]["duration"] = 11
+        with self.assertRaisesRegex(ValueError, "2–10 seconds"):
+            core.import_plan(self.store, self.scene, bad)
+        bad = copy.deepcopy(self.plan)
+        bad["clips"][0]["prompt"] = "Image 1: Actor (character)\n\nA camera follows Actor."
+        with self.assertRaisesRegex(ValueError, "Static locked-off shot"):
+            core.import_plan(self.store, self.scene, bad)
+        bad["clips"][0]["prompt"] = "Image 1: Actor (character)\n\nStatic locked-off shot. A tracking shot follows Actor."
+        with self.assertRaisesRegex(ValueError, "camera movement"):
+            core.import_plan(self.store, self.scene, bad)
 
     def test_ordered_slots_bind_exact_files_to_h3(self):
         location_path = f"projects/{self.project['id']}/station.png"
@@ -159,7 +174,7 @@ class CoreTests(Fixture, unittest.TestCase):
             "references": [{"tag": "Image 1", "name": "Actor", "type": "character"},
                            {"tag": "Image 2", "name": "Station", "type": "location"},
                            {"tag": "Audio 1", "name": "Actor voice", "type": "character"}],
-            "prompt": "Image 1: Actor (character)\nImage 2: Station (location)\nAudio 1: Actor voice (character)\n\nActor crosses Station and speaks in the supplied voice."}]}
+            "prompt": "Image 1: Actor (character)\nImage 2: Station (location)\nAudio 1: Actor voice (character)\n\nStatic locked-off shot. Actor crosses Station and speaks in the supplied voice."}]}
         clip = core.import_plan(self.store, self.scene, plan)[0]
         with self.assertRaisesRegex(ValueError, "Fill Image 1"):
             core.ensure_ready(self.store, self.scene, clip)
@@ -189,7 +204,7 @@ class CoreTests(Fixture, unittest.TestCase):
 
     def test_slot_prompt_order_and_type_must_match_json(self):
         bad = copy.deepcopy(self.plan)
-        bad["clips"][0]["prompt"] = "Image 1: Actor (location)\n\nActor walks."
+        bad["clips"][0]["prompt"] = "Image 1: Actor (location)\n\nStatic locked-off shot. Actor walks."
         with self.assertRaisesRegex(ValueError, "Prompt reference 1"):
             core.import_plan(self.store, self.scene, bad)
         bad = copy.deepcopy(self.plan)
@@ -199,7 +214,7 @@ class CoreTests(Fixture, unittest.TestCase):
 
     def test_clip_without_references_needs_no_library_selection(self):
         plan = {"version": 1, "clips": [{"duration": 3, "references": [], "use_last_frame": False,
-                                         "prompt": "A camera glides across an empty hallway in quiet ambience."}]}
+                                         "prompt": "Static locked-off shot. An empty hallway remains still in quiet ambience."}]}
         clip = core.import_plan(self.store, self.scene, plan)[0]
         core.ensure_ready(self.store, self.scene, clip)
         self.assertEqual(([], []), core.media(self.scene, clip))

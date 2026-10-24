@@ -735,10 +735,10 @@
         "Node name for S&R": "PrimitiveFloat"
       },
       "widgets_values": [
-        15
+        10
       ],
       "widgets_values_named": {
-        "value": 15
+        "value": 10
       },
       "color": "#322",
       "bgcolor": "#533"

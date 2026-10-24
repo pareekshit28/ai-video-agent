@@ -326,7 +326,7 @@ function generationSettings() {
 
 function planImporter() {
   const json = area("", 12);
-  json.placeholder = '{"version":1,"scene":"Scene name","clips":[{"title":"Opening","duration":5,"references":[{"tag":"Image 1","name":"Mara","type":"character"}],"use_last_frame":false,"prompt":"Image 1: Mara (character)\\n\\nA moving camera follows Mara..."}]}';
+  json.placeholder = '{"version":1,"scene":"Scene name","clips":[{"title":"Opening","duration":5,"references":[{"tag":"Image 1","name":"Mara","type":"character"}],"use_last_frame":false,"prompt":"Image 1: Mara (character)\\n\\nStatic locked-off shot. Mara enters the frame..."}]}';
   let requestId;
   json.addEventListener("input", () => { requestId = null; });
   return card(eyebrow("01 / IMPORT"), heading("Import a scene from ChatGPT", "Give ChatGPT the scene and planning skill. Import its clip JSON, then fill each reference slot from this project's library."),
@@ -347,7 +347,7 @@ function downloadJSON(value, filename) {
 
 function clipEditor(clip, index) {
   const prompt = area(clip.prompt, 10), length = input(clip.nextDuration ?? clip.duration, "number");
-  length.min = 2; length.max = 15; length.step = 0.5;
+  length.min = 2; length.max = 10; length.step = 0.5;
   const continuity = $("input", { type: "checkbox", checked: clip.continuityMode === "on" || clip.continuityMode === "auto" && clip.transition === "continue" });
   const hasSlots = Array.isArray(clip.referenceSlots);
   const checks = hasSlots ? [] : scene.references.filter(r => r.assets.length).map(ref => ({ ref, box: $("input", { type: "checkbox", checked: clip.referenceIds.includes(ref.id) }) }));
@@ -385,6 +385,7 @@ function clipEditor(clip, index) {
     clip.error && $("p", { class: "ava-error", text: clip.error }),
     clip.video && $("video", { src: mediaUrl(clip.video), controls: true, preload: "metadata" }),
     clip.sceneName && note(clip.sceneName), field("Editable H3 prompt", prompt),
+    note("Each clip is 2–10 seconds in one static locked-off shot. Begin the scene prose with “Static locked-off shot.”"),
     hasSlots ? $("div", {}, heading("Reference slots", "Choose a matching library item and one file for every slot. H3 receives files in tag order."),
       ...slots.map(({ view }) => view), !slots.length && note("This clip needs no reference files."))
       : $("div", { class: "ava-checks" }, ...checks.map(({ ref, box }) => $("label", {}, box, document.createTextNode(ref.name)))),

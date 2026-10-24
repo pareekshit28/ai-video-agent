@@ -24,22 +24,22 @@ Image 1: Mara (character)
 Image 2: Riverside station (location)
 Audio 1: Mara voice (character)
 
-A smooth tracking shot follows Mara through Riverside station. Preserve Mara's facial features and clothing, and the station's layout and signage. She says, "The train is here," softly in her supplied voice timbre, with synchronized lip movement. Footsteps and distant train noise sit under her speech.
+Static locked-off shot. From a fixed view of Riverside station, Mara crosses the platform and stops near the camera. Preserve her facial features and clothing, and the station's layout and signage. She says, "The train is here," softly in her supplied voice timbre, with synchronized lip movement. Footsteps and distant train noise sit under her speech.
 ```
 
 The declaration header establishes each image or audio tag's subject, type and order. In the prose, use those names to describe how the references affect appearance, setting, object details or sound. The renderer turns the header into H3 `<Picture N>` and `<Audio N>` bindings in the same order and attaches exactly one selected library file to each slot. Do not write raw `<Picture N>`, `<Audio N>`, `<Video N>` or a `Reference` section yourself. Do not make an appearance image a compulsory starting composition. For audio, state whether it supplies voice timbre, ambience or a physical sound; do not treat words in an audio sample as new scripted dialogue.
 
-After the header, write clear English prose for style, subjects, setting, framing, lighting, ordered action, reactions and end state. Preserve the exact dialogue, language, speaker and order from the scene. Identify delivery and whether speech has visible synchronized lips or is off-screen. Include appropriate ambience and physical sounds; add narration, subtitles or music only if requested. Choose camera movement and cuts to fit the story. There is no static-shot requirement. Keep motion, dialogue, pauses and reactions feasible within the clip duration.
+After the header, begin scene prose with the exact sentence `Static locked-off shot.` Each clip uses one fixed camera position, framing and focal length throughout: no pan, tilt, track, dolly, orbit, zoom, handheld motion, reframing or cut within the clip. Describe a useful composition and let subjects move and perform within it. A new clip may use a different locked composition. Write clear English prose for style, subjects, setting, framing, lighting, ordered action, reactions and end state. Preserve the exact dialogue, language, speaker and order from the scene. Identify delivery and whether speech has visible synchronized lips or is off-screen. Include appropriate ambience and physical sounds; add narration, subtitles or music only if requested. Keep action, dialogue, pauses and reactions feasible within the clip duration.
 
 ## Plan clips and continuity
 
-Prefer one clip if the complete scene fits naturally in 2–15 seconds. Otherwise use the fewest natural 2–15 second clips. Split at a useful beat without rushing or omitting action or dialogue. Write complete prompts for later clips now; the user can revise them after rendering the preceding clip.
+Prefer one clip if the complete scene fits naturally in one locked shot lasting 2–10 seconds. Otherwise use the fewest natural 2–10 second clips, each with a single fixed composition. Split at a useful beat without rushing or omitting action or dialogue. Write complete prompts for later clips now; the user can revise them after rendering the preceding clip.
 
 Set `use_last_frame` to `true` only when continuous action should start from the immediately preceding clip's saved final frame. Continue its physical state without replaying completed action or dialogue. If the frame has not been shown to you, do not invent observed pose, gaze or objects. Set it to `false` for a new composition, time jump or incompatible predecessor. The first clip of a project must use `false`; the first clip of an appended scene can use `true` if the project's previous clip is its intended predecessor.
 
 ## Output contract
 
-When the scene is sufficiently specified, return JSON only, with no Markdown fence. `version` is integer `1`; `clips` contains 1–40 objects. `scene` and `title` are optional labels. Each clip requires `duration` (number, 2–15), `references` (ordered array of `{tag,name,type}` slots), `use_last_frame` (boolean) and `prompt` (nonempty string, at most 12000 characters). Escape newlines and dialogue quotes as valid JSON. A clip with no references has no declaration header and begins directly with scene prose.
+When the scene is sufficiently specified, return JSON only, with no Markdown fence. `version` is integer `1`; `clips` contains 1–40 objects. `scene` and `title` are optional labels. Each clip requires `duration` (number, 2–10), `references` (ordered array of `{tag,name,type}` slots), `use_last_frame` (boolean) and `prompt` (nonempty string, at most 12000 characters). Escape newlines and dialogue quotes as valid JSON. A clip with no references has no declaration header and begins directly with `Static locked-off shot.`
 
 ```json
 {
@@ -55,10 +55,10 @@ When the scene is sufficiently specified, return JSON only, with no Markdown fen
         { "tag": "Audio 1", "name": "Mara voice", "type": "character" }
       ],
       "use_last_frame": false,
-      "prompt": "Image 1: Mara (character)\nImage 2: Riverside station (location)\nAudio 1: Mara voice (character)\n\nA moving camera follows Mara through Riverside station. Preserve Mara's appearance and the station's layout. She says, \"The train is here,\" softly in her supplied voice timbre, with synchronized lip movement. Footsteps and distant train noise accompany her."
+      "prompt": "Image 1: Mara (character)\nImage 2: Riverside station (location)\nAudio 1: Mara voice (character)\n\nStatic locked-off shot. From a fixed view of Riverside station, Mara crosses the platform and stops near the camera. Preserve her appearance and the station's layout. She says, \"The train is here,\" softly in her supplied voice timbre, with synchronized lip movement. Footsteps and distant train noise accompany her."
     }
   ]
 }
 ```
 
-Before responding, check that the reference declarations match the array exactly, each needed slot has a clear name and type, the prompt describes how the inputs affect the clip, events and exact dialogue appear once, durations allow natural performance, and continuity matches the intended transition. Importing a plan does not fill slots, submit a render or replace saved takes.
+Before responding, check that the reference declarations match the array exactly, each needed slot has a clear name and type, every scene prompt begins with `Static locked-off shot.` and contains no camera movement or internal cut, events and exact dialogue appear once, durations do not exceed 10 seconds, and continuity matches the intended transition. Importing a plan does not fill slots, submit a render or replace saved takes.

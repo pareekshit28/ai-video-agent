@@ -48,8 +48,8 @@ def text(value, maximum=32000):
 def duration(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError("Duration must be a number")
-    if not 2 <= value <= 15:
-        raise ValueError("H3 clips must be 2–15 seconds.")
+    if not 2 <= value <= 10:
+        raise ValueError("H3 clips must be 2–10 seconds.")
     return value
 
 
@@ -400,7 +400,7 @@ def final_prompt(scene, clip):
             lines.append(f"{tag}: {slot['name']} ({slot['type']}). {detail}")
         if continuation(clip):
             lines.append("Opening Frame: the preceding clip's saved final frame anchors frame zero. Continue its physical state without replaying completed action.")
-        return "Reference\n" + ("\n".join(lines) or "No supplied appearance or audio reference inputs.") + "\n\n" + body
+        return "Reference\n" + ("\n".join(lines) or "No supplied appearance or audio reference inputs.") + "\n\n" + h3_prompt.LOCKED_CAMERA + "\n" + body
     if TAGS.search(clip["prompt"]):
         raise ValueError("Use reference names in the editable prompt; input tags are assigned automatically")
     images, audios = media(scene, clip)
@@ -412,7 +412,7 @@ def final_prompt(scene, clip):
     bindings += [f"<Audio {i+1}>: {a['referenceName']}'s supplied voice timbre, not the sample's spoken words." for i, a in enumerate(audios)]
     if continuation(clip):
         bindings.append("Opening Frame: the supplied frame-zero guide anchors the opening composition and state. Continue the preceding action without resetting it. This guide is separate from the numbered reference images.")
-    return "Reference\n" + ("\n".join(bindings) or "No supplied appearance or voice reference inputs.") + "\n\n" + clip["prompt"]
+    return "Reference\n" + ("\n".join(bindings) or "No supplied appearance or voice reference inputs.") + "\n\n" + h3_prompt.LOCKED_CAMERA + "\n" + clip["prompt"]
 
 
 def build_h3(store, scene, clip, input_dir, take_id):
