@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { createInterface } from "node:readline";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { CodexClient, withCodex } from "../src/lib/codex";
 
@@ -11,7 +10,15 @@ afterEach(() => { vi.clearAllMocks(); vi.unstubAllEnvs(); });
 function workerProcess() {
   const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill() { child.emit("close"); return true; } });
   const requests: any[] = [];
-  createInterface({ input: child.stdin }).on("line", line => requests.push(JSON.parse(line)));
+  let input = "";
+  child.stdin.setEncoding("utf8").on("data", chunk => {
+    input += chunk;
+    let newline: number;
+    while ((newline = input.indexOf("\n")) !== -1) {
+      requests.push(JSON.parse(input.slice(0, newline)));
+      input = input.slice(newline + 1);
+    }
+  });
   const message = (value: unknown) => child.stdout.write(JSON.stringify(value) + "\n");
   return { child, requests, message };
 }
@@ -53,6 +60,43 @@ describe("native Codex transport", () => {
     message({ method: "item/completed", params: { threadId: "our-thread", item: { type: "agentMessage", id: "answer", phase: "final_answer", text: "Done" } } });
     message({ method: "turn/completed", params: { threadId: "our-thread", turn: { status: "completed" } } });
     expect(await turn).toEqual({ text: "Done", images: [{ type: "imageGeneration", status: "completed", savedPath: "edited.png", failure: null }] }); client.close();
+  });
+  it.each(["\u2028", "\u2029"])("preserves Unicode separator %j inside scene and answer JSON", async separator => {
+    const { client, requests, message } = worker();
+    const scene = `SCENE 1 — EXT. COLLEGE CAMPUS — AFTERNOON\nETHAN${separator}Listen, we agreed on Friday.\nCLAIRE${separator}Where did I put my keys?`;
+    const answer = JSON.stringify({ references: [{ name: "Ethan", description: `Standing by his SUV.${separator}Speaking on his phone.` }, { name: "Claire", description: "Searching her tote bag for keys." }] });
+    const result = client.turn("scene-thread", [{ type: "text", text: scene }], new AbortController().signal).catch(error => ({ error: error.code }));
+    expect(requests[0].params.input[0].text).toBe(scene);
+    message({ id: requests[0].id, result: { turn: { id: "turn" } } });
+    message({ method: "item/started", params: { threadId: "scene-thread", item: { type: "userMessage", id: "scene", content: [{ type: "text", text: scene }] } } });
+    message({ method: "item/completed", params: { threadId: "scene-thread", item: { type: "agentMessage", id: "answer", phase: "final_answer", text: answer } } });
+    message({ method: "turn/completed", params: { threadId: "scene-thread", turn: { status: "completed" } } });
+    try { expect(await result).toEqual({ text: answer, images: [] }); } finally { client.close(); }
+  });
+  it.each([1, 2, 7, 4096])("reassembles JSONL and UTF-8 across %i-byte chunks", async chunkSize => {
+    const { child, client, requests } = worker();
+    const text = "ETHAN\u2028Listen — Claire 🙂\u2029Friday.";
+    const result = client.turn("thread", [], new AbortController().signal);
+    const wire = Buffer.from([
+      { id: requests[0].id, result: { turn: { id: "turn" } } },
+      { method: "item/completed", params: { threadId: "thread", item: { type: "agentMessage", id: "answer", text } } },
+      { method: "turn/completed", params: { threadId: "thread", turn: { status: "completed" } } },
+    ].map(value => JSON.stringify(value)).join("\r\n") + "\r\n");
+    for (let offset = 0; offset < wire.length; offset += chunkSize) child.stdout.write(wire.subarray(offset, offset + chunkSize));
+    expect(await result).toEqual({ text, images: [] }); client.close();
+  });
+  it("reads a final JSON record without a trailing newline", async () => {
+    const { child, client, requests } = worker();
+    const result = client.call("model/list");
+    child.stdout.end(JSON.stringify({ id: requests[0].id, result: { data: [] } }));
+    expect(await result).toEqual({ data: [] }); client.close();
+  });
+  it("bounds an unfinished record before its newline arrives", async () => {
+    const { child, client } = worker();
+    const failed = client.call("initialize").catch(error => error);
+    child.stdout.write(" ".repeat(32_000_001));
+    expect(await failed).toMatchObject({ code: "codex_protocol_error", message: expect.stringContaining("exceeded the supported size") });
+    client.close();
   });
   it("rejects failed turns and worker termination without exposing provider logs", async () => {
     const first = worker(); const turn = first.client.turn("thread", [], new AbortController().signal);

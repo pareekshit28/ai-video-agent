@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createInterface } from "node:readline";
+import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
 import { access, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -57,10 +57,13 @@ export class CodexClient {
   private failure?: RequestError;
   constructor(private child: ChildProcessWithoutNullStreams) {
     child.stderr.resume(); // Never expose provider logs, credentials or image payloads to the UI.
-    createInterface({ input: child.stdout }).on("line", line => {
-      if (line.length > 32_000_000) return this.fail(new RequestError("The Codex app-server response exceeded the supported size. Try a shorter request.", "codex_protocol_error"));
+    const onLine = (line: string) => {
+      if (this.closed || !line.trim()) return;
       let message: RpcMessage;
-      try { message = JSON.parse(line); } catch { return this.fail(new RequestError("Codex returned an invalid app-server message. Check that CODEX_CLI_PATH points to the Codex CLI executable.", "codex_protocol_error")); }
+      try {
+        message = JSON.parse(line);
+        if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error("Invalid RPC envelope");
+      } catch { return this.fail(new RequestError("Codex returned malformed app-server JSON. Retry the request; if it repeats, check Codex CLI compatibility.", "codex_protocol_error")); }
       if (message.id !== undefined && message.method) {
         // This worker never approves shell escapes, connector actions or extra permissions.
         child.stdin.write(JSON.stringify({ id: message.id, error: { code: -32000, message: "Only the requested local planning is authorized." } }) + "\n");
@@ -68,6 +71,35 @@ export class CodexClient {
         const pending = this.pending.get(message.id); this.pending.delete(message.id);
         if (pending) { if (message.error) pending.reject(rpcFailure(pending.method, message.error)); else pending.resolve(message.result); }
       } else for (const listener of this.listeners) listener(message);
+    };
+    // JSONL uses LF as its record delimiter. Node's readline also splits on
+    // U+2028/U+2029, which are valid, unescaped characters inside JSON strings.
+    const decoder = new StringDecoder("utf8");
+    let fragments: string[] = []; let length = 0;
+    const read = (text: string) => {
+      if (this.closed) return;
+      let start = 0;
+      for (;;) {
+        const newline = text.indexOf("\n", start);
+        const fragment = text.slice(start, newline === -1 ? undefined : newline);
+        length += fragment.length;
+        if (length > 32_000_000) {
+          fragments = []; length = 0;
+          return this.fail(new RequestError("The Codex app-server response exceeded the supported size. Try a shorter request.", "codex_protocol_error"));
+        }
+        if (fragment) fragments.push(fragment);
+        if (newline === -1) return;
+        const line = fragments.join(""); fragments = []; length = 0;
+        onLine(line);
+        if (this.closed) return;
+        start = newline + 1;
+      }
+    };
+    child.stdout.on("data", (chunk: Buffer) => read(decoder.write(chunk)));
+    child.stdout.on("end", () => {
+      read(decoder.end());
+      if (fragments.length) onLine(fragments.join(""));
+      fragments = []; length = 0;
     });
     child.on("error", (error: NodeJS.ErrnoException) => this.fail(error.code === "ENOENT"
       ? new RequestError("The app could not find the Codex CLI executable. Set CODEX_CLI_PATH to the absolute path reported by `which codex` on macOS, then restart the app.", "codex_not_found")
