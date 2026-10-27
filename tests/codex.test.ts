@@ -1,17 +1,24 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { createInterface } from "node:readline";
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { CodexClient } from "../src/lib/codex";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { CodexClient, withCodex } from "../src/lib/codex";
 
-function worker() {
+vi.mock("node:child_process", () => ({ spawn: vi.fn() }));
+afterEach(() => { vi.clearAllMocks(); vi.unstubAllEnvs(); });
+
+function workerProcess() {
   const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill() { child.emit("close"); return true; } });
   const requests: any[] = [];
   createInterface({ input: child.stdin }).on("line", line => requests.push(JSON.parse(line)));
-  const client = new CodexClient(child as unknown as ChildProcessWithoutNullStreams);
   const message = (value: unknown) => child.stdout.write(JSON.stringify(value) + "\n");
-  return { child, client, requests, message };
+  return { child, requests, message };
+}
+
+function worker() {
+  const transport = workerProcess();
+  return { ...transport, client: new CodexClient(transport.child as unknown as ChildProcessWithoutNullStreams) };
 }
 describe("native Codex transport", () => {
   it.each(["low", "high"] as const)("explicitly overrides inherited thinking with %s for the planning thread and turn", async effort => {
@@ -51,7 +58,67 @@ describe("native Codex transport", () => {
     const first = worker(); const turn = first.client.turn("thread", [], new AbortController().signal);
     const failure = expect(turn).rejects.toThrow("did not finish");
     first.message({ method: "turn/completed", params: { threadId: "thread", turn: { status: "failed", error: { message: "secret provider detail" } } } }); await failure; first.client.close();
-    const second = worker(); const call = second.client.call("initialize"); const closed = expect(call).rejects.toThrow("Codex could not complete"); second.child.emit("close"); await closed;
+    const second = worker(); const call = second.client.call("initialize"); const closed = expect(call).rejects.toMatchObject({ code: "codex_process_exited", message: expect.stringContaining("Request: initialize") }); second.child.emit("close", 1); await closed;
+  });
+  it.each([
+    [-32602, "Invalid parameters: private-provider-detail", "selected model"],
+    [-32603, "Required MCP server private-provider-detail failed to start", "enabled MCP servers"],
+    [-32000, "Authentication failed: private-provider-detail", "ChatGPT sign-in"],
+    [-32000, "Rate limit: private-provider-detail", "usage limits"],
+  ])("keeps the failed RPC stage and code %s without exposing server text", async (code, detail, advice) => {
+    const { client, requests, message } = worker();
+    const failure = client.call("thread/start").catch(error => error);
+    message({ id: requests[0].id, error: { code, message: detail } });
+    const error = await failure;
+    expect(error).toMatchObject({ code: "codex_rpc_failed", message: expect.stringContaining(`thread/start (RPC ${code})`) });
+    expect(error.message).toContain(advice);
+    expect(error.message).not.toContain("private-provider-detail");
+    client.close();
+  });
+  it.each([
+    ["ENOENT", "codex_not_found"], ["EACCES", "codex_start_failed"],
+  ])("distinguishes executable startup failure %s from sign-in", async (code, expected) => {
+    const { child, client } = worker();
+    const failed = client.call("initialize").catch(error => error);
+    child.emit("error", Object.assign(new Error("private-provider-detail"), { code }));
+    // A subsequent process-close notification must not overwrite the startup error.
+    child.emit("close", -1);
+    expect(await failed).toMatchObject({ code: expected });
+    expect((await client.call("model/list").catch(error => error)).message).not.toContain("private-provider-detail");
+    client.close();
+  });
+  it("reports a broken app-server protocol without displaying stdout", async () => {
+    const { child, client } = worker();
+    const failed = client.call("initialize").catch(error => error);
+    child.stdout.write("private-provider-detail\n");
+    expect(await failed).toMatchObject({ code: "codex_protocol_error", message: expect.not.stringContaining("private-provider-detail") });
+    client.close();
+  });
+  it.each([false, true])("preserves interruption reason during a running turn (timeout=%s)", async timeout => {
+    const { client, requests, message } = worker();
+    const controller = new AbortController();
+    const failed = client.turn("thread", [], controller.signal).catch(error => error);
+    message({ id: requests[0].id, result: { turn: { id: "turn" } } });
+    controller.abort(timeout ? new DOMException("private-provider-detail", "TimeoutError") : undefined);
+    expect(await failed).toMatchObject({ code: timeout ? "codex_timeout" : "codex_interrupted" });
+  });
+  it.each([false, true])("preserves interruption reason while initializing (timeout=%s)", async timeout => {
+    const { child, requests } = workerProcess();
+    vi.stubEnv("CODEX_CLI_PATH", "codex-test");
+    vi.mocked(spawn).mockReturnValue(child as unknown as ChildProcessWithoutNullStreams);
+    const controller = new AbortController(); const action = vi.fn();
+    const failed = withCodex(action, controller.signal).catch(error => error);
+    await vi.waitFor(() => expect(requests[0]?.method).toBe("initialize"));
+    controller.abort(timeout ? new DOMException("private-provider-detail", "TimeoutError") : undefined);
+    expect(await failed).toMatchObject({ code: timeout ? "codex_timeout" : "codex_interrupted" });
+    expect(action).not.toHaveBeenCalled();
+  });
+  it("reports a process exit during a running turn", async () => {
+    const { child, client, requests, message } = worker();
+    const failed = client.turn("thread", [], new AbortController().signal).catch(error => error);
+    message({ id: requests[0].id, result: { turn: { id: "turn" } } });
+    child.emit("close", 1);
+    expect(await failed).toMatchObject({ code: "codex_process_exited", message: expect.stringContaining("code 1") });
   });
   it("rejects server approval requests", async () => {
     const { client, requests, message } = worker();
