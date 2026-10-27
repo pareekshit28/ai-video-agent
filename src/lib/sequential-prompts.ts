@@ -15,9 +15,9 @@ export function promptPlanningSettings(settings: GenerationSettings) {
 // Read media once when checking an older fingerprint against its original step count.
 function promptFingerprint(project: AgentProject, clip: AgentClip) {
   const previous = project.clips[project.clips.findIndex(item => item.id === clip.id) - 1];
-  if (!previous?.frame || previous.status !== "complete") throw new RequestError("Finish the previous clip and save its last frame before planning this prompt.", "previous_clip_unfinished");
-  const observed = { id: previous.id, prompt: previous.compiledPrompt || previous.prompt, frame: previous.frame, video: previous.video, jobId: previous.jobId, media: previous.media };
-  const content: (string | Buffer)[] = [readFileSync(assetPath(project.id, previous.frame.path))];
+  if (!previous || previous.status !== "complete" || (project.settings.provider === "apimart" && !previous.frame)) throw new RequestError("Finish the previous clip before planning this prompt.", "previous_clip_unfinished");
+  const observed = { id: previous.id, prompt: previous.compiledPrompt || previous.prompt, frame: previous.frame, video: previous.video, jobId: previous.jobId, media: previous.media, ...(project.settings.provider !== "apimart" ? { latentId: previous.latentId, workflow: "h3-motion-context-v1" } : {}) };
+  const content: (string | Buffer)[] = previous.frame ? [readFileSync(assetPath(project.id, previous.frame.path))] : [];
   for (const reference of [...suppliedImages(project, clip), ...suppliedAudios(project, clip)]) {
     content.push(JSON.stringify(reference), readFileSync(assetPath(project.id, reference.asset.path)));
   }
@@ -74,7 +74,7 @@ export async function prepareSequentialPrompt(id: string, clipId: string, model:
     const target = current.clips[index];
     if (["complete", "failed"].includes(target.status)) target.revision = { ...target.revision, prompt, referenceIds: clip.referenceIds, comments: target.revision?.comments || "", model, createdAt: Date.now() };
     else Object.assign(target, { outline: target.outline || target.prompt, prompt, compiledPrompt: prompt, referenceIds: clip.referenceIds, revision: undefined, status: "pending", promptGuideVersion: wanPromptGuideVersion });
-    target.promptContextKey = key; target.promptFromFrame = current.clips[index - 1].frame!.path;
+    target.promptContextKey = key; target.promptFromFrame = current.clips[index - 1].frame?.path; target.promptFromLatent = current.clips[index - 1].latentId;
     target.promptFromJob = current.clips[index - 1].jobId; target.promptPlanError = undefined; target.approvedPromptKey = undefined;
     return current;
   });

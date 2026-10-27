@@ -75,7 +75,7 @@ async function submit(value: unknown, agent: boolean, expectedEndpoint?: string)
   let result: Partial<H3Job>;
   try {
     // Never retry /run automatically: a lost response may have started a paid job.
-    const response = await fetch(`https://api.runpod.ai/v2/${endpoint}/run`, { method: "POST", headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify(buildPayload(input.settings, input.images, input.audios, input.firstFrame)), signal: AbortSignal.timeout(60000), redirect: "error", cache: "no-store" });
+    const response = await fetch(`https://api.runpod.ai/v2/${endpoint}/run`, { method: "POST", headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify(buildPayload(input.settings, input.images, input.audios, { clipId: input.clipId || input.requestId, previousClipId: input.previousClipId })), signal: AbortSignal.timeout(60000), redirect: "error", cache: "no-store" });
     if (!response.ok) {
       const rejected = response.status >= 400 && response.status < 500 && response.status !== 408;
       result = { status: rejected ? "REJECTED" : "SUBMISSION_UNKNOWN", error: providerError(response.status) };

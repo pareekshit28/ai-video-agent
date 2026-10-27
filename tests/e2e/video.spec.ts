@@ -30,9 +30,14 @@ test("H3 controls, image and audio refs, submission, recovery and playable outpu
   await expect(page.getByAltText("Picture 1 preview")).toBeVisible();
   await page.getByLabel("Upload voice references").setInputFiles({ name: "voice.wav", mimeType: "audio/wav", buffer: wav() });
   await expect(page.getByLabel("Preview Audio 1")).toBeVisible();
+  await expect(page.getByLabel("Duration (seconds)")).toHaveValue("5");
+  await expect(page.getByLabel("Megapixels", { exact: true })).toHaveValue("2");
   await page.getByLabel("Duration (seconds)").fill("7.5");
   await page.getByLabel("Megapixels", { exact: true }).fill("2");
   await page.getByText("Advanced settings", { exact: true }).click();
+  await expect(page.getByLabel("Seed (−1 = random)")).toHaveValue("158062420567623");
+  await expect(page.getByLabel("Steps", { exact: true })).toHaveValue("6");
+  await expect(page.getByLabel("Reference image quality")).toHaveValue("max");
   await page.getByLabel("Seed (−1 = random)").fill("42");
   await page.getByLabel("Steps", { exact: true }).fill("8");
   await page.getByRole("button", { name: "Generate video", exact: true }).click();

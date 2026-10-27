@@ -5,7 +5,7 @@ import { publicReferenceUrlSchema } from "./public-reference-url";
 export function clipReferenceBudget(project: AgentProject, clip: AgentClip) {
   const refs = suppliedImages(project, clip), audios = suppliedAudios(project, clip);
   const previous = project.clips[project.clips.findIndex(item => item.id === clip.id) - 1];
-  const usesFrame = previousFrameDecision(clip) && Boolean(previous);
+  const usesFrame = project.settings.provider === "apimart" && previousFrameDecision(clip) && Boolean(previous);
   const frameBytes = usesFrame ? previous?.frame?.bytes || 0 : 0;
   const bytes = [...refs, ...audios].reduce((sum, slot) => sum + slot.asset.bytes, 0) + frameBytes;
   const issues: string[] = [];

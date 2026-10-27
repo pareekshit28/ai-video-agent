@@ -19,7 +19,7 @@ import { createProject, getProject, updateProject, writeAsset, assetPath, projec
 import { reserveRun, executeProject, inputFor, isProjectActive, publicProject, retryClip, recoverClip } from "../src/lib/agent-runner";
 import { discardProcessedSource, downloadOutput, finalizeClip, probeMedia, publicAddress } from "../src/lib/agent-media";
 import { GET as mediaRoute } from "../src/app/api/agent/media/route";
-import { POST as projectRoute } from "../src/app/api/agent/project/route";
+import { POST as projectRoute, GET as getProjectRoute } from "../src/app/api/agent/project/route";
 import { POST as frameRoute } from "../src/app/api/agent/frame/route";
 import { POST as analyzeRoute } from "../src/app/api/agent/analyze/route";
 import { POST as projectsRoute } from "../src/app/api/agent/projects/route";
@@ -47,7 +47,9 @@ describe("individual clip duration", () => {
     expect((await set(7.5)).status).toBe(200);
     let saved = await getProject(value.id);
     expect(saved.clips[0].duration).toBe(7.5); expect(saved.clips[1]).toEqual(value.clips[1]);
-    for (const duration of [0, 1, 10.5, 31]) expect((await set(duration)).status).toBe(400);
+    expect((await set(10)).status).toBe(200);
+    expect((await set(9.5)).status).toBe(200);
+    for (const duration of [0, 1, 10.5, 15, 31]) expect((await set(duration)).status).toBe(400);
     expect((await set(5, "missing")).status).toBe(400);
     await updateProject(value.id, current => { current.settings.provider = "apimart"; return current; });
     expect((await set(30)).status).toBe(200); expect((await set(2.5)).status).toBe(400);
@@ -61,7 +63,7 @@ describe("individual clip duration", () => {
       expect((await projectRoute(localMutation("agent/project", { projectId: value.id, action: "setDuration", clipId: "boarding", duration: 6 }))).status).toBe(200);
       const saved = await getProject(value.id);
       expect(saved.clips[0]).toMatchObject({ duration: 2, nextDuration: 5, requestedDuration: 2 });
-      return { localId: input.requestId, id: "original-job", endpoint: "xnnd4qobofshqz", prompt: input.settings.prompt, status: "COMPLETED", createdAt: Date.now(), output: { video: `data:video/mp4;base64,${video.toString("base64")}` } };
+      return { localId: input.requestId, id: "original-job", endpoint: "xnnd4qobofshqz", prompt: input.settings.prompt, status: "COMPLETED", delayTime: 0, executionTime: 2500, createdAt: Date.now(), output: { video: `data:video/mp4;base64,${video.toString("base64")}` } };
     });
     await executeProject(value.id, await reserveRun(value.id, "test-model", { clipId: "arrival" }), { compile: async () => [], submit });
     let saved = await getProject(value.id);
@@ -72,11 +74,17 @@ describe("individual clip duration", () => {
     expect(stopNext.mock.calls[0][0].settings.duration).toBe(6);
     expect((await getProject(value.id)).clips[1].nextDuration).toBeUndefined();
     const originalVideo = saved.clips[0].video;
+    const originalLatent = saved.clips[0].latentId;
     expect((await projectRoute(localMutation("agent/project", { projectId: value.id, action: "prepareClip", clipId: "arrival", prompt: "A slower arrival.", referenceIds: ["traveler"] }))).status).toBe(200);
     const retry = vi.fn(async (input) => ({ localId: input.requestId, id: "new-job", endpoint: "xnnd4qobofshqz", prompt: input.settings.prompt, status: "FAILED", createdAt: Date.now(), error: "Test render stopped" }));
     await executeProject(value.id, await reserveRun(value.id, "test-model", { clipId: "arrival", revision: true }), { compile: async () => [], submit: retry });
     saved = await getProject(value.id);
     expect(retry.mock.calls[0][0].settings.duration).toBe(5);
+    expect(saved.clips[0].latentId).not.toBe(originalLatent);
+    expect(saved.clips[0].versions![0].clip.latentId).toBe(originalLatent);
+    expect(saved.clips[0].versions![0].clip).toMatchObject({ delayTime: 0, executionTime: 2500 });
+    expect(saved.clips[0].delayTime).toBeUndefined();
+    expect(saved.clips[0].executionTime).toBeUndefined();
     expect(saved.clips[0].duration).toBe(5); expect(saved.clips[0].nextDuration).toBeUndefined();
     expect(saved.clips[0].versions![0].clip).toMatchObject({ duration: 2, video: originalVideo, media: { duration: 2 } });
     expect(await readFile(assetPath(value.id, originalVideo!.path))).toBeTruthy();
@@ -252,7 +260,7 @@ describe("reference upload validation before generation", () => {
     expect(built.input.audios[0].base64).toBe(voice.base64);
     expect(saved.references[0].audios![0].publicUrl).toBe("https://media.example/traveler.wav");
     expect(built.input.settings.prompt).toContain("<Audio 1>"); expect(built.input.settings.prompt).toContain("Traveler");
-    const payload = buildPayload(built.input.settings, built.input.images, built.input.audios);
+    const payload = buildPayload(built.input.settings, built.input.images, built.input.audios, { clipId: built.input.clipId || built.input.requestId, previousClipId: built.input.previousClipId });
     expect(payload.input.workflow["124"].inputs.steps).toBe(18);
     expect(Object.values(payload.input.workflow).some(node => node.class_type === "LoadAudio")).toBe(true);
     expect(payload.input.images.find(file => file.name === "reference-audio-1.wav")?.image).toBe(voice.base64);
@@ -269,7 +277,7 @@ describe("reference upload validation before generation", () => {
     expect((await referenceRoute(localMutation("agent/reference", { projectId: value.id, slotId: "traveler", characterId: character.id }))).status).toBe(200);
     const videoAsset = await writeAsset(value.id, "clips/arrival.mp4", video, "video/mp4", "arrival.mp4");
     const frameAsset = await writeAsset(value.id, "frames/arrival.png", png, "image/png", "arrival.png");
-    await updateProject(value.id, current => { current.clips[0].status = "complete"; current.clips[0].video = videoAsset; current.clips[0].frame = frameAsset; current.clips[1].compiledPrompt = "Stale compiled prompt"; return current; });
+    await updateProject(value.id, current => { current.clips[0].status = "complete"; current.clips[0].latentId = crypto.randomUUID(); current.clips[0].video = videoAsset; current.clips[0].frame = frameAsset; current.clips[1].compiledPrompt = "Stale compiled prompt"; return current; });
     const response = await referenceRoute(localMutation("agent/reference", { projectId: value.id, slotId: "traveler", action: "clearLibraryAsset" }));
     expect(response.status).toBe(200);
     const saved = await getProject(value.id);
@@ -365,7 +373,7 @@ describe("reference upload validation before generation", () => {
     value.clips[0].referenceIds = ["traveler"];
     value.clips[1].referenceIds = ["station"];
     expect(projectReferenceIssues(value)).toEqual([]);
-    expect(clipReferenceBudget(value, value.clips[1])).toMatchObject({ bytes: 4_000_000, count: 1, pendingFrame: true });
+    expect(clipReferenceBudget(value, value.clips[1])).toMatchObject({ bytes: 4_000_000, count: 1, pendingFrame: false });
     delete value.references[1].asset;
     expect(clipReferenceBudget(value, value.clips[1])).toMatchObject({ bytes: 0, count: 0 });
   });
@@ -384,8 +392,11 @@ describe("reference upload validation before generation", () => {
     value.references[1].asset = { ...value.references[0].asset!, bytes: 2_000_000 };
     value.clips[0].status = "complete";
     value.clips[0].frame = { ...value.references[0].asset!, bytes: 1_100_000 };
-    expect(projectReferenceIssues(value)).toHaveLength(1);
-    expect(projectReferenceIssues(value)[0].message).toContain("including the previous clip’s last frame");
+    expect(projectReferenceIssues(value)).toEqual([]);
+    expect(clipReferenceBudget(value, value.clips[1]).frameBytes).toBe(0);
+    value.settings.provider = "apimart";
+    expect(clipReferenceBudget(value, value.clips[1]).frameBytes).toBe(1_100_000);
+    value.settings.provider = "runpod";
     value.clips[1].continuityMode = "off";
     expect(projectReferenceIssues(value)).toEqual([]);
   });
@@ -467,23 +478,14 @@ describe("scene planning and reference selection", () => {
     expect(submit).toHaveBeenCalledTimes(1); expect(submit.mock.calls[0][0].settings.steps).toBe(18); expect(submit.mock.calls[0][0].settings.prompt).toContain(prompt!);
     expect(planning.call).toHaveBeenCalledTimes(1); expect((await getProject(value.id)).clips[1].status).toBe("complete");
   }, 20000);
-  it("recovers an older prompt fingerprint after steps were already changed without accepting a changed frame", async () => {
+  it("invalidates old frame-only H3 prompt contexts after moving to latent continuity", async () => {
     const value = await sequentialScene(); planning.call.mockResolvedValue({ prompt: "Static shot. She boards." }); await finishFirst(value);
-    const before = await getProject(value.id), previous = before.clips[0], clip = before.clips[1];
-    // Reproduce the old fingerprint, including the original settings property order.
-    const originalSettings = { ...before.settings, provider: "runpod" as const };
-    const hash = createHash("sha256");
-    hash.update(JSON.stringify({ previous: { id: previous.id, prompt: previous.compiledPrompt || previous.prompt, frame: previous.frame, video: previous.video, jobId: previous.jobId, media: previous.media }, target: { duration: clip.duration, references: clip.referenceIds, continuation: previousFrameDecision(clip), settings: originalSettings } }));
-    const originalFrame = await readFile(assetPath(value.id, previous.frame!.path)); hash.update(originalFrame);
-    for (const ref of [...suppliedImages(before, clip), ...suppliedAudios(before, clip)]) { hash.update(JSON.stringify(ref)); hash.update(await readFile(assetPath(value.id, ref.asset.path))); }
-    await updateProject(value.id, current => { current.settings = { provider: "runpod", ...current.settings, steps: 22 }; Object.assign(current.clips[1], { status: "failed", jobId: "failed-old-job", requestId: crypto.randomUUID(), promptContextKey: hash.digest("hex") }); return current; });
-    const changed = await getProject(value.id);
-    await writeAsset(value.id, previous.frame!.path, Buffer.concat([originalFrame, Buffer.from("changed")]), previous.frame!.mime, previous.frame!.name);
-    expect(() => assertPreviousPromptReady(changed, changed.clips[1])).toThrow("Plan this prompt");
-    await writeAsset(value.id, previous.frame!.path, originalFrame, previous.frame!.mime, previous.frame!.name);
-    const response = await projectRoute(localMutation("agent/project", { projectId: value.id, action: "prepareClip", clipId: "boarding", prompt: clip.compiledPrompt, referenceIds: clip.referenceIds }));
-    expect(response.status).toBe(200); expect((await response.json()).project.clips[1].promptContextKey).toMatch(/^v2:/);
-    expect(planning.call).toHaveBeenCalledTimes(1);
+    await updateProject(value.id, current => { current.clips[1].promptContextKey = "a".repeat(64); return current; });
+    const before = await getProject(value.id);
+    expect(() => assertPreviousPromptReady(before, before.clips[1])).toThrow("Plan this prompt");
+    await prepareSequentialPrompt(value.id, "boarding", "test-model");
+    const after = await getProject(value.id);
+    expect(() => assertPreviousPromptReady(after, after.clips[1])).not.toThrow();
   }, 15000);
   it("defers later prompts, inspects the actual saved last frame automatically, and waits for review", async () => {
     const value = await sequentialScene();
@@ -629,6 +631,22 @@ describe("scene planning and reference selection", () => {
     planning.call.mockRejectedValue(new Error("Codex stopped before the response completed"));
     await expect(analyzeScript("Scene", "test-model")).rejects.toThrow("before the response completed");
   });
+  it("plans a ten-second H3 scene as one clip and uses the same limit for compiled and revised prompts", async () => {
+    planning.call.mockResolvedValue({ ...plan, clips: [{ ...plan.clips[0], duration: 10, transition: "first", continuityReason: "Start of the scene." }] });
+    const result = await analyzeScript("The traveler reads the complete letter.", "test-model");
+    expect(result.clips).toHaveLength(1);
+    expect(result.clips[0].duration).toBe(10);
+    expect(planning.call.mock.calls[0][1]).toContain("never exceed 10 seconds");
+    expect(planning.call.mock.calls[0][1]).toContain("Prefer 8–10-second clips");
+    const value = await project(false);
+    value.clips = [{ ...value.clips[0], duration: 10 }];
+    planning.call.mockResolvedValue({ clips: [{ id: value.clips[0].id, prompt: "Static shot. The traveler reads the letter." }] });
+    await compilePrompts(value);
+    expect(planning.call.mock.calls[1][1]).toContain("at most 10 seconds");
+    planning.call.mockResolvedValue({ prompt: "Static shot. The traveler reads slowly." });
+    await reviseClipPrompt(value, value.clips[0].id, "Read slowly", "test-model");
+    expect(planning.call.mock.calls[2][1]).toContain("at most 10 seconds");
+  });
   it("omits empty slots and assigns contiguous picture tags only to provided images", async () => {
     const value = await project(); value.reasoningEffort = "medium"; let compiledContent: Record<string, any> | undefined;
     planning.call.mockImplementation(vi.fn(async (_model, _instructions, content) => {
@@ -642,12 +660,54 @@ describe("scene planning and reference selection", () => {
     const built = await inputFor(value, value.clips[0]);
     expect(built.input.images).toHaveLength(1); expect(built.input.settings.prompt).toContain("<Picture 1>"); expect(built.input.settings.prompt).not.toContain("<Picture 2>");
     const empty = await project(false); expect((await inputFor(empty, empty.clips[0])).input.images).toEqual([]);
-    await expect(inputFor(value, value.clips[1])).rejects.toThrow("previous clip's saved last frame");
+    await expect(inputFor(value, value.clips[1])).rejects.toThrow("previous clip's saved H3 latent");
   });
   it("rejects mismatched compiled prompts before submitting any GPU jobs", async () => {
     const value = await project(); const fetch = vi.fn().mockResolvedValue({ clips: [{ id: "invented", prompt: "Wrong" }] }); planning.call.mockImplementation(fetch);
     const controller = await reserveRun(value.id, "test-model"); await executeProject(value.id, controller);
     const saved = await getProject(value.id); expect(saved.status).toBe("paused"); expect(saved.clips[0].requestId).toBeUndefined(); expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("saved provider timing", () => {
+  it("hydrates older clips and previous takes from matching local jobs without exposing other job data", async () => {
+    const value = await project(false);
+    const originalRequest = crypto.randomUUID(), currentRequest = crypto.randomUUID();
+    await updateProject(value.id, current => {
+      const clip = current.clips[0];
+      clip.requestId = currentRequest;
+      clip.versions = [{ archivedAt: Date.now(), clip: { ...clip, requestId: originalRequest } }];
+      return current;
+    });
+    memory.db.h3Jobs = [
+      { localId: currentRequest, endpoint: "test", prompt: "Secret prompt", status: "COMPLETED", createdAt: 1, delayTime: 0, executionTime: 1250, output: { privateOutput: "do-not-return" } },
+      { localId: originalRequest, endpoint: "test", prompt: "Old prompt", status: "COMPLETED", createdAt: 1, delayTime: 500, executionTime: 2500 },
+    ];
+    const response = await getProjectRoute(new Request(`http://127.0.0.1:3000/api/agent/project?projectId=${value.id}`, { headers: { Host: "127.0.0.1:3000" } }));
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data.project.clips[0]).toMatchObject({ delayTime: 0, executionTime: 1250 });
+    expect(data.project.clips[0].versions[0].clip).toMatchObject({ delayTime: 500, executionTime: 2500 });
+    expect(data.project.clips[1].delayTime).toBeUndefined();
+    expect(JSON.stringify(data)).not.toContain("do-not-return");
+  });
+});
+
+describe("H3 latent continuity state", () => {
+  it("uses the persisted previous UUID without reading a last frame and omits it for manual cuts", async () => {
+    const value = await project(false);
+    Object.assign(value.clips[0], { status: "complete", latentId: crypto.randomUUID() });
+    Object.assign(value.clips[1], { requestId: crypto.randomUUID() });
+    const first = await inputFor(value, value.clips[1]);
+    const second = await inputFor(value, value.clips[1]);
+    expect(first.input.clipId).toBe(second.input.clipId);
+    expect(first.input.previousClipId).toBe(value.clips[0].latentId);
+    expect(first.input.firstFrame).toBeUndefined();
+    value.clips[1].continuityMode = "off";
+    expect((await inputFor(value, value.clips[1])).input.previousClipId).toBeUndefined();
+    delete value.clips[0].latentId;
+    value.clips[1].continuityMode = "on";
+    await expect(inputFor(value, value.clips[1])).rejects.toThrow("saved H3 latent");
   });
 });
 
@@ -662,20 +722,26 @@ describe("fewer clips and automatic frame continuity", () => {
     for (let index = 0; index < 5; index++) expect(output.clips[0].prompt).toContain(`Dialogue: "Line ${index}."`);
     expect(output.clips[0].prompt).toContain("8–10s:"); expect(output.clips[0].referenceIds).toEqual(["station", "traveler"]); expect(input.clips).toHaveLength(5);
   });
-  it("reuses the last frame for direct continuation but starts fresh for cuts, locations and time jumps", async () => {
+  it("loads the saved latent for direct continuation but starts fresh for cuts, locations and time jumps", async () => {
     const clips = [shot(0, 8, "first"), { ...shot(1, 8, "continue"), continuation: false }, { ...shot(2, 8, "cut"), continuation: true }, { ...shot(3, 8, "scene-change"), continuation: true }, { ...shot(4, 8, "time-jump"), continuation: true }];
     const optimized = automaticPlan({ ...plan, clips });
     expect(optimized.clips.map(clip => clip.continuation)).toEqual([false, true, false, false, false]); expect(optimized.clips).toHaveLength(5);
     const value = await project();
     await updateProject(value.id, current => { current.clips = optimized.clips.map(clip => ({ ...clip, status: "pending" })); return current; });
     const frame = await writeAsset(value.id, "frames/shot_0.jpg", Buffer.from([255, 216, 255, 217]), "image/jpeg", "last-frame.jpg");
-    await updateProject(value.id, current => { current.clips[0].status = "complete"; current.clips[0].frame = frame; return current; });
+    await updateProject(value.id, current => { current.clips[0].status = "complete"; current.clips[0].latentId = crypto.randomUUID(); current.clips[0].frame = frame; return current; });
     const saved = await getProject(value.id);
-    expect((await inputFor(saved, saved.clips[1])).firstFrameFrom).toBe("shot_0");
+    expect((await inputFor(saved, saved.clips[1])).input.previousClipId).toBe(saved.clips[0].latentId);
     for (const clip of saved.clips.slice(2)) expect((await inputFor(saved, clip)).input.firstFrame).toBeUndefined();
   });
-  it("does not merge across cuts, manual decisions, ten-second capacity or nine-reference limits", () => {
-    expect(compactPlan({ ...plan, clips: [shot(0, 6, "first"), shot(1, 6, "continue")] }).clips).toHaveLength(2);
+  it("packs continuous actions up to ten seconds without losing beats", () => {
+    const output = automaticPlan({ ...plan, clips: [shot(0, 5, "first"), shot(1, 5, "continue"), shot(2, 5, "continue"), shot(3, 2, "continue")] });
+    expect(output.clips.map(clip => clip.duration)).toEqual([10, 7]);
+    expect(output.clips[1].prompt).toContain("0–5s:");
+    expect(output.clips[1].prompt).toContain('Dialogue: "Line 2."');
+  });
+  it("does not merge across cuts, manual decisions, fifteen-second capacity or nine-reference limits", () => {
+    expect(compactPlan({ ...plan, clips: [shot(0, 8, "first"), shot(1, 8, "continue")] }).clips).toHaveLength(2);
     for (const boundary of ["cut", "scene-change", "time-jump"] as const) expect(compactPlan({ ...plan, clips: [shot(0, 2, "first"), shot(1, 2, boundary)] }).clips).toHaveLength(2);
     expect(compactPlan({ ...plan, clips: [shot(0, 2, "first"), { ...shot(1, 2, "continue"), continuityMode: "off" }] }).clips).toHaveLength(2);
     const references = Array.from({ length: 10 }, (_, i) => ({ ...plan.references[0], id: `ref_${i}` }));
@@ -716,7 +782,7 @@ describe("last-frame replacement and feedback-driven clip retries", () => {
     const value = await project();
     const savedVideo = await writeAsset(value.id, "clips/original.mp4", video, "video/mp4", "original.mp4");
     const frame = await writeAsset(value.id, "frames/original.png", png, "image/png", "original.png");
-    await updateProject(value.id, current => { Object.assign(current.clips[0], { status: "complete", requestId: crypto.randomUUID(), jobId: "original-job", video: savedVideo, frame, extractedFrame: frame }); return current; });
+    await updateProject(value.id, current => { Object.assign(current.clips[0], { status: "complete", latentId: crypto.randomUUID(), requestId: crypto.randomUUID(), jobId: "original-job", video: savedVideo, frame, extractedFrame: frame }); return current; });
     return getProject(value.id);
   }
   it("keeps the video and extracted frame, replaces the guide and restores it across reloads", async () => {
@@ -728,7 +794,7 @@ describe("last-frame replacement and feedback-driven clip retries", () => {
     expect(saved.clips[0].frameReplaced).toBe(true); expect(saved.clips[0].video).toEqual(value.clips[0].video); expect(saved.clips[0].extractedFrame).toEqual(value.clips[0].frame);
     expect(saved.clips[1].continuityOutdated).toBe(true);
     expect(await readFile(assetPath(value.id, saved.clips[0].frame!.path))).toEqual(png);
-    const input = await inputFor(saved, saved.clips[1]); expect(input.input.firstFrame?.name).toBe("continuity-arrival.png"); expect(input.input.firstFrame?.base64).toBe(png.toString("base64"));
+    const input = await inputFor(saved, saved.clips[1]); expect(input.input.firstFrame).toBeUndefined(); expect(input.input.previousClipId).toBe(saved.clips[0].latentId);
     const restored = await frameRoute(request(value.id, { clipId: "arrival", restore: true }, "frame")); expect(restored.status).toBe(200);
     expect((await getProject(value.id)).clips[0].frame).toEqual(value.clips[0].frame);
     expect(await readFile(assetPath(value.id, value.clips[0].video!.path))).toEqual(video);
@@ -740,8 +806,8 @@ describe("last-frame replacement and feedback-driven clip retries", () => {
     const response = await frameRoute(request(value.id, { clipId: "arrival", file: { name: "replacement.png", bytes: changed.length, base64: changed.toString("base64") } }, "frame"));
     expect(response.status).toBe(200);
     const updated = await getProject(value.id), after = await inputFor(updated, updated.clips[1]);
-    expect(after.input.firstFrame!.name).toBe(before.input.firstFrame!.name);
-    expect(Buffer.from(after.input.firstFrame!.base64, "base64")).toEqual(changed);
+    expect(after.input.firstFrame).toBeUndefined();
+    expect(after.input.previousClipId).toBe(before.input.previousClipId);
     const submit = vi.fn(async (input) => ({ localId: input.requestId, id: "retry-current", endpoint: "xnnd4qobofshqz", prompt: input.settings.prompt, status: "COMPLETED", createdAt: Date.now(), output: { video: `data:video/mp4;base64,${video.toString("base64")}` } }));
     await executeProject(value.id, await reserveRun(value.id, "test-model", { clipId: "arrival", retryCurrent: true }), { compile: async () => [], submit });
     const saved = await getProject(value.id);
@@ -813,14 +879,14 @@ describe("last-frame replacement and feedback-driven clip retries", () => {
     expect(saved.clips[1]).toEqual(value.clips[1]); expect(saved.clips[0].versions?.[0].clip.video).toEqual(value.clips[0].video); expect(saved.clips[0].video!.path).not.toBe(value.clips[0].video!.path); expect(await readFile(assetPath(value.id, value.clips[0].video!.path))).toEqual(video);
     const previous = await mediaRoute(new Request(`http://127.0.0.1:3000/api/agent/media?projectId=${value.id}&kind=video&id=arrival&version=0`, { headers: { Host: "127.0.0.1:3000" } })); expect(Buffer.from(await previous.arrayBuffer())).toEqual(video);
   }, 15000);
-  it("pauses after each saved clip for review, then continues with its replacement frame", async () => {
+  it("pauses after each saved clip for review, then continues with its saved latent", async () => {
     const value = await project(); await updateProject(value.id, current => { current.reviewAfterEachClip = true; return current; });
     const submit = vi.fn(async (input) => ({ localId: input.requestId, id: crypto.randomUUID(), endpoint: "xnnd4qobofshqz", prompt: input.settings.prompt, status: "COMPLETED", createdAt: Date.now(), output: { video: `data:video/mp4;base64,${video.toString("base64")}` } }));
     await executeProject(value.id, await reserveRun(value.id, "test-model"), { compile: async () => [], submit });
     const paused = await getProject(value.id); expect(paused.status).toBe("paused"); expect(paused.clips[0].status).toBe("complete"); expect(paused.clips[1].status).toBe("pending"); expect(isProjectActive(value.id)).toBe(false);
     expect((await frameRoute(request(value.id, { clipId: "arrival", file: { name: "guide.png", bytes: png.length, base64: png.toString("base64") } }, "frame"))).status).toBe(200);
     await executeProject(value.id, await reserveRun(value.id, "test-model"), { compile: async () => [], submit });
-    expect(submit).toHaveBeenCalledTimes(2); expect(submit.mock.calls[1][0].firstFrame?.base64).toBe(png.toString("base64")); expect((await getProject(value.id)).status).toBe("complete");
+    expect(submit).toHaveBeenCalledTimes(2); expect(submit.mock.calls[1][0].previousClipId).toBe((await getProject(value.id)).clips[0].latentId); expect((await getProject(value.id)).status).toBe("complete");
   }, 20000);
   it("resumes an interrupted retry without submitting again or running other pending clips", async () => {
     const value = await completedClip();
@@ -836,7 +902,7 @@ describe("last-frame replacement and feedback-driven clip retries", () => {
 });
 
 describe("sequential generation with real FFmpeg and durable media", () => {
-  it("saves both videos and final frames, then uses the preceding frame at index zero", async () => {
+  it("saves videos, timings and per-take UUIDs, then loads the preceding latent", async () => {
     const value = await project(); const submissions: any[] = []; let savedBeforeNext = false;
     planning.call.mockResolvedValue({ clips: value.clips.map(clip => ({ id: clip.id, prompt: clip.prompt })) });
     const fetch = vi.fn(async (url: string, options?: RequestInit) => {
@@ -844,17 +910,20 @@ describe("sequential generation with real FFmpeg and durable media", () => {
         if (submissions.length) { const saved = await getProject(value.id); expect(saved.clips[0].status).toBe("complete"); expect((await readFile(assetPath(value.id, saved.clips[0].video!.path))).length).toBeGreaterThan(1000); savedBeforeNext = true; }
         submissions.push(JSON.parse(String(options?.body))); return Response.json({ id: `job-${submissions.length}`, status: "IN_QUEUE" });
       }
-      return Response.json({ status: "COMPLETED", output: { video: `data:video/mp4;base64,${video.toString("base64")}` } });
+      return Response.json({ status: "COMPLETED", delayTime: 1250, executionTime: 68750, output: { video: `data:video/mp4;base64,${video.toString("base64")}` } });
     }); vi.stubGlobal("fetch", fetch);
     await executeProject(value.id, await reserveRun(value.id, "test-model"), { pollMs: 1 });
     const saved = await getProject(value.id);
     expect(saved.error).toBeUndefined(); expect(saved.status).toBe("complete"); expect(isProjectActive(value.id)).toBe(false); expect(savedBeforeNext).toBe(true); expect(submissions).toHaveLength(2);
-    expect(submissions[0].input.images).toHaveLength(1); expect(submissions[1].input.images).toHaveLength(2);
+    expect(submissions[0].input.images).toHaveLength(1); expect(submissions[1].input.images).toHaveLength(1);
     const workflow = submissions[1].input.workflow;
-    expect(workflow.agent_frame_guide).toEqual({ class_type: "MiniMaxH3AddGuide", inputs: { positive: ["136", 0], latent: ["136", 1], vae: ["119", 0], image: ["agent_first_frame", 0], frame_idx: 0 } });
-    expect(workflow["126"].inputs.conditioning).toEqual(["agent_frame_guide", 0]); expect(workflow["125"].inputs.latent_image).toEqual(["136", 1]);
-    expect(submissions[1].input.images[1].image).toBe((await readFile(assetPath(value.id, saved.clips[0].frame!.path))).toString("base64"));
-    expect(saved.clips[1].firstFrameFrom).toBe("arrival");
+    expect(workflow.agent_frame_guide).toBeUndefined();
+    expect(workflow["158"].inputs.clip_id).toBe(saved.clips[0].latentId);
+    expect(workflow["159"].inputs.clip_id).toBe(saved.clips[1].latentId);
+    expect(workflow["126"].inputs.conditioning).toEqual(["160", 0]);
+    expect(workflow["125"].inputs.latent_image).toEqual(["136", 1]);
+    expect(saved.clips[1].previousLatentId).toBe(saved.clips[0].latentId);
+    expect(saved.clips.every(clip => clip.delayTime === 1250 && clip.executionTime === 68750)).toBe(true);
     for (const clip of saved.clips) { expect(await probeMedia(assetPath(value.id, clip.video!.path))).toMatchObject({ duration: 2, fps: 24 }); expect((await readFile(assetPath(value.id, clip.frame!.path))).subarray(0, 2)).toEqual(Buffer.from([255, 216])); }
     expect((await readdir(join(projectFolder(value.id), "clips"))).sort()).toEqual(["arrival.mp4", "boarding.mp4"]);
     expect(saved.clips.every(clip => clip.source?.path === clip.video?.path)).toBe(true);
@@ -867,7 +936,7 @@ describe("sequential generation with real FFmpeg and durable media", () => {
     const value = await project(false);
     const { execFile } = await import("node:child_process"); const { promisify } = await import("node:util");
     const longPath = assetPath(value.id, "clips/long.mp4");
-    await promisify(execFile)(process.env.FFMPEG_PATH || "ffmpeg", ["-v", "error", "-stream_loop", "5", "-i", fileURLToPath(new URL("./fixtures/agent-preview.mp4", import.meta.url)), "-c", "copy", longPath], { windowsHide: true });
+    await promisify(execFile)(process.env.FFMPEG_PATH || "ffmpeg", ["-v", "error", "-stream_loop", "8", "-i", fileURLToPath(new URL("./fixtures/agent-preview.mp4", import.meta.url)), "-c", "copy", longPath], { windowsHide: true });
     const source = { path: "clips/long.mp4", name: "long.mp4", bytes: 1, mime: "video/mp4" };
     const saved = await finalizeClip(value.id, "ten_seconds", source, 10, new AbortController().signal);
     expect(saved.media.duration).toBe(10); expect(saved.media.fps).toBe(24); expect(saved.frame.bytes).toBeGreaterThan(100);
@@ -1017,7 +1086,7 @@ describe("sequential generation with real FFmpeg and durable media", () => {
     expect(output.media.duration).toBeGreaterThan(11.9);
     expect(Math.abs(output.media.duration - original.duration)).toBeLessThan(0.06);
     expect((await readFile(assetPath(value.id, output.frame.path))).length).toBeGreaterThan(0);
-    await expect(finalizeClip(value.id, "h3-overlong", source, 12, new AbortController().signal)).rejects.toThrow("2–10");
+    await expect(finalizeClip(value.id, "h3-overlong", source, 16, new AbortController().signal)).rejects.toThrow("2–10");
   }, 20000);
   it("waits for approval before submitting a clip and uses the approved edited text", async () => {
     const value = await project(false);

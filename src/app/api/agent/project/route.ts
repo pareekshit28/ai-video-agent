@@ -2,7 +2,7 @@ import { defaultReasoningEffort, reasoningEffortSchema } from "@/lib/reasoning";
 import { z } from "zod";
 import { assertLocalRequest } from "@/lib/config";
 import { apiError, privateHeaders } from "@/lib/http";
-import { readJson } from "@/lib/runpod";
+import { jobHistory, readJson } from "@/lib/runpod";
 import { getProject, updateProject } from "@/lib/agent-store";
 import { generationSchema, needsPreviousPrompt, previousFrameDecision, shotSchema, wanShotSchema, entityIdSchema, type AgentProject } from "@/lib/agent-types";
 import { optimizeScriptPlan, reviseClipPrompt, planFromReferences } from "@/lib/agent-llm";
@@ -31,7 +31,7 @@ function validateReferences(project: AgentProject, ids: string[]) {
   return ids;
 }
 export async function GET(request: Request) {
-  try { assertLocalRequest(request); const id = new URL(request.url).searchParams.get("projectId") || ""; return Response.json({ project: publicProject(await getProject(id)) }, { headers: privateHeaders }); } catch (error) { return apiError(error); }
+  try { assertLocalRequest(request); const id = new URL(request.url).searchParams.get("projectId") || ""; const [project, history] = await Promise.all([getProject(id), jobHistory()]); return Response.json({ project: publicProject(project, history) }, { headers: privateHeaders }); } catch (error) { return apiError(error); }
 }
 export async function POST(request: Request) {
   try {
@@ -124,7 +124,7 @@ export async function POST(request: Request) {
         if (JSON.stringify(current) !== JSON.stringify(snapshot)) throw new RequestError("The project changed while revising. Your saved clip was kept; try again.", "project_changed");
         if (contextKey && previousPromptKey(current, { ...clip, referenceIds }) !== contextKey) throw new RequestError("The previous frame changed while revising. Refresh this prompt again.", "project_changed");
         current.clips.find(clip => clip.id === data.clipId)!.revision = { prompt, referenceIds, comments: data.comments, model: data.model, reasoningEffort: data.reasoningEffort || snapshot.reasoningEffort || defaultReasoningEffort, createdAt: Date.now() };
-        if (contextKey) Object.assign(current.clips.find(item => item.id === data.clipId)!, { promptContextKey: contextKey, promptFromFrame: current.clips[current.clips.findIndex(item => item.id === data.clipId) - 1].frame!.path, promptFromJob: current.clips[current.clips.findIndex(item => item.id === data.clipId) - 1].jobId, promptPlanError: undefined });
+        if (contextKey) Object.assign(current.clips.find(item => item.id === data.clipId)!, { promptContextKey: contextKey, promptFromFrame: current.clips[current.clips.findIndex(item => item.id === data.clipId) - 1].frame?.path, promptFromLatent: current.clips[current.clips.findIndex(item => item.id === data.clipId) - 1].latentId, promptFromJob: current.clips[current.clips.findIndex(item => item.id === data.clipId) - 1].jobId, promptPlanError: undefined });
         current.reasoningEffort = data.reasoningEffort || snapshot.reasoningEffort || defaultReasoningEffort;
         return current;
       });

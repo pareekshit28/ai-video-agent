@@ -43,7 +43,7 @@ async function setup(page: Page, initial?: PublicProject) {
     if (route.request().method() === "POST") {
       const body = route.request().postDataJSON(); requests.push({ path: "project", body });
       if (body.action === "plan") { project!.sequentialPrompts = true; project!.clips = planned().clips.map((clip, index) => ({ ...clip, outline: clip.prompt, compiledPrompt: index ? undefined : clip.prompt, referenceIds: project!.references.filter(slot => slot.asset || slot.audios?.length).map(slot => slot.id) })); }
-      if (body.action === "planNextPrompt") { const index = project!.clips.findIndex(clip => clip.id === body.clipId); const clip = project!.clips[index], previous = project!.clips[index - 1]; Object.assign(clip, { compiledPrompt: "Static shot. Continue from the observed replacement pose.", promptContextKey: "refreshed-frame-key", promptFromFrame: previous.frame!.path, promptFromJob: previous.jobId, referenceIds: body.referenceIds || clip.referenceIds }); }
+      if (body.action === "planNextPrompt") { const index = project!.clips.findIndex(clip => clip.id === body.clipId); const clip = project!.clips[index], previous = project!.clips[index - 1]; Object.assign(clip, { compiledPrompt: "Static shot. Continue from the observed replacement pose.", promptContextKey: "refreshed-frame-key", promptFromLatent: previous.latentId, promptFromFrame: previous.frame!.path, promptFromJob: previous.jobId, referenceIds: body.referenceIds || clip.referenceIds }); }
       if (body.action === "prepareClip") {
         const clip = project!.clips.find(clip => clip.id === body.clipId)!;
         if (["complete", "failed"].includes(clip.status)) clip.revision = { prompt: body.prompt, referenceIds: body.referenceIds, comments: clip.revision?.comments || "", model: project!.model, createdAt: Date.now() };
@@ -69,8 +69,8 @@ async function setup(page: Page, initial?: PublicProject) {
       project.active = false;
       const pending = project.clips.filter(clip => clip.status !== "complete" && (!runningClip || clip.id === runningClip));
       const targets = project.reviewAfterEachClip !== false && !runningClip ? pending.slice(0, 1) : pending;
-      targets.forEach(clip => { const index = project!.clips.indexOf(clip); Object.assign(clip, { status: "complete", jobId: `job-${index}`, video: { path: `clips/${clip.id}${clip.versions?.length ? "-take2" : ""}.mp4`, bytes: video.length, name: `${clip.id}.mp4`, mime: "video/mp4" }, frame: { path: `frames/${clip.id}.jpg`, bytes: png.length, name: "last-frame.jpg", mime: "image/jpeg" }, media: { width: 320, height: 180, duration: clip.duration, fps: 24 }, ...(index ? { firstFrameFrom: "arrival" } : {}) }); });
-      if (project.sequentialPrompts !== false) { for (const clip of targets) { const next = project.clips[project.clips.indexOf(clip) + 1]; if (next && next.status === "pending") Object.assign(next, { compiledPrompt: "Static shot. Continue from the observed last frame at the door.", promptContextKey: "planned-frame-key", promptFromFrame: clip.frame!.path, promptFromJob: clip.jobId }); } }
+      targets.forEach(clip => { const index = project!.clips.indexOf(clip); Object.assign(clip, { status: "complete", latentId: "f01aaeed-aaaa-4aaa-8aaa-111111111111", jobId: `job-${index}`, video: { path: `clips/${clip.id}${clip.versions?.length ? "-take2" : ""}.mp4`, bytes: video.length, name: `${clip.id}.mp4`, mime: "video/mp4" }, frame: { path: `frames/${clip.id}.jpg`, bytes: png.length, name: "last-frame.jpg", mime: "image/jpeg" }, media: { width: 320, height: 180, duration: clip.duration, fps: 24 }, ...(index ? { firstFrameFrom: "arrival" } : {}) }); });
+      if (project.sequentialPrompts !== false) { for (const clip of targets) { const next = project.clips[project.clips.indexOf(clip) + 1]; if (next && next.status === "pending") Object.assign(next, { compiledPrompt: "Static shot. Continue from the observed last frame at the door.", promptContextKey: "planned-frame-key", promptFromLatent: clip.latentId, promptFromFrame: clip.frame!.path, promptFromJob: clip.jobId }); } }
       project.status = project.clips.every(clip => clip.status === "complete") ? "complete" : "paused";
     }
     return route.fulfill({ json: { project } });
@@ -80,15 +80,16 @@ async function setup(page: Page, initial?: PublicProject) {
 
 test("clip duration stays editable after generation and persists on reload", async ({ page }, info) => {
   const value = planned();
-  Object.assign(value.clips[0], { status: "complete", jobId: "saved-job", video: { path: "clips/arrival.mp4", name: "arrival.mp4", bytes: video.length, mime: "video/mp4" }, media: { width: 320, height: 180, fps: 24, duration: 5 } });
+  Object.assign(value.clips[0], { status: "complete", latentId: "f01aaeed-aaaa-4aaa-8aaa-111111111111", jobId: "saved-job", video: { path: "clips/arrival.mp4", name: "arrival.mp4", bytes: video.length, mime: "video/mp4" }, media: { width: 320, height: 180, fps: 24, duration: 5 } });
   const requests = await setup(page, value);
-  await page.getByLabel("Clip 1 duration", { exact: true }).fill("7.5");
+  await expect(page.getByLabel("Clip 1 duration", { exact: true })).toHaveAttribute("max", "10");
+  await page.getByLabel("Clip 1 duration", { exact: true }).fill("10");
   await page.getByRole("button", { name: "Save duration for clip 1", exact: true }).click();
-  await expect(page.getByLabel("Clip 1 duration", { exact: true })).toHaveValue("7.5");
+  await expect(page.getByLabel("Clip 1 duration", { exact: true })).toHaveValue("10");
   await expect(page.getByRole("link", { name: "Download clip 1", exact: true })).toBeVisible();
-  await expect(page.getByText("7.5s saved for the next take.", { exact: false })).toBeVisible();
+  await expect(page.getByText("10s saved for the next take.", { exact: false })).toBeVisible();
   await page.reload();
-  await expect(page.getByLabel("Clip 1 duration", { exact: true })).toHaveValue("7.5");
+  await expect(page.getByLabel("Clip 1 duration", { exact: true })).toHaveValue("10");
   expect(requests.filter(item => item.path === "run")).toHaveLength(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.locator(".agent-clip").first().screenshot({ path: `test-results/${info.project.name}-editable-duration.png` });
@@ -172,8 +173,8 @@ test("Wan provider choice persists and exposes its connection and resolution", a
 
 test("replacing the previous frame requires a refreshed editable prompt before the next generation", async ({ page }, info) => {
   const value = planned(); value.sequentialPrompts = true;
-  Object.assign(value.clips[0], { status: "complete", jobId: "first-take", video: { path: "clips/arrival.mp4", name: "arrival.mp4", bytes: video.length, mime: "video/mp4" }, frame: { path: "frames/arrival.png", name: "arrival.png", bytes: png.length, mime: "image/png" } });
-  Object.assign(value.clips[1], { outline: value.clips[1].prompt, compiledPrompt: "Static shot. Continue from the original pose.", promptContextKey: "original-key", promptFromFrame: value.clips[0].frame!.path, promptFromJob: "first-take" });
+  Object.assign(value.clips[0], { status: "complete", latentId: "f01aaeed-aaaa-4aaa-8aaa-111111111111", jobId: "first-take", video: { path: "clips/arrival.mp4", name: "arrival.mp4", bytes: video.length, mime: "video/mp4" }, frame: { path: "frames/arrival.png", name: "arrival.png", bytes: png.length, mime: "image/png" } });
+  Object.assign(value.clips[1], { outline: value.clips[1].prompt, compiledPrompt: "Static shot. Continue from the original pose.", promptContextKey: "original-key", promptFromLatent: value.clips[0].latentId, promptFromFrame: value.clips[0].frame!.path, promptFromJob: "first-take" });
   const requests = await setup(page, value);
   await expect(page.getByLabel("Prompt for clip 2", { exact: true })).toBeEditable();
   await page.getByLabel("Replace last frame for clip 1").setInputFiles({ name: "new-pose.png", mimeType: "image/png", buffer: png });
@@ -190,9 +191,9 @@ test("replacing the previous frame requires a refreshed editable prompt before t
 
 test("a failed sequential clip can retry with new sampling steps and its existing prompt", async ({ page }) => {
   const value = planned(); value.sequentialPrompts = true; value.status = "paused";
-  Object.assign(value.clips[0], { status: "complete", jobId: "previous-take", video: { path: "clips/arrival.mp4", name: "arrival.mp4", bytes: video.length, mime: "video/mp4" }, frame: { path: "frames/arrival.png", name: "arrival.png", bytes: png.length, mime: "image/png" } });
+  Object.assign(value.clips[0], { status: "complete", latentId: "f01aaeed-aaaa-4aaa-8aaa-111111111111", jobId: "previous-take", video: { path: "clips/arrival.mp4", name: "arrival.mp4", bytes: video.length, mime: "video/mp4" }, frame: { path: "frames/arrival.png", name: "arrival.png", bytes: png.length, mime: "image/png" } });
   const prompt = "Static shot. She boards from the position in the previous last frame.";
-  Object.assign(value.clips[1], { status: "failed", jobId: "failed-runpod-job", requestId: crypto.randomUUID(), compiledPrompt: prompt, promptContextKey: "v2:saved-frame-key", promptFromFrame: value.clips[0].frame!.path, promptFromJob: "previous-take", error: "RunPod job failed." });
+  Object.assign(value.clips[1], { status: "failed", jobId: "failed-runpod-job", requestId: crypto.randomUUID(), compiledPrompt: prompt, promptContextKey: "v2:saved-frame-key", promptFromLatent: value.clips[0].latentId, promptFromFrame: value.clips[0].frame!.path, promptFromJob: "previous-take", error: "RunPod job failed." });
   const requests = await setup(page, value);
   await page.getByLabel("Sampling steps", { exact: true }).fill("18");
   await page.getByLabel("Sampling steps", { exact: true }).press("Tab");
@@ -235,7 +236,7 @@ test("continuity controls and edited prompt save together without generating", a
   const value = planned();
   Object.assign(value.clips[1], { transition: "continue", continuityReason: "Continuous action.", autoContinuation: true, continuityMode: "auto" });
   const requests = await setup(page, value);
-  await page.getByLabel("Frame continuity for clip 2").selectOption("off");
+  await page.getByLabel("Motion continuity for clip 2").selectOption("off");
   await page.getByLabel("Prompt for clip 2", { exact: true }).fill("Static shot. A new view of the station.");
   await page.locator(".agent-clip").nth(1).getByRole("button", { name: "Save prompt", exact: true }).click();
   expect(requests.find(item => item.body.clip)?.body.clip.continuityMode).toBe("off");
@@ -272,23 +273,20 @@ test("oversized references show actionable validation before any generation requ
   expect(requests.filter(request => request.path === "run")).toHaveLength(1);
 });
 
-test("saved continuity frame counts toward validation and a cut clears its overage", async ({ page }) => {
+test("H3 motion continuity excludes the previous frame from uploads", async ({ page }) => {
   const value = planned();
   value.references.forEach(slot => { slot.asset = { path: `references/${slot.id}.png`, name: `${slot.id}.png`, bytes: 2_500_000, mime: "image/png" }; });
-  value.clips[0].status = "complete";
-  value.clips[0].frame = { path: "frames/arrival.jpg", name: "arrival.jpg", mime: "image/jpeg", bytes: 1_200_000 };
+  Object.assign(value.clips[0], { status: "complete", latentId: "f01aaeed-aaaa-4aaa-8aaa-111111111111", frame: { path: "frames/arrival.jpg", name: "arrival.jpg", mime: "image/jpeg", bytes: 1_200_000 } });
   const requests = await setup(page, value);
-  await expect(page.locator("#agent-reference-validation")).toContainText("including the previous clip’s last frame");
-  await expect(page.getByRole("button", { name: "Generate clip 2", exact: true })).toBeDisabled();
-  await page.getByLabel("Frame continuity for clip 2").selectOption("off");
   await expect(page.locator("#agent-reference-validation")).toHaveCount(0);
+  await expect(page.locator("#reference-budget-boarding")).toContainText("5.00 MB / 6 MB");
   await expect(page.getByRole("button", { name: "Generate clip 2", exact: true })).toBeEnabled();
   expect(requests.filter(request => request.path === "run")).toHaveLength(0);
 });
 
 test("replaces a completed last frame and retries only the selected clip from reviewed feedback", async ({ page }, info) => {
   const value = planned(); value.status = "complete";
-  value.clips.forEach((clip, index) => Object.assign(clip, { status: "complete", jobId: `old-${index}`, video: { path: `clips/${clip.id}.mp4`, name: `${clip.id}.mp4`, bytes: video.length, mime: "video/mp4" }, frame: { path: `frames/${clip.id}.jpg`, name: "frame.jpg", bytes: png.length, mime: "image/jpeg" } }));
+  value.clips.forEach((clip, index) => Object.assign(clip, { status: "complete", latentId: "f01aaeed-aaaa-4aaa-8aaa-111111111111", jobId: `old-${index}`, video: { path: `clips/${clip.id}.mp4`, name: `${clip.id}.mp4`, bytes: video.length, mime: "video/mp4" }, frame: { path: `frames/${clip.id}.jpg`, name: "frame.jpg", bytes: png.length, mime: "image/jpeg" } }));
   const requests = await setup(page, value);
   await page.getByLabel("Thinking mode", { exact: true }).selectOption("high");
   await page.getByLabel("Replace last frame for clip 1").setInputFiles({ name: "custom-frame.png", mimeType: "image/png", buffer: png });
@@ -408,7 +406,7 @@ test("actual local agent routes reject invalid planning and cross-origin mutatio
 
 test("retry generation needs no comments and preserves the previous take", async ({ page }) => {
   const value = planned(); value.status = "complete";
-  value.clips.forEach(clip => Object.assign(clip, { status: "complete", video: { path: `clips/${clip.id}.mp4`, bytes: video.length, name: "clip.mp4", mime: "video/mp4" }, frame: { path: `frames/${clip.id}.png`, bytes: png.length, name: "frame.png", mime: "image/png" } }));
+  value.clips.forEach(clip => Object.assign(clip, { status: "complete", latentId: "f01aaeed-aaaa-4aaa-8aaa-111111111111", video: { path: `clips/${clip.id}.mp4`, bytes: video.length, name: "clip.mp4", mime: "video/mp4" }, frame: { path: `frames/${clip.id}.png`, bytes: png.length, name: "frame.png", mime: "image/png" } }));
   const requests = await setup(page, value);
   await page.getByRole("button", { name: "Regenerate clip 2", exact: true }).click();
   await expect(page.getByRole("button", { name: "Regenerate clip 2", exact: true })).toBeEnabled({ timeout: 10000 });
@@ -728,4 +726,21 @@ test("editing a character immediately updates details and reloads image and voic
   await expect(page.getByRole("link",{name:"Public voice link 1",exact:true})).toHaveAttribute("href","https://media.example/mira.wav");
   await page.getByRole("button",{name:"Edit Mira updated",exact:true}).click();
   await expect(page.getByLabel("Character public voice URL 1",{exact:true})).toHaveValue("https://media.example/mira.wav");
+});
+
+test("shows queue, generation and total times for clips and archived takes after reload", async ({ page }, info) => {
+  const value = planned();
+  Object.assign(value.clips[0], { status: "complete", delayTime: 1250, executionTime: 68750 });
+  value.clips[0].versions = [{ archivedAt: Date.now(), clip: { ...value.clips[0], delayTime: 0, executionTime: 2500 } }];
+  await setup(page, value);
+  const first = page.locator(".agent-clip").first();
+  await expect(first.getByLabel("Clip timing").first()).toHaveText("Queue: 1.3s · Generation: 1m 8.8s · Total: 1m 10.0s");
+  await first.getByText("Previous generations (1)", { exact: true }).click();
+  await expect(first.getByLabel("Clip timing").nth(1)).toHaveText("Queue: 0.0s · Generation: 2.5s · Total: 2.5s");
+  await expect(page.locator(".agent-clip").nth(1).getByLabel("Clip timing")).toHaveText("Queue: — · Generation: — · Total: —");
+  await page.reload();
+  await expect(page.locator(".agent-clip").first().getByLabel("Clip timing").first()).toContainText("Queue: 1.3s");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.locator(".agent-clip").first().getByLabel("Clip timing").first().scrollIntoViewIfNeeded();
+  await page.screenshot({ path: `test-results/${info.project.name}-clip-timing.png` });
 });

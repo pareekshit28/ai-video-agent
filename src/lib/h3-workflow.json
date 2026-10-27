@@ -12,13 +12,13 @@
     },
     "class_type": "SaveVideo",
     "_meta": {
-      "title": "Save Video"
+      "title": "SaveVideo"
     }
   },
   "115": {
     "inputs": {
       "aspect_ratio": "16:9 (Widescreen)",
-      "megapixels": 1,
+      "megapixels": 2,
       "multiple": 32
     },
     "class_type": "ResolutionSelector",
@@ -32,7 +32,7 @@
     },
     "class_type": "VAELoader",
     "_meta": {
-      "title": "Load VAE"
+      "title": "VAELoader"
     }
   },
   "120": {
@@ -41,7 +41,7 @@
     },
     "class_type": "VAELoader",
     "_meta": {
-      "title": "Load VAE"
+      "title": "VAELoader"
     }
   },
   "121": {
@@ -57,7 +57,7 @@
     },
     "class_type": "VAEDecodeAudio",
     "_meta": {
-      "title": "VAE Decode Audio"
+      "title": "VAEDecodeAudio"
     }
   },
   "122": {
@@ -73,7 +73,7 @@
     },
     "class_type": "VAEDecode",
     "_meta": {
-      "title": "VAE Decode"
+      "title": "VAEDecode"
     }
   },
   "123": {
@@ -135,23 +135,23 @@
         0
       ],
       "conditioning": [
-        "136",
+        "160",
         0
       ]
     },
     "class_type": "BasicGuider",
     "_meta": {
-      "title": "Basic Guider"
+      "title": "BasicGuider"
     }
   },
   "127": {
     "inputs": {
-      "unet_name": "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors",
+      "unet_name": "minimax_h3_ref2va_pruned_fp8_scaled.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",
     "_meta": {
-      "title": "Load Diffusion Model"
+      "title": "UNETLoader"
     }
   },
   "128": {
@@ -162,12 +162,12 @@
     },
     "class_type": "CLIPLoader",
     "_meta": {
-      "title": "Load CLIP"
+      "title": "CLIPLoader"
     }
   },
   "129": {
     "inputs": {
-      "noise_seed": 945293403504544
+      "noise_seed": 158062420567623
     },
     "class_type": "RandomNoise",
     "_meta": {
@@ -179,18 +179,19 @@
       "fps": 24,
       "bit_depth": 8,
       "color_space": "sRGB",
+      "codec": "none",
       "images": [
-        "122",
+        "161",
         0
       ],
       "audio": [
-        "121",
-        0
+        "161",
+        1
       ]
     },
     "class_type": "CreateVideo",
     "_meta": {
-      "title": "Create Video"
+      "title": "CreateVideo"
     }
   },
   "131": {
@@ -203,7 +204,7 @@
     },
     "class_type": "ComfyMathExpression",
     "_meta": {
-      "title": "Math Expression"
+      "title": "ComfyMathExpression"
     }
   },
   "132": {
@@ -249,12 +250,12 @@
     },
     "class_type": "MiniMaxH3ReferenceToVideo",
     "_meta": {
-      "title": "MiniMax H3 Reference to Video"
+      "title": "MiniMaxH3ReferenceToVideo"
     }
   },
   "138": {
     "inputs": {
-      "value": "References: Use <Picture 1> and <Picture 2> for the Ben and John's appearance. Scene: They both look toward the camera and say, “Hi we are not real.” Keep the voice natural and the movement realistic."
+      "value": ""
     },
     "class_type": "PrimitiveStringMultiline",
     "_meta": {
@@ -272,7 +273,7 @@
     },
     "class_type": "LoraLoaderModelOnly",
     "_meta": {
-      "title": "Load LoRA"
+      "title": "LoraLoaderModelOnly"
     }
   },
   "148": {
@@ -286,7 +287,7 @@
     },
     "class_type": "MiniMaxH3SigmaShift",
     "_meta": {
-      "title": "ModelSamplingMiniMaxH3"
+      "title": "MiniMaxH3SigmaShift"
     }
   },
   "149": {
@@ -300,6 +301,96 @@
     "class_type": "ModelAttentionBackend",
     "_meta": {
       "title": "ModelAttentionBackend"
+    }
+  },
+  "158": {
+    "inputs": {
+      "latent_path": "h3_context",
+      "clip_index": 0,
+      "stock_format": false,
+      "folder": "output",
+      "storage_root": "/runpod-volume/h3_latents",
+      "clip_id": ""
+    },
+    "class_type": "MiniMaxH3MotionContextLoadLatent",
+    "_meta": {
+      "title": "MiniMaxH3MotionContextLoadLatent",
+      "aux_id": "pareekshit28/ComfyUI-H3-Motion-Context",
+      "ver": "5d3ed39587009f70bff16284d524d1129a60393f"
+    }
+  },
+  "159": {
+    "inputs": {
+      "filename_prefix": "h3_context/clip",
+      "clip_index": 1,
+      "storage_root": "/runpod-volume/h3_latents",
+      "clip_id": "",
+      "latent": [
+        "125",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3MotionContextSaveLatent",
+    "_meta": {
+      "title": "MiniMaxH3MotionContextSaveLatent",
+      "aux_id": "pareekshit28/ComfyUI-H3-Motion-Context",
+      "ver": "5d3ed39587009f70bff16284d524d1129a60393f"
+    }
+  },
+  "160": {
+    "inputs": {
+      "context_length": "22",
+      "audio_context_length": 18,
+      "conditioning": [
+        "136",
+        0
+      ],
+      "vae": [
+        "119",
+        0
+      ],
+      "latent": [
+        "136",
+        1
+      ],
+      "context_latent": [
+        "158",
+        0
+      ],
+      "audio_vae": [
+        "120",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3MotionContext",
+    "_meta": {
+      "title": "MiniMaxH3MotionContext",
+      "aux_id": "pareekshit28/ComfyUI-H3-Motion-Context",
+      "ver": "5d3ed39587009f70bff16284d524d1129a60393f"
+    }
+  },
+  "161": {
+    "inputs": {
+      "trim_frames": [
+        "160",
+        1
+      ],
+      "fps": 24,
+      "match_tail": true,
+      "images": [
+        "122",
+        0
+      ],
+      "audio": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3MotionContextTrim",
+    "_meta": {
+      "title": "MiniMaxH3MotionContextTrim",
+      "aux_id": "pareekshit28/ComfyUI-H3-Motion-Context",
+      "ver": "5d3ed39587009f70bff16284d524d1129a60393f"
     }
   }
 }

@@ -1,6 +1,6 @@
 import type { ReasoningEffort } from "./reasoning";
 import { z } from "zod";
-import { ratios } from "./h3";
+import { initialSettings, ratios } from "./h3";
 
 export const entityIdSchema = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/);
 const slotSchema = z.object({ id: entityIdSchema, name: z.string().trim().min(1).max(120), kind: z.enum(["character", "location", "prop"]), description: z.string().trim().min(1).max(1000) });
@@ -21,12 +21,12 @@ export const videoProviderSchema = z.enum(["runpod", "apimart"]);
 export type VideoProvider = z.infer<typeof videoProviderSchema>;
 export const generationSchema = z.object({ provider: videoProviderSchema.optional(), wanResolution: z.enum(["480P", "720P", "1080P"]).optional(), wanDurationMode: z.enum(["auto", "fixed"]).optional(), aspectRatio: z.enum(ratios), megapixels: z.number().min(0.25).max(4), steps: z.number().int().min(1).max(100), refImageSize: z.enum(["max", "match"]) });
 export type GenerationSettings = z.infer<typeof generationSchema>;
-export const defaultGeneration: GenerationSettings = { aspectRatio: ratios[0], megapixels: 1, steps: 6, refImageSize: "max" };
+export const defaultGeneration: GenerationSettings = { aspectRatio: initialSettings.aspectRatio, megapixels: initialSettings.megapixels, steps: initialSettings.steps, refImageSize: initialSettings.refImageSize };
 export type Asset = { path: string; name: string; bytes: number; mime: string; publicUrl?: string };
 export type ReferenceSlot = z.infer<typeof slotSchema> & { asset?: Asset; images?: Asset[]; audios?: Asset[]; characterId?: string };
 export type ClipRevision = { referenceIds?: string[]; reasoningEffort?: ReasoningEffort; prompt: string; comments: string; model: string; createdAt: number };
 export type ClipVersion = { archivedAt: number; clip: Omit<AgentClip, "versions" | "revision"> };
-export type AgentClip = z.infer<typeof shotSchema> & { nextDuration?: number; outline?: string; promptContextKey?: string; promptFromFrame?: string; promptFromJob?: string; promptPlanError?: string; status: "awaiting-approval" | "pending" | "preparing" | "submitting" | "queued" | "rendering" | "saving" | "complete" | "recoverable" | "submission-unknown" | "failed"; approvedPromptKey?: string; compiledPrompt?: string; promptGuideVersion?: number; requestedDuration?: number; seed?: number; requestId?: string; jobId?: string; endpoint?: string; video?: Asset; frame?: Asset; extractedFrame?: Asset; frameReplaced?: boolean; source?: Asset; firstFrameFrom?: string; continuityOutdated?: boolean; revision?: ClipRevision; revisionComments?: string; versions?: ClipVersion[]; error?: string; media?: { width: number; height: number; duration: number; fps: number }; };
+export type AgentClip = z.infer<typeof shotSchema> & { delayTime?: number; executionTime?: number; latentId?: string; previousLatentId?: string; promptFromLatent?: string; nextDuration?: number; outline?: string; promptContextKey?: string; promptFromFrame?: string; promptFromJob?: string; promptPlanError?: string; status: "awaiting-approval" | "pending" | "preparing" | "submitting" | "queued" | "rendering" | "saving" | "complete" | "recoverable" | "submission-unknown" | "failed"; approvedPromptKey?: string; compiledPrompt?: string; promptGuideVersion?: number; requestedDuration?: number; seed?: number; requestId?: string; jobId?: string; endpoint?: string; video?: Asset; frame?: Asset; extractedFrame?: Asset; frameReplaced?: boolean; source?: Asset; firstFrameFrom?: string; continuityOutdated?: boolean; revision?: ClipRevision; revisionComments?: string; versions?: ClipVersion[]; error?: string; media?: { width: number; height: number; duration: number; fps: number }; };
 export type AgentProject = { sequentialPrompts?: boolean; referencesIdentified?: boolean; collectionId?: string; reasoningEffort?: ReasoningEffort; id: string; title: string; script: string; summary: string; model: string; runEndpoint?: string; runClipId?: string; reviewBeforeEachClip?: boolean; reviewAfterEachClip?: boolean; createdAt: number; updatedAt: number; status: "ready" | "preparing" | "running" | "paused" | "complete"; error?: string; settings: GenerationSettings; references: ReferenceSlot[]; clips: AgentClip[] };
 export type PublicProject = AgentProject & { folder: string; active: boolean };
 // Submitted takes keep their original duration; edits are staged for the next take.
@@ -42,7 +42,7 @@ export function needsPreviousPrompt(project: Pick<AgentProject, "clips" | "seque
 export function previousPromptAvailable(project: AgentProject, clip: AgentClip) {
   if (!needsPreviousPrompt(project, clip)) return true;
   const previous = project.clips[project.clips.findIndex(item => item.id === clip.id) - 1];
-  return previous?.status === "complete" && Boolean(previous.frame && clip.promptContextKey && clip.promptFromFrame === previous.frame.path && clip.promptFromJob === previous.jobId);
+  return previous?.status === "complete" && Boolean(clip.promptContextKey && clip.promptFromFrame === previous.frame?.path && clip.promptFromJob === previous.jobId && (project.settings.provider === "apimart" ? previous.frame : clip.promptFromLatent === previous.latentId));
 }
 export function suppliedReferences(project: AgentProject, clip: AgentClip) {
   return clip.referenceIds.flatMap(id => { const slot = project.references.find(slot => slot.id === id); return slot?.asset ? [slot as ReferenceSlot & { asset: Asset }] : []; });
@@ -75,7 +75,7 @@ export function finalPrompt(project: AgentProject, clip: AgentClip) {
     });
     return [...references, ...audioBindings(project, clip).map(ref => `${ref.tag} supplies ${ref.name}'s voice timbre. Use this voice for their scripted dialogue, not the sample's spoken words.`), text].join("\n\n");
   }
-  return [...bindings.map(ref => `${ref.tag} is the supplied reference for ${ref.name}. Use this image as the authority for their visual appearance.`), ...audioBindings(project, clip).map(ref => `${ref.tag} is the supplied voice reference for ${ref.name}. Preserve this voice for their dialogue.`), text, ...(previousFrameDecision(clip) ? ["Begin on the supplied frame-zero guide and continue the preceding action without resetting the scene."] : [])].join("\n\n");
+  return [...bindings.map(ref => `${ref.tag} is the supplied reference for ${ref.name}. Use this image as the authority for their visual appearance.`), ...audioBindings(project, clip).map(ref => `${ref.tag} is the supplied voice reference for ${ref.name}. Preserve this voice for their dialogue.`), text, ...(previousFrameDecision(clip) ? ["Continue the preceding action from the supplied motion-context latent without resetting the scene or replaying completed action."] : [])].join("\n\n");
 }
 export function assetUrl(projectId: string, kind: "video" | "frame" | "reference", id: string, download = false) {
   return `/api/agent/media?projectId=${encodeURIComponent(projectId)}&kind=${kind}&id=${encodeURIComponent(id)}${download ? "&download=1" : ""}`;

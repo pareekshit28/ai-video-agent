@@ -11,7 +11,7 @@ import { promisify } from "node:util";
 import { assetPath } from "./agent-store";
 import { getCollection } from "./project-collections";
 
-type AgentInput = z.infer<typeof agentSubmissionSchema>;
+type AgentInput = z.infer<typeof agentSubmissionSchema> & { firstFrame?: ReferenceFile };
 const keySchema = z.string().trim().min(1).max(2048).regex(/^\S+$/);
 export async function apimartConnectionInfo() {
   return withDatabase(db => ({ configured: Boolean(db.apimart?.apiKey || process.env.APIMART_API_KEY?.trim()), environmentKey: Boolean(process.env.APIMART_API_KEY?.trim()) }));

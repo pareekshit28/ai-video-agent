@@ -6,7 +6,7 @@ vi.mock("../src/lib/store", () => ({ withDatabase: <T>(fn: (db: Database) => T) 
 import { apimartConnectionInfo, checkGeneration, checkWan, saveApimartConnection, submitWan, wanRequest } from "../src/lib/apimart";
 import { clipReferenceBudget } from "../src/lib/agent-reference-validation";
 import type { AgentProject } from "../src/lib/agent-types";
-const input = () => ({ requestId: crypto.randomUUID(), settings: { ...initialSettings, prompt: "<Picture 1> speaks with <Audio 1>.", seed: "42" }, images: [], audios: [] });
+const input = () => ({ requestId: crypto.randomUUID(), settings: { ...initialSettings, duration: 5, prompt: "<Picture 1> speaks with <Audio 1>.", seed: "42" }, images: [], audios: [] });
 beforeEach(() => { memory.db = { apimart: { apiKey: "test-wan-secret" } }; memory.queue = Promise.resolve(); vi.unstubAllGlobals(); });
 describe("API Mart Wan 3.0 contract", () => {
   it("accepts 30-second clips and sends automatic duration with natural pacing instructions", () => {

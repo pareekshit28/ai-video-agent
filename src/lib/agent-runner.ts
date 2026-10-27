@@ -17,14 +17,23 @@ import { apimartConnectionInfo, checkGeneration, prepareWanRequest, submitGenera
 import { promptApprovalKey } from "./prompt-approval";
 import { wanPromptGuideVersion } from "./wan-prompt-guide";
 
+function jobTiming(job: H3Job) {
+  return { ...(typeof job.delayTime === "number" && Number.isFinite(job.delayTime) && job.delayTime >= 0 ? { delayTime: job.delayTime } : {}), ...(typeof job.executionTime === "number" && Number.isFinite(job.executionTime) && job.executionTime >= 0 ? { executionTime: job.executionTime } : {}) };
+}
+
 type RunnerState = { active?: { projectId: string; controller: AbortController; clipId?: string } };
 const globals = globalThis as typeof globalThis & { videoAgentRunner?: RunnerState };
 const state = globals.videoAgentRunner ??= {};
 export function isProjectActive(id: string) { return state.active?.projectId === id; }
 export function assertEditable(id: string) { if (isProjectActive(id)) throw new RequestError("Pause the agent before editing the project.", "project_busy"); }
-export function publicProject(project: AgentProject): PublicProject {
+export function publicProject(project: AgentProject, history: H3Job[] = []): PublicProject {
   const active = isProjectActive(project.id);
-  return { ...project, folder: projectFolder(project.id), active, ...(!active && ["running", "preparing"].includes(project.status) ? { status: "paused" as const, error: "The server stopped while processing this project. Resume to recover existing jobs and continue." } : {}) };
+  const timing = <T extends Pick<AgentClip, "requestId">>(clip: T) => {
+    const job = clip.requestId ? history.find(job => job.localId === clip.requestId) : undefined;
+    return job ? { ...clip, ...jobTiming(job) } : clip;
+  };
+  const clips = project.clips.map(clip => ({ ...timing(clip), ...(clip.versions ? { versions: clip.versions.map(take => ({ ...take, clip: timing(take.clip) })) } : {}) }));
+  return { ...project, clips, folder: projectFolder(project.id), active, ...(!active && ["running", "preparing"].includes(project.status) ? { status: "paused" as const, error: "The server stopped while processing this project. Resume to recover existing jobs and continue." } : {}) };
 }
 async function referenceFile(projectId: string, name: string, path: string): Promise<ReferenceFile> {
   const bytes = await readFile(assetPath(projectId, path)); return { name, bytes: bytes.length, base64: bytes.toString("base64") };
@@ -32,18 +41,24 @@ async function referenceFile(projectId: string, name: string, path: string): Pro
 export async function inputFor(project: AgentProject, clip: AgentClip) {
   const images = await Promise.all(suppliedImages(project, clip).map((slot, index) => referenceFile(project.id, `reference-${index + 1}.${slot.asset.path.split(".").pop()}`, slot.asset.path)));
   const audios = await Promise.all(suppliedAudios(project, clip).map((slot, index) => referenceFile(project.id, `voice-${index + 1}.${slot.asset.path.split(".").pop()}`, slot.asset.path)));
-  let firstFrame: ReferenceFile | undefined; let firstFrameFrom: string | undefined;
+  let firstFrame: ReferenceFile | undefined; let firstFrameFrom: string | undefined; let previousClipId: string | undefined;
   if (previousFrameDecision(clip)) {
     const previous = project.clips[project.clips.findIndex(item => item.id === clip.id) - 1];
-    if (!previous || previous.status !== "complete" || !previous.frame) throw new RequestError("This clip needs the previous clip's saved last frame. Generate the preceding clip first.", "continuity_frame_missing");
-    firstFrame = await referenceFile(project.id, `continuity-${previous.id}.${previous.frame.path.split(".").pop()}`, previous.frame.path);
-    firstFrameFrom = previous.id;
+    if (project.settings.provider === "apimart") {
+      if (previous?.status !== "complete" || !previous.frame) throw new RequestError("This clip needs the previous clip's saved last frame. Generate the preceding clip first.", "continuity_frame_missing");
+      firstFrame = await referenceFile(project.id, `continuity-${previous.id}.${previous.frame.path.split(".").pop()}`, previous.frame.path);
+      firstFrameFrom = previous.id;
+    } else {
+      if (previous?.status !== "complete" || !previous.latentId) throw new RequestError("This clip needs the previous clip's saved H3 latent. Generate or regenerate the preceding clip with the motion-context workflow first.", "continuity_latent_missing");
+      previousClipId = previous.latentId;
+    }
   }
-  const input = { collectionId: project.collectionId, requestId: clip.requestId || randomUUID(), settings: { ...project.settings, prompt: finalPrompt(project, clip), duration: clip.duration, seed: String(clip.seed ?? crypto.getRandomValues(new Uint32Array(1))[0]) }, images, audios, ...(firstFrame ? { firstFrame } : {}) };
+  const requestId = clip.requestId || randomUUID();
+  const input = { collectionId: project.collectionId, requestId, clipId: clip.latentId || requestId, previousClipId, settings: { ...project.settings, prompt: finalPrompt(project, clip), duration: clip.duration, seed: String(clip.seed ?? crypto.getRandomValues(new Uint32Array(1))[0]) }, images, audios, ...(firstFrame ? { firstFrame } : {}) };
   if (project.settings.provider === "apimart") return { input, firstFrameFrom };
   const parsed = agentSubmissionSchema.safeParse(input);
   if (!parsed.success) throw new RequestError(`${clip.title}: ${parsed.error.issues[0].message}`, "invalid_agent_request");
-  return { input: parsed.data, firstFrameFrom };
+  return { input: parsed.data as typeof parsed.data & { firstFrame?: ReferenceFile }, firstFrameFrom };
 }
 async function assertReplaceableJob(jobId: string, requestId?: string) {
   try {
@@ -78,7 +93,7 @@ export async function reserveRun(id: string, model: string, options: { clipId?: 
       }
       const { versions, revision, nextDuration, ...take } = selected;
       if (options.revision && revision?.referenceIds && (new Set(revision.referenceIds).size !== revision.referenceIds.length || revision.referenceIds.some(id => !project.references.some(slot => slot.id === id)))) throw new RequestError("Choose valid scene references for this revision.", "invalid_reference");
-      revised = { ...selected, duration: plannedDuration(selected), nextDuration: undefined, referenceIds: options.revision ? revision!.referenceIds ?? selected.referenceIds : selected.referenceIds, promptGuideVersion: options.revision && project.settings.provider === "apimart" ? wanPromptGuideVersion : selected.promptGuideVersion, versions: [...(versions || []), { archivedAt: Date.now(), clip: take }], prompt: options.revision ? revision!.prompt : selected.prompt, compiledPrompt: options.revision ? revision!.prompt : selected.compiledPrompt || selected.prompt, revisionComments: options.revision ? revision!.comments : selected.revisionComments, revision: undefined, status: "pending", approvedPromptKey: undefined, requestId: undefined, jobId: undefined, requestedDuration: undefined, seed: undefined, endpoint: undefined, source: undefined, video: undefined, frame: undefined, extractedFrame: undefined, frameReplaced: false, media: undefined, firstFrameFrom: undefined, error: undefined, continuityOutdated: false };
+      revised = { ...selected, duration: plannedDuration(selected), nextDuration: undefined, referenceIds: options.revision ? revision!.referenceIds ?? selected.referenceIds : selected.referenceIds, promptGuideVersion: options.revision && project.settings.provider === "apimart" ? wanPromptGuideVersion : selected.promptGuideVersion, versions: [...(versions || []), { archivedAt: Date.now(), clip: take }], prompt: options.revision ? revision!.prompt : selected.prompt, compiledPrompt: options.revision ? revision!.prompt : selected.compiledPrompt || selected.prompt, revisionComments: options.revision ? revision!.comments : selected.revisionComments, revision: undefined, status: "pending", approvedPromptKey: undefined, requestId: undefined, latentId: undefined, previousLatentId: undefined, delayTime: undefined, executionTime: undefined, jobId: undefined, requestedDuration: undefined, seed: undefined, endpoint: undefined, source: undefined, video: undefined, frame: undefined, extractedFrame: undefined, frameReplaced: false, media: undefined, firstFrameFrom: undefined, error: undefined, continuityOutdated: false };
     }
     const candidate = { ...project, clips: project.clips.map(clip => {
       if (clip.id === revised?.id) return revised;
@@ -92,7 +107,7 @@ export async function reserveRun(id: string, model: string, options: { clipId?: 
     if (targets.some(clip => clip.status === "failed" || clip.status === "submission-unknown")) throw new RequestError("Recover or explicitly retry the failed clip before resuming.", "clip_needs_review");
     if (scopeId && previousFrameDecision(targets[0])) {
       const previous = candidate.clips[candidate.clips.findIndex(clip => clip.id === scopeId) - 1];
-      if (previous?.status !== "complete" || !previous.frame) throw new RequestError("Generate the preceding clip before retrying this continuation.", "continuity_frame_missing");
+      if (previous?.status !== "complete" || !(candidate.settings.provider === "apimart" ? previous.frame : previous.latentId)) throw new RequestError("Generate the preceding clip with the current workflow before retrying this continuation.", "continuity_missing");
     }
     const referenceIssues = projectReferenceIssues(candidate).filter(issue => !scopeId || issue.clipId === scopeId);
     if (referenceIssues.length) throw new RequestError(referenceIssues.map(issue => issue.message).join("\n"), "invalid_agent_request");
@@ -133,9 +148,9 @@ export async function executeProject(id: string, controller: AbortController, ov
         const built = await inputFor(project, clip);
         const wan = project.settings.provider === "apimart" ? await prepareWanRequest(project, clip, built.input, signal) : undefined;
         signal.throwIfAborted();
-        await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; shot.requestId = built.input.requestId; shot.seed = Number(built.input.settings.seed); shot.requestedDuration = wan?.duration ?? clip.duration; shot.firstFrameFrom = built.firstFrameFrom; shot.status = "submitting"; shot.error = undefined; return current; });
+        await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; shot.requestId = built.input.requestId; shot.seed = Number(built.input.settings.seed); shot.requestedDuration = wan?.duration ?? clip.duration; shot.firstFrameFrom = built.firstFrameFrom; shot.latentId = wan ? undefined : built.input.clipId; shot.previousLatentId = wan ? undefined : built.input.previousClipId; shot.status = "submitting"; shot.error = undefined; return current; });
         // Save a readable audit with filenames/bindings and graph, excluding inline media and credentials.
-        const payload = buildPayload(built.input.settings, built.input.images, built.input.audios, built.input.firstFrame);
+        const payload = buildPayload(built.input.settings, built.input.images, built.input.audios, { clipId: built.input.clipId || built.input.requestId, previousClipId: built.input.previousClipId });
         await writeAsset(id, `requests/${clipId}-${built.input.requestId}.json`, Buffer.from(JSON.stringify({ clipId, requestId: built.input.requestId, endpoint: project.runEndpoint, firstFrameFrom: built.firstFrameFrom, suppliedReferences: suppliedReferences(project, clip).map(slot => ({ id: slot.id, name: slot.name, asset: slot.asset.path })), media: payload.input.images.map(file => ({ name: file.name })), ...(wan ? { provider: "apimart", request: wan } : { provider: "runpod", workflow: payload.input.workflow }) }, null, 2)), "application/json", "request.json");
         job = await dependencies.submit({ ...built.input, ...(wan ? { wanRequest: wan } : {}) }, project.runEndpoint);
       }
@@ -147,7 +162,7 @@ export async function executeProject(id: string, controller: AbortController, ov
         await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; shot.status = "failed"; shot.error = job!.error; return current; });
         throw new RequestError(job.error || "The video provider rejected the request.", "runpod_rejected");
       }
-      if (job?.id) await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; shot.jobId = job!.id; shot.endpoint = job!.endpoint; shot.status = "queued"; return current; });
+      if (job?.id) await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; Object.assign(shot, jobTiming(job!)); shot.jobId = job!.id; shot.endpoint = job!.endpoint; shot.status = "queued"; return current; });
       project = await getProject(id); clip = project.clips.find(clip => clip.id === clipId)!;
       if (!clip.jobId) throw new RequestError("This shot has no recoverable video job ID.", "job_id_missing");
       signal.throwIfAborted();
@@ -156,7 +171,7 @@ export async function executeProject(id: string, controller: AbortController, ov
         while (!job || !["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"].includes(job.status)) {
           signal.throwIfAborted();
           job = await dependencies.check(clip.jobId, clip.requestId);
-          await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; shot.status = job!.status === "IN_PROGRESS" ? "rendering" : "queued"; return current; });
+          await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; Object.assign(shot, jobTiming(job!)); shot.status = job!.status === "IN_PROGRESS" ? "rendering" : "queued"; return current; });
           if (!["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"].includes(job.status)) await delay(dependencies.pollMs, undefined, { signal });
         }
         if (job.status !== "COMPLETED") {
@@ -208,7 +223,7 @@ export async function recoverClip(id: string, clipId: string, jobId: string) {
   assertEditable(id); const project = await getProject(id); const clip = project.clips.find(clip => clip.id === clipId);
   if (!clip?.requestId || clip.status === "complete") throw new RequestError("This shot does not need job recovery.", "invalid_clip_state");
   const job = await checkGeneration(jobId, clip.requestId);
-  return updateProject(id, current => { assertEditable(id); const shot = current.clips.find(shot => shot.id === clipId)!; shot.jobId = job.id; shot.endpoint = job.endpoint; shot.status = "recoverable"; shot.error = undefined; current.error = undefined; current.status = "paused"; return current; });
+  return updateProject(id, current => { assertEditable(id); const shot = current.clips.find(shot => shot.id === clipId)!; Object.assign(shot, jobTiming(job)); shot.jobId = job.id; shot.endpoint = job.endpoint; shot.status = "recoverable"; shot.error = undefined; current.error = undefined; current.status = "paused"; return current; });
 }
 export async function retryClip(id: string, clipId: string, reviewed = false) {
   assertEditable(id); const project = await getProject(id); const clip = project.clips.find(clip => clip.id === clipId);
@@ -220,5 +235,5 @@ export async function retryClip(id: string, clipId: string, reviewed = false) {
     if (!reviewed) throw new RequestError(job.endpoint === "apimart" ? "Review your API Mart tasks before resolving an uncertain submission." : "Review the RunPod console before resolving an uncertain submission.", "review_required");
     await resolveUnknown(job.localId);
   } else if (clip.status === "submission-unknown" && !reviewed) throw new RequestError("Review the RunPod console before retrying.", "review_required");
-  return updateProject(id, current => { assertEditable(id); const shot = current.clips.find(shot => shot.id === clipId)!; shot.status = "pending"; shot.requestId = undefined; shot.jobId = undefined; shot.compiledPrompt = undefined; shot.endpoint = undefined; shot.error = undefined; shot.source = undefined; current.status = "ready"; current.error = undefined; return current; });
+  return updateProject(id, current => { assertEditable(id); const shot = current.clips.find(shot => shot.id === clipId)!; shot.status = "pending"; shot.requestId = undefined; shot.latentId = undefined; shot.previousLatentId = undefined; shot.delayTime = undefined; shot.executionTime = undefined; shot.jobId = undefined; shot.compiledPrompt = undefined; shot.endpoint = undefined; shot.error = undefined; shot.source = undefined; current.status = "ready"; current.error = undefined; return current; });
 }
