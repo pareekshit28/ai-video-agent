@@ -1,10 +1,11 @@
+import { comfyCloudConnectionInfo, prepareComfyCloudRequest, saveComfyCloudLatent, downloadGenerationOutput } from "./comfy-cloud";
 import { assertStorageReady } from "./output-storage";
 import type { ReasoningEffort } from "./reasoning";
 import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { agentSubmissionSchema, buildPayload, type H3Job, type ReferenceFile } from "./h3";
-import { plannedDuration, assetUrl, finalPrompt, markFollowingContinuityOutdated, needsPreviousPrompt, previousPromptAvailable, previousFrameDecision, suppliedReferences, suppliedImages, suppliedAudios, type AgentClip, type AgentProject, type PublicProject } from "./agent-types";
+import { plannedDuration, assetUrl, finalPrompt, markFollowingContinuityOutdated, needsPreviousPrompt, previousPromptAvailable, previousFrameDecision, suppliedReferences, suppliedImages, suppliedAudios, type AgentClip, type AgentProject, type PublicProject, type Asset } from "./agent-types";
 import { prepareSequentialPrompt, assertPreviousPromptReady } from "./sequential-prompts";
 import { assetPath, getProject, updateProject, writeAsset, projectFolder } from "./agent-store";
 import { archiveAgentOutput, checkVideo, connectionInfo, jobHistory, submitAgentVideo, resolveUnknown } from "./runpod";
@@ -41,7 +42,7 @@ async function referenceFile(projectId: string, name: string, path: string): Pro
 export async function inputFor(project: AgentProject, clip: AgentClip) {
   const images = await Promise.all(suppliedImages(project, clip).map((slot, index) => referenceFile(project.id, `reference-${index + 1}.${slot.asset.path.split(".").pop()}`, slot.asset.path)));
   const audios = await Promise.all(suppliedAudios(project, clip).map((slot, index) => referenceFile(project.id, `voice-${index + 1}.${slot.asset.path.split(".").pop()}`, slot.asset.path)));
-  let firstFrame: ReferenceFile | undefined; let firstFrameFrom: string | undefined; let previousClipId: string | undefined;
+  let firstFrame: ReferenceFile | undefined; let firstFrameFrom: string | undefined; let previousClipId: string | undefined; let previousLatent: Asset | undefined;
   if (previousFrameDecision(clip)) {
     const previous = project.clips[project.clips.findIndex(item => item.id === clip.id) - 1];
     if (project.settings.provider === "apimart") {
@@ -50,6 +51,10 @@ export async function inputFor(project: AgentProject, clip: AgentClip) {
       firstFrameFrom = previous.id;
     } else {
       if (previous?.status !== "complete" || !previous.latentId) throw new RequestError("This clip needs the previous clip's saved H3 latent. Generate or regenerate the preceding clip with the motion-context workflow first.", "continuity_latent_missing");
+      if (project.settings.provider === "comfy-cloud") {
+        if (!previous.latent) throw new RequestError("This continuation needs the preceding clip’s locally saved latent file. Generate or regenerate it with Comfy Cloud first.", "continuity_latent_missing");
+        previousLatent = previous.latent;
+      } else if (previous.endpoint === "comfy-cloud") throw new RequestError("The preceding latent belongs to Comfy Cloud. Continue using Comfy Cloud or start a new shot on RunPod.", "continuity_latent_provider");
       previousClipId = previous.latentId;
     }
   }
@@ -58,7 +63,7 @@ export async function inputFor(project: AgentProject, clip: AgentClip) {
   if (project.settings.provider === "apimart") return { input, firstFrameFrom };
   const parsed = agentSubmissionSchema.safeParse(input);
   if (!parsed.success) throw new RequestError(`${clip.title}: ${parsed.error.issues[0].message}`, "invalid_agent_request");
-  return { input: parsed.data as typeof parsed.data & { firstFrame?: ReferenceFile }, firstFrameFrom };
+  return { input: { ...parsed.data, ...(previousLatent ? { previousLatent } : {}) } as typeof parsed.data & { firstFrame?: ReferenceFile; previousLatent?: Asset }, firstFrameFrom };
 }
 async function assertReplaceableJob(jobId: string, requestId?: string) {
   try {
@@ -66,7 +71,7 @@ async function assertReplaceableJob(jobId: string, requestId?: string) {
     if (!["FAILED", "CANCELLED", "TIMED_OUT"].includes(checked.status)) throw new RequestError("This job still exists. Resume it to recover and save its output before requesting a replacement.", "job_still_exists");
   } catch (error) {
     // A missing result can only be replaced through an explicit retry, never on resume.
-    if (!(error instanceof RequestError) || !["runpod_job_missing", "apimart_job_missing"].includes(error.code)) throw error;
+    if (!(error instanceof RequestError) || !["runpod_job_missing", "apimart_job_missing", "comfy_cloud_job_missing"].includes(error.code)) throw error;
   }
 }
 export async function reserveRun(id: string, model: string, options: { clipId?: string; revision?: boolean; retryCurrent?: boolean; reasoningEffort?: ReasoningEffort } = {}) {
@@ -75,7 +80,7 @@ export async function reserveRun(id: string, model: string, options: { clipId?: 
   const controller = new AbortController(); state.active = { projectId: id, controller };
   try {
     const project = await getProject(id);
-    const connection = project.settings.provider === "apimart" ? { ...await apimartConnectionInfo(), endpoint: "apimart" } : await connectionInfo();
+    const connection = project.settings.provider === "comfy-cloud" ? { ...await comfyCloudConnectionInfo(), endpoint: "comfy-cloud" } : project.settings.provider === "apimart" ? { ...await apimartConnectionInfo(), endpoint: "apimart" } : await connectionInfo();
     if (!connection.configured) throw new RequestError("Configure the selected video provider key in .env.local or its connection dialog before generating.", "runpod_not_configured");
     await verifyMediaTools();
     controller.signal.throwIfAborted();
@@ -93,7 +98,7 @@ export async function reserveRun(id: string, model: string, options: { clipId?: 
       }
       const { versions, revision, nextDuration, ...take } = selected;
       if (options.revision && revision?.referenceIds && (new Set(revision.referenceIds).size !== revision.referenceIds.length || revision.referenceIds.some(id => !project.references.some(slot => slot.id === id)))) throw new RequestError("Choose valid scene references for this revision.", "invalid_reference");
-      revised = { ...selected, duration: plannedDuration(selected), nextDuration: undefined, referenceIds: options.revision ? revision!.referenceIds ?? selected.referenceIds : selected.referenceIds, promptGuideVersion: options.revision && project.settings.provider === "apimart" ? wanPromptGuideVersion : selected.promptGuideVersion, versions: [...(versions || []), { archivedAt: Date.now(), clip: take }], prompt: options.revision ? revision!.prompt : selected.prompt, compiledPrompt: options.revision ? revision!.prompt : selected.compiledPrompt || selected.prompt, revisionComments: options.revision ? revision!.comments : selected.revisionComments, revision: undefined, status: "pending", approvedPromptKey: undefined, requestId: undefined, latentId: undefined, previousLatentId: undefined, delayTime: undefined, executionTime: undefined, jobId: undefined, requestedDuration: undefined, seed: undefined, endpoint: undefined, source: undefined, video: undefined, frame: undefined, extractedFrame: undefined, frameReplaced: false, media: undefined, firstFrameFrom: undefined, error: undefined, continuityOutdated: false };
+      revised = { ...selected, duration: plannedDuration(selected), nextDuration: undefined, referenceIds: options.revision ? revision!.referenceIds ?? selected.referenceIds : selected.referenceIds, promptGuideVersion: options.revision && project.settings.provider === "apimart" ? wanPromptGuideVersion : selected.promptGuideVersion, versions: [...(versions || []), { archivedAt: Date.now(), clip: take }], prompt: options.revision ? revision!.prompt : selected.prompt, compiledPrompt: options.revision ? revision!.prompt : selected.compiledPrompt || selected.prompt, revisionComments: options.revision ? revision!.comments : selected.revisionComments, revision: undefined, status: "pending", approvedPromptKey: undefined, requestId: undefined, latentId: undefined, previousLatentId: undefined, latent: undefined, delayTime: undefined, executionTime: undefined, jobId: undefined, requestedDuration: undefined, seed: undefined, endpoint: undefined, source: undefined, video: undefined, frame: undefined, extractedFrame: undefined, frameReplaced: false, media: undefined, firstFrameFrom: undefined, error: undefined, continuityOutdated: false };
     }
     const candidate = { ...project, clips: project.clips.map(clip => {
       if (clip.id === revised?.id) return revised;
@@ -107,7 +112,7 @@ export async function reserveRun(id: string, model: string, options: { clipId?: 
     if (targets.some(clip => clip.status === "failed" || clip.status === "submission-unknown")) throw new RequestError("Recover or explicitly retry the failed clip before resuming.", "clip_needs_review");
     if (scopeId && previousFrameDecision(targets[0])) {
       const previous = candidate.clips[candidate.clips.findIndex(clip => clip.id === scopeId) - 1];
-      if (previous?.status !== "complete" || !(candidate.settings.provider === "apimart" ? previous.frame : previous.latentId)) throw new RequestError("Generate the preceding clip with the current workflow before retrying this continuation.", "continuity_missing");
+      if (previous?.status !== "complete" || !(candidate.settings.provider === "apimart" ? previous.frame : candidate.settings.provider === "comfy-cloud" ? previous.latent : previous.latentId)) throw new RequestError("Generate the preceding clip with the current workflow before retrying this continuation.", "continuity_missing");
     }
     const referenceIssues = projectReferenceIssues(candidate).filter(issue => !scopeId || issue.clipId === scopeId);
     if (referenceIssues.length) throw new RequestError(referenceIssues.map(issue => issue.message).join("\n"), "invalid_agent_request");
@@ -121,8 +126,8 @@ export async function reserveRun(id: string, model: string, options: { clipId?: 
     return controller;
   } catch (error) { if (state.active?.controller === controller) state.active = undefined; throw error; }
 }
-type Dependencies = { compile: typeof compilePrompts; submit: typeof submitGeneration; check: typeof checkGeneration; history: typeof jobHistory; download: typeof downloadOutput; finalize: typeof finalizeClip; pollMs: number };
-const defaultDependencies: Dependencies = { compile: compilePrompts, submit: submitGeneration, check: checkGeneration, history: jobHistory, download: downloadOutput, finalize: finalizeClip, pollMs: 5000 };
+type Dependencies = { prepareCloud: typeof prepareComfyCloudRequest; saveLatent: typeof saveComfyCloudLatent; compile: typeof compilePrompts; submit: typeof submitGeneration; check: typeof checkGeneration; history: typeof jobHistory; download: typeof downloadOutput; finalize: typeof finalizeClip; pollMs: number };
+const defaultDependencies: Dependencies = { prepareCloud: prepareComfyCloudRequest, saveLatent: saveComfyCloudLatent, compile: compilePrompts, submit: submitGeneration, check: checkGeneration, history: jobHistory, download: downloadGenerationOutput, finalize: finalizeClip, pollMs: 5000 };
 export async function executeProject(id: string, controller: AbortController, overrides: Partial<Dependencies> = {}) {
   const dependencies = { ...defaultDependencies, ...overrides }; const signal = controller.signal;
   const scopeId = state.active?.controller === controller ? state.active.clipId : undefined;
@@ -144,15 +149,16 @@ export async function executeProject(id: string, controller: AbortController, ov
         await updateProject(id, current => { const shot = current.clips.find(item => item.id === clipId)!; shot.status = "awaiting-approval"; shot.error = undefined; current.status = "paused"; current.error = undefined; return current; });
         return;
       }
-      if (!job && !clip.jobId) {
+      if (!job && !clip.jobId && !clip.source) {
         const built = await inputFor(project, clip);
         const wan = project.settings.provider === "apimart" ? await prepareWanRequest(project, clip, built.input, signal) : undefined;
+        const cloudRequest = project.settings.provider === "comfy-cloud" ? await dependencies.prepareCloud(project, built.input, signal) : undefined;
         signal.throwIfAborted();
-        await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; shot.requestId = built.input.requestId; shot.seed = Number(built.input.settings.seed); shot.requestedDuration = wan?.duration ?? clip.duration; shot.firstFrameFrom = built.firstFrameFrom; shot.latentId = wan ? undefined : built.input.clipId; shot.previousLatentId = wan ? undefined : built.input.previousClipId; shot.status = "submitting"; shot.error = undefined; return current; });
+        await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; shot.requestId = built.input.requestId; shot.seed = Number(built.input.settings.seed); shot.requestedDuration = wan?.duration ?? clip.duration; shot.firstFrameFrom = built.firstFrameFrom; shot.endpoint = project.runEndpoint; shot.latentId = wan ? undefined : built.input.clipId; shot.previousLatentId = wan ? undefined : built.input.previousClipId; shot.status = "submitting"; shot.error = undefined; return current; });
         // Save a readable audit with filenames/bindings and graph, excluding inline media and credentials.
         const payload = buildPayload(built.input.settings, built.input.images, built.input.audios, { clipId: built.input.clipId || built.input.requestId, previousClipId: built.input.previousClipId });
-        await writeAsset(id, `requests/${clipId}-${built.input.requestId}.json`, Buffer.from(JSON.stringify({ clipId, requestId: built.input.requestId, endpoint: project.runEndpoint, firstFrameFrom: built.firstFrameFrom, suppliedReferences: suppliedReferences(project, clip).map(slot => ({ id: slot.id, name: slot.name, asset: slot.asset.path })), media: payload.input.images.map(file => ({ name: file.name })), ...(wan ? { provider: "apimart", request: wan } : { provider: "runpod", workflow: payload.input.workflow }) }, null, 2)), "application/json", "request.json");
-        job = await dependencies.submit({ ...built.input, ...(wan ? { wanRequest: wan } : {}) }, project.runEndpoint);
+        await writeAsset(id, `requests/${clipId}-${built.input.requestId}.json`, Buffer.from(JSON.stringify({ clipId, requestId: built.input.requestId, endpoint: project.runEndpoint, firstFrameFrom: built.firstFrameFrom, suppliedReferences: suppliedReferences(project, clip).map(slot => ({ id: slot.id, name: slot.name, asset: slot.asset.path })), media: payload.input.images.map(file => ({ name: file.name })), ...(wan ? { provider: "apimart", request: wan } : { provider: project.settings.provider || "runpod", workflow: cloudRequest?.workflow || payload.input.workflow, ...(cloudRequest ? { baseUrl: cloudRequest.baseUrl } : {}) }) }, null, 2)), "application/json", "request.json");
+        job = await dependencies.submit({ ...built.input, ...(wan ? { wanRequest: wan } : {}), ...(cloudRequest ? { cloudWorkflow: cloudRequest.workflow, cloudBaseUrl: cloudRequest.baseUrl } : {}) }, project.runEndpoint);
       }
       if (job && ["SUBMISSION_UNKNOWN", "SUBMITTING"].includes(job.status)) {
         await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; shot.status = "submission-unknown"; shot.error = job!.error || "Recover the job ID from the provider account before resuming."; return current; });
@@ -175,13 +181,21 @@ export async function executeProject(id: string, controller: AbortController, ov
           if (!["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"].includes(job.status)) await delay(dependencies.pollMs, undefined, { signal });
         }
         if (job.status !== "COMPLETED") {
-          await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; shot.status = "failed"; shot.error = job!.error || `RunPod job ${job!.status.toLowerCase()}.`; return current; });
-          throw new RequestError(job.error || `RunPod job ${job.status.toLowerCase()}.`, "runpod_job_failed");
+          await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; shot.status = "failed"; shot.error = job!.error || `Video job ${job!.status.toLowerCase()}.`; return current; });
+          throw new RequestError(job.error || `Video job ${job.status.toLowerCase()}.`, "runpod_job_failed");
         }
         signal.throwIfAborted();
         await updateProject(id, current => { current.clips.find(shot => shot.id === clipId)!.status = "saving"; return current; });
         const source = await dependencies.download(id, `${clipId}-${clip.requestId!.slice(0, 8)}`, job.output, signal);
         await updateProject(id, current => { const shot = current.clips.find(shot => shot.id === clipId)!; shot.source = source; return current; });
+      }
+      project = await getProject(id); clip = project.clips.find(clip => clip.id === clipId)!;
+      if (clip.endpoint === "comfy-cloud" && !clip.latent) {
+        // Keep the downloaded source independently: a failed latent transfer must resume saving,
+        // including after a restart, without submitting or re-downloading the video.
+        job = await dependencies.check(clip.jobId!, clip.requestId);
+        const latent = await dependencies.saveLatent(id, `${clipId}-${clip.requestId!.slice(0, 8)}`, job.output, signal);
+        await updateProject(id, current => { current.clips.find(item => item.id === clipId)!.latent = latent; return current; });
       }
       signal.throwIfAborted(); project = await getProject(id); clip = project.clips.find(clip => clip.id === clipId)!;
       const outputId = clip.versions?.length ? `${clipId}-${clip.requestId!.slice(0, 8)}` : clipId;
@@ -222,7 +236,7 @@ export async function pauseProject(id: string) {
 export async function recoverClip(id: string, clipId: string, jobId: string) {
   assertEditable(id); const project = await getProject(id); const clip = project.clips.find(clip => clip.id === clipId);
   if (!clip?.requestId || clip.status === "complete") throw new RequestError("This shot does not need job recovery.", "invalid_clip_state");
-  const job = await checkGeneration(jobId, clip.requestId);
+  const job = await checkGeneration(jobId, clip.requestId, clip.endpoint || project.settings.provider);
   return updateProject(id, current => { assertEditable(id); const shot = current.clips.find(shot => shot.id === clipId)!; Object.assign(shot, jobTiming(job)); shot.jobId = job.id; shot.endpoint = job.endpoint; shot.status = "recoverable"; shot.error = undefined; current.error = undefined; current.status = "paused"; return current; });
 }
 export async function retryClip(id: string, clipId: string, reviewed = false) {
@@ -232,8 +246,8 @@ export async function retryClip(id: string, clipId: string, reviewed = false) {
   if (job?.id) {
     await assertReplaceableJob(job.id, clip.requestId);
   } else if (job && ["SUBMITTING", "SUBMISSION_UNKNOWN"].includes(job.status)) {
-    if (!reviewed) throw new RequestError(job.endpoint === "apimart" ? "Review your API Mart tasks before resolving an uncertain submission." : "Review the RunPod console before resolving an uncertain submission.", "review_required");
+    if (!reviewed) throw new RequestError(job.endpoint === "comfy-cloud" ? "Review your Comfy Cloud jobs before resolving an uncertain submission." : job.endpoint === "apimart" ? "Review your API Mart tasks before resolving an uncertain submission." : "Review the RunPod console before resolving an uncertain submission.", "review_required");
     await resolveUnknown(job.localId);
-  } else if (clip.status === "submission-unknown" && !reviewed) throw new RequestError("Review the RunPod console before retrying.", "review_required");
-  return updateProject(id, current => { assertEditable(id); const shot = current.clips.find(shot => shot.id === clipId)!; shot.status = "pending"; shot.requestId = undefined; shot.latentId = undefined; shot.previousLatentId = undefined; shot.delayTime = undefined; shot.executionTime = undefined; shot.jobId = undefined; shot.compiledPrompt = undefined; shot.endpoint = undefined; shot.error = undefined; shot.source = undefined; current.status = "ready"; current.error = undefined; return current; });
+  } else if (clip.status === "submission-unknown" && !reviewed) throw new RequestError(project.settings.provider === "comfy-cloud" ? "Review the Comfy Cloud account before retrying." : "Review the RunPod console before retrying.", "review_required");
+  return updateProject(id, current => { assertEditable(id); const shot = current.clips.find(shot => shot.id === clipId)!; shot.status = "pending"; shot.requestId = undefined; shot.latentId = undefined; shot.previousLatentId = undefined; shot.latent = undefined; shot.delayTime = undefined; shot.executionTime = undefined; shot.jobId = undefined; shot.compiledPrompt = undefined; shot.endpoint = undefined; shot.error = undefined; shot.source = undefined; current.status = "ready"; current.error = undefined; return current; });
 }

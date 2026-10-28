@@ -32,7 +32,7 @@ export function publicAddress(address: string) {
   }
   return false;
 }
-async function downloadHttps(urlValue: string, target: string, signal: AbortSignal, redirects = 0): Promise<void> {
+async function downloadHttps(urlValue: string, target: string, signal: AbortSignal, redirects = 0, maximumBytes = MAX_VIDEO_BYTES): Promise<void> {
   const url = new URL(urlValue);
   if (url.protocol !== "https:" || url.username || url.password || (url.port && url.port !== "443") || redirects > 5) throw new RequestError("The worker returned an unsupported video URL. Use a public HTTPS video output.", "invalid_video_url");
   const addresses = await lookup(url.hostname.replace(/^\[|\]$/g, ""), { all: true });
@@ -43,11 +43,26 @@ async function downloadHttps(urlValue: string, target: string, signal: AbortSign
     const request = httpsRequest(url, { signal, family: address.family, lookup: (_hostname, _options, callback) => callback(null, address.address, address.family), headers: { "Accept-Encoding": "identity" }, timeout: 120000 }, resolve);
     request.on("timeout", () => request.destroy(new Error("Download timed out"))); request.on("error", reject); request.end();
   });
-  if ([301, 302, 303, 307, 308].includes(response.statusCode || 0) && response.headers.location) { response.resume(); return downloadHttps(new URL(response.headers.location, url).href, target, signal, redirects + 1); }
-  if (response.statusCode !== 200 || Number(response.headers["content-length"]) > MAX_VIDEO_BYTES) { response.destroy(); throw new RequestError("The video download failed or exceeded 512 MiB. Check the worker output and resume saving.", "video_download_failed"); }
+  if ([301, 302, 303, 307, 308].includes(response.statusCode || 0) && response.headers.location) { response.resume(); return downloadHttps(new URL(response.headers.location, url).href, target, signal, redirects + 1, maximumBytes); }
+  if (response.statusCode !== 200 || Number(response.headers["content-length"]) > maximumBytes) { response.destroy(); throw new RequestError("The output download failed or exceeded its size limit. Resume saving the existing job.", "video_download_failed"); }
   let total = 0;
-  const limit = new Transform({ transform(chunk: Buffer, _encoding, callback) { total += chunk.length; callback(total > MAX_VIDEO_BYTES ? new Error("Video is too large") : null, chunk); } });
+  const limit = new Transform({ transform(chunk: Buffer, _encoding, callback) { total += chunk.length; callback(total > maximumBytes ? new Error("Output is too large") : null, chunk); } });
   await pipeline(response, limit, createWriteStream(target, { mode: 0o600, flags: "wx" }), { signal });
+}
+export async function downloadBinaryFile(url: string, target: string, signal: AbortSignal, maximumBytes: number) {
+  const temporary = `${target}.${randomUUID()}.part`;
+  try {
+    await downloadHttps(url, temporary, signal, 0, maximumBytes);
+    signal.throwIfAborted();
+    const info = await stat(temporary);
+    if (!info.size) throw new RequestError("The provider returned an empty output file.", "empty_output");
+    await rename(temporary, target);
+    return info.size;
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined);
+    if (error instanceof RequestError || signal.aborted) throw error;
+    throw new RequestError("Could not download the output file. Resume to save the existing job without generating again.", "output_download_failed");
+  }
 }
 export async function downloadOutput(projectId: string, clipId: string, output: unknown, signal: AbortSignal): Promise<Asset> {
   const path = `clips/${clipId}.source.mp4`; const target = assetPath(projectId, path);

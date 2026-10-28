@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { checkComfyCloud, submitComfyCloud, type ComfyCloudInput } from "./comfy-cloud";
+import type { Workflow } from "./h3";
 import { withDatabase } from "./store";
 import { jobIdSchema, jobHistory, submitAgentVideo, checkVideo } from "./runpod";
 import { type H3Job, type ReferenceFile, type agentSubmissionSchema } from "./h3";
@@ -122,11 +124,16 @@ export async function checkWan(taskId: string, localId?: string): Promise<H3Job>
     return job;
   });
 }
-export async function checkGeneration(jobId: string, localId?: string) {
+export async function checkGeneration(jobId: string, localId?: string, provider?: string) {
   const job = (await jobHistory()).find(job => localId ? job.localId === localId : job.id === jobId);
-  return job?.endpoint === "apimart" ? checkWan(jobId, localId) : checkVideo(jobId, localId);
+  const endpoint = job?.endpoint || provider;
+  return endpoint === "comfy-cloud" ? checkComfyCloud(jobId, localId) : endpoint === "apimart" ? checkWan(jobId, localId) : checkVideo(jobId, localId);
 }
-export async function submitGeneration(input: AgentInput & { wanRequest?: WanRequest }, endpoint?: string) {
+export async function submitGeneration(input: ComfyCloudInput & { wanRequest?: WanRequest; cloudWorkflow?: Workflow; cloudBaseUrl?: string }, endpoint?: string) {
+  if (endpoint === "comfy-cloud") {
+    if (!input.cloudWorkflow) throw new RequestError("Prepare the Comfy Cloud workflow before submitting.", "invalid_comfy_cloud_request");
+    return submitComfyCloud(input, input.cloudWorkflow, input.cloudBaseUrl);
+  }
   if (endpoint === "apimart") {
     if (!input.wanRequest) throw new RequestError("Prepare the Wan request before submitting.", "invalid_wan_request");
     return submitWan(input, input.wanRequest);

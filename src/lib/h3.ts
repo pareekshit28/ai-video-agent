@@ -38,7 +38,7 @@ const baseSubmissionSchema = z.object({ requestId: z.uuid(), collectionId: z.uui
 export const agentSubmissionSchema = baseSubmissionSchema;
 export const submissionSchema = baseSubmissionSchema.superRefine((data, ctx) => { if (!data.images.length && !data.audios.length) ctx.addIssue({ code: "custom", message: "Add at least one image or audio reference.", path: ["images"] }); });
 
-type Workflow = Record<string, { class_type: string; inputs: Record<string, unknown>; _meta?: { title: string; aux_id?: string; ver?: string } }>;
+export type Workflow = Record<string, { class_type: string; inputs: Record<string, unknown>; _meta?: { title: string; aux_id?: string; ver?: string } }>;
 export function dimensions(aspectRatio: H3Settings["aspectRatio"], megapixels: number) {
   const ratio = aspectRatio.startsWith("9:16") ? 9 / 16 : aspectRatio.startsWith("1:1") ? 1 : 16 / 9;
   const height = Math.round(Math.sqrt(megapixels * 1_000_000 / ratio) / 32) * 32;
@@ -46,9 +46,9 @@ export function dimensions(aspectRatio: H3Settings["aspectRatio"], megapixels: n
 }
 // API graph converted from workflows/minimax_h3_motion_context.json.
 // Fork provenance stays in _meta; the worker image supplies the node implementation.
-export function buildPayload(settings: H3Settings, images: ReferenceFile[], audios: ReferenceFile[], context: { clipId: string; previousClipId?: string }) {
+export function buildPayload(settings: H3Settings, images: ReferenceFile[], audios: ReferenceFile[], context: { clipId: string; previousClipId?: string }, template: Workflow = sourceWorkflow) {
   z.object({ clipId: z.uuid(), previousClipId: z.uuid().optional() }).parse(context);
-  const workflow = structuredClone(sourceWorkflow) as Workflow;
+  const workflow = structuredClone(template);
   workflow["138"].inputs.value = settings.prompt.trim();
   workflow["132"].inputs.value = settings.duration;
   workflow["115"].inputs.aspect_ratio = settings.aspectRatio;
@@ -63,7 +63,7 @@ export function buildPayload(settings: H3Settings, images: ReferenceFile[], audi
     // MotionContextTrim removes this pinned head from both decoded streams.
     // Reserve it before H3's frame snapping so the requested action still fits.
     const contextFrames = Number(workflow["160"].inputs.context_length);
-    workflow["131"].inputs.expression = sourceWorkflow["131"].inputs.expression.replaceAll("a * 24", `(a * 24 + ${contextFrames})`);
+    workflow["131"].inputs.expression = String(template["131"].inputs.expression).replaceAll("a * 24", `(a * 24 + ${contextFrames})`);
   }
   let nextId = 162;
   const uploads: { name: string; image: string }[] = [];
@@ -79,7 +79,7 @@ export function buildPayload(settings: H3Settings, images: ReferenceFile[], audi
   return { input: { workflow, images: uploads } };
 }
 
-export type H3Job = { collectionId?: string; localId: string; id?: string; endpoint: string; prompt: string; createdAt: number; status: string; agent?: boolean; output?: unknown; error?: string; delayTime?: number; executionTime?: number };
+export type H3Job = { baseUrl?: string; statusUrl?: string; collectionId?: string; localId: string; id?: string; endpoint: string; prompt: string; createdAt: number; status: string; agent?: boolean; output?: unknown; error?: string; delayTime?: number; executionTime?: number };
 export const terminalStatuses = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "REJECTED", "SUBMISSION_UNKNOWN", "SUBMITTING"]);
 export function mediaFrom(output: unknown): string[] {
   const results: string[] = [];

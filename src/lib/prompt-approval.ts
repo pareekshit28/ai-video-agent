@@ -14,6 +14,9 @@ export function promptApprovalKey(project: AgentProject, clip: AgentClip) {
     if (project.settings.provider === "apimart") {
       const frame = previous?.frame;
       if (frame) { hash.update(JSON.stringify(frame)); hash.update(readFileSync(assetPath(project.id, frame.path))); }
+    } else if (project.settings.provider === "comfy-cloud") {
+      hash.update(JSON.stringify({ workflow: "h3-cloud-files-v1", previousJobId: previous?.jobId, latent: previous?.latent }));
+      if (previous?.latent) hash.update(readFileSync(assetPath(project.id, previous.latent.path)));
     } else hash.update(JSON.stringify({ workflow: "h3-motion-context-v1", previousLatentId: previous?.latentId, previousJobId: previous?.jobId }));
   }
   return hash.digest("hex");

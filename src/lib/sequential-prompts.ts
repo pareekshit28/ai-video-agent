@@ -17,7 +17,9 @@ function promptFingerprint(project: AgentProject, clip: AgentClip) {
   const previous = project.clips[project.clips.findIndex(item => item.id === clip.id) - 1];
   if (!previous || previous.status !== "complete" || (project.settings.provider === "apimart" && !previous.frame)) throw new RequestError("Finish the previous clip before planning this prompt.", "previous_clip_unfinished");
   const observed = { id: previous.id, prompt: previous.compiledPrompt || previous.prompt, frame: previous.frame, video: previous.video, jobId: previous.jobId, media: previous.media, ...(project.settings.provider !== "apimart" ? { latentId: previous.latentId, workflow: "h3-motion-context-v1" } : {}) };
+  if (project.settings.provider === "comfy-cloud" && previous.latent) Object.assign(observed, { latent: previous.latent });
   const content: (string | Buffer)[] = previous.frame ? [readFileSync(assetPath(project.id, previous.frame.path))] : [];
+  if (project.settings.provider === "comfy-cloud" && previous.latent) content.push(readFileSync(assetPath(project.id, previous.latent.path)));
   for (const reference of [...suppliedImages(project, clip), ...suppliedAudios(project, clip)]) {
     content.push(JSON.stringify(reference), readFileSync(assetPath(project.id, reference.asset.path)));
   }

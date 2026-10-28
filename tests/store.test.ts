@@ -34,10 +34,10 @@ describe("local storage and request protection", () => {
     encrypted[encrypted.length - 1] ^= 1;
     expect(() => decrypt(encrypted, key)).toThrow();
   });
-  it("removes obsolete credentials on upgrade while preserving the RunPod key and all job history", async () => {
+  it("removes obsolete credentials on upgrade while preserving all provider keys and job history", async () => {
     await withDatabase(() => undefined);
     const key = await readFile(join(directory, "storage.key"));
-    const retained = { runpod: { endpoint: "original-endpoint", apiKey: "saved-test-key" }, h3Jobs: [{ id: "existing-job", status: "complete" }] };
+    const retained = { runpod: { endpoint: "original-endpoint", apiKey: "saved-test-key" }, apimart: { apiKey: "saved-wan-key" }, comfyCloud: { apiKey: "saved-cloud-key", baseUrl: "https://dep-saved.run.comfy.app" }, h3Jobs: [{ id: "existing-job", status: "complete" }] };
     const old = { ...retained, hostId: "old-installation", profiles: { old: { credentials: { accessToken: "obsolete-access", refreshToken: "obsolete-refresh" } } }, sessions: { old: {} }, transactions: { old: {} } };
     await writeFile(join(directory, "credentials.enc"), encrypt(JSON.stringify(old), key));
     await expect(withDatabase(async db => { expect(db).toEqual(retained); throw new Error("Requested operation failed"); })).rejects.toThrow("Requested operation failed");

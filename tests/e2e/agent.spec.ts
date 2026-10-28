@@ -10,13 +10,14 @@ function planned(): PublicProject {
 }
 async function setup(page: Page, initial?: PublicProject) {
   await mockProject(page);
+  if (!initial) await page.route("**/api/comfy-cloud/settings", route => route.fulfill({ json: { configured: true, environmentKey: false, baseUrl: "https://cloud.comfy.org" } }));
   await page.route("**/api/characters*", route => route.fulfill({ json: { characters: [] } }));
   let project = initial; const requests: { path: string; body: any }[] = []; let polls = 0; let runningClip: string | undefined;
   await page.route("**/api/agent/codex", route => route.fulfill({ json: { connected: true, imageGeneration: true, models: [{ slug: "codex:test-model", displayName: "Test · Codex", reasoningEfforts: [{ effort: "low", description: "Fast" }, { effort: "medium", description: "Balanced" }, { effort: "high", description: "Thorough" }], defaultReasoningEffort: "low" }], skills: ["imagegen"] } }));
   await page.route("**/api/video/settings", route => route.fulfill({ json: { endpoint: "xnnd4qobofshqz", configured: true, environmentKey: true } }));
   await page.route("**/api/agent/projects", route => route.fulfill({ json: { folder: "D:\\Videos\\AI Video Agent", projects: project ? [{ id: project.id, collectionId: project.collectionId, title: project.title, status: project.status, active: project.active, completed: project.clips.filter(clip => clip.status === "complete").length, clipCount: 2 }] : [] } }));
   await page.route("**/api/agent/media?*", route => route.fulfill({ body: new URL(route.request().url()).searchParams.get("kind") === "video" ? video : png, contentType: new URL(route.request().url()).searchParams.get("kind") === "video" ? "video/mp4" : "image/png" }));
-  await page.route("**/api/agent/analyze", route => { requests.push({ path: "analyze", body: route.request().postDataJSON() }); project = planned(); project.clips = []; project.referencesIdentified = true; project.reasoningEffort = route.request().postDataJSON().reasoningEffort; return route.fulfill({ json: { project } }); });
+  await page.route("**/api/agent/analyze", route => { requests.push({ path: "analyze", body: route.request().postDataJSON() }); project = planned(); project.settings.provider = route.request().postDataJSON().videoProvider; project.clips = []; project.referencesIdentified = true; project.reasoningEffort = route.request().postDataJSON().reasoningEffort; return route.fulfill({ json: { project } }); });
   await page.route("**/api/agent/reference", route => { const body = route.request().postDataJSON(); requests.push({ path: "reference", body }); project!.references.find(slot => slot.id === body.slotId)!.asset = body.file ? { path: `references/${body.slotId}.png`, name: body.file.name, bytes: body.file.bytes, mime: "image/png" } : undefined; return route.fulfill({ json: { project } }); });
   await page.route("**/api/agent/frame", route => {
     const body = route.request().postDataJSON(); requests.push({ path: "frame", body });
@@ -78,6 +79,22 @@ async function setup(page: Page, initial?: PublicProject) {
   await page.goto("/"); return requests;
 }
 
+test("new scenes default to Comfy Cloud while saved provider choices survive reload", async ({ page }) => {
+  const requests = await setup(page);
+  await expect(page.getByLabel("Video generation model", { exact: true })).toHaveValue("comfy-cloud");
+  await page.getByLabel("Your scene", { exact: true }).fill("A traveler arrives at a station.");
+  await page.getByRole("button", { name: "Identify references", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Scene references", exact: true })).toBeVisible();
+  expect(requests.find(item => item.path === "analyze")?.body.videoProvider).toBe("comfy-cloud");
+  await page.reload();
+  await expect(page.getByLabel("Video generation model", { exact: true })).toHaveValue("comfy-cloud");
+  await page.getByLabel("Video generation model", { exact: true }).selectOption("runpod");
+  await expect(page.getByLabel("Video generation model", { exact: true })).toHaveValue("runpod");
+  await page.reload();
+  await expect(page.getByLabel("Video generation model", { exact: true })).toHaveValue("runpod");
+  expect(requests.filter(item => item.path === "run")).toHaveLength(0);
+});
+
 for (const provider of ["runpod", "apimart"] as const) {
   test(`maximum clip duration is validated before ${provider} planning and saved with the scene`, async ({ page }, info) => {
     const value = planned(); value.clips = []; value.referencesIdentified = true; value.settings.provider = provider;
@@ -138,8 +155,55 @@ test("duration can be saved during an active job without pausing generation", as
   expect(requests.filter(item => item.path === "run")).toHaveLength(0);
 });
 
+test("Comfy Cloud is a third provider with its own key and locally downloadable continuity latents", async ({ page }, info) => {
+  const value = planned(); value.settings.provider = "comfy-cloud"; value.sequentialPrompts = true;
+  Object.assign(value.clips[0], { status: "complete", endpoint: "comfy-cloud", latentId: "f01aaeed-aaaa-4aaa-8aaa-111111111111", latent: { path: "latents/arrival-take1.safetensors", name: "arrival.safetensors", bytes: 200, mime: "application/octet-stream" }, jobId: "cloud-first", video: { path: "clips/arrival.mp4", name: "arrival.mp4", bytes: video.length, mime: "video/mp4" }, frame: { path: "frames/arrival.png", name: "arrival.png", bytes: png.length, mime: "image/png" } });
+  Object.assign(value.clips[1], { compiledPrompt: "The traveler boards from the preceding pose.", promptContextKey: "cloud-planned-key", promptFromLatent: value.clips[0].latentId, promptFromFrame: value.clips[0].frame!.path, promptFromJob: value.clips[0].jobId });
+  const credentials: unknown[] = [];
+  const deploymentUrl = "https://dep-4bcaff52-e1a6-4372-b23a-3e0c126ace00.run.comfy.app";
+  let baseUrl = "https://cloud.comfy.org";
+  await page.route("**/api/comfy-cloud/settings", route => {
+    if (route.request().method() === "POST") { const body = route.request().postDataJSON(); credentials.push(body); baseUrl = body.baseUrl; }
+    return route.fulfill({ json: { configured: true, environmentKey: false, baseUrl } });
+  });
+  const requests = await setup(page, value);
+  await expect(page.getByLabel("Video generation model", { exact: true })).toHaveValue("comfy-cloud");
+  await expect(page.getByLabel("Video generation model").locator("option")).toHaveCount(3);
+  await page.getByRole("button", { name: "Comfy Cloud connection", exact: true }).click();
+  await expect(page.getByLabel("Agent endpoint ID")).toHaveCount(0);
+  await expect(page.getByLabel("Comfy Cloud deployment URL", { exact: true })).toHaveValue(baseUrl);
+  await page.getByLabel("Comfy Cloud deployment URL", { exact: true }).fill(deploymentUrl);
+  await page.getByLabel("Comfy Cloud API key", { exact: true }).fill("cloud-test-key");
+  await page.getByRole("button", { name: "Save connection", exact: true }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(credentials).toEqual([{ apiKey: "cloud-test-key", baseUrl: deploymentUrl }]);
+  await expect(page.getByRole("link", { name: "Download motion latent", exact: true })).toHaveAttribute("href", /kind=latent/);
+  await expect(page.getByRole("button", { name: "Generate clip 2", exact: true })).toBeEnabled();
+  await page.locator(".agent-clip").first().screenshot({ path: `test-results/${info.project.name}-comfy-cloud-latent.png` });
+  await page.reload();
+  await expect(page.getByLabel("Video generation model", { exact: true })).toHaveValue("comfy-cloud");
+  await expect(page.getByRole("link", { name: "Download motion latent", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Comfy Cloud connection", exact: true }).click();
+  await expect(page.getByLabel("Comfy Cloud deployment URL", { exact: true })).toHaveValue(deploymentUrl);
+  await page.getByRole("dialog").screenshot({ path: `test-results/${info.project.name}-comfy-cloud-deployment.png` });
+  await page.getByRole("button", { name: "Close agent Comfy Cloud connection", exact: true }).click();
+  await page.getByRole("button", { name: "Generate clip 2", exact: true }).click();
+  expect(requests.find(item => item.path === "run")?.body.clipId).toBe("boarding");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+test("Comfy Cloud continuation stays blocked when the previous take has no saved latent file", async ({ page }) => {
+  const value = planned(); value.settings.provider = "comfy-cloud"; value.sequentialPrompts = false;
+  Object.assign(value.clips[0], { status: "complete", endpoint: "comfy-cloud", jobId: "cloud-first", latentId: "f01aaeed-aaaa-4aaa-8aaa-111111111111" });
+  await page.route("**/api/comfy-cloud/settings", route => route.fulfill({ json: { configured: true, environmentKey: true } }));
+  const requests = await setup(page, value);
+  await expect(page.getByRole("button", { name: "Generate clip 2", exact: true })).toBeDisabled();
+  expect(requests.filter(item => item.path === "run")).toHaveLength(0);
+});
+
 test("reference-first planning, editable prompts and individual generation preserve local playback", async ({ page }, info) => {
   const requests = await setup(page);
+  await page.getByLabel("Video generation model", { exact: true }).selectOption("runpod");
   await page.getByLabel("Your scene", { exact: true }).fill("A traveler arrives at a station, then boards a train.");
   await page.getByRole("button", { name: "Identify references", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Scene references" })).toBeVisible();

@@ -13,7 +13,8 @@ const planning = vi.hoisted(() => ({ call: vi.fn() }));
 vi.mock("../src/lib/codex", async importOriginal => ({ ...await importOriginal<typeof import("../src/lib/codex")>(), codexJson: planning.call }));
 import { planSchema, defaultGeneration, referenceBindings, finalPrompt, previousFrameDecision, suppliedImages, suppliedAudios, type AgentProject } from "../src/lib/agent-types";
 import { wanReferencePromptGuidance, wanPromptGuideVersion } from "../src/lib/wan-prompt-guide";
-import { analyzeScript, compilePrompts, optimizeScriptPlan } from "../src/lib/agent-llm";
+import { analyzeScript, compilePrompts, optimizeScriptPlan, planFromReferences, planFollowingClipPrompt } from "../src/lib/agent-llm";
+import { scriptedDialogueConstraint } from "../src/lib/agent-prompt-rules";
 import { automaticPlan, compactPlan } from "../src/lib/agent-planning";
 import { createProject, getProject, updateProject, writeAsset, assetPath, projectFolder, listProjects } from "../src/lib/agent-store";
 import { reserveRun, executeProject, inputFor, isProjectActive, publicProject, retryClip, recoverClip } from "../src/lib/agent-runner";
@@ -33,6 +34,10 @@ import { createCollection } from "../src/lib/project-collections";
 import { saveStudioInput, saveStudioOutput, studioFolder } from "../src/lib/studio-assets";
 import { prepareSequentialPrompt, assertPreviousPromptReady } from "../src/lib/sequential-prompts";
 import { GET as studioMedia } from "../src/app/api/video/media/route";
+import type { ComfyCloudInput } from "../src/lib/comfy-cloud";
+import { RequestError } from "../src/lib/request-error";
+import { promptApprovalKey } from "../src/lib/prompt-approval";
+import { previousPromptKey } from "../src/lib/sequential-prompts";
 
 const plan = {
   title: "Station arrival", summary: "A traveler waits, then boards a train.",
@@ -40,6 +45,110 @@ const plan = {
   clips: [{ id: "arrival", title: "Arrival", duration: 2, prompt: "A traveler approaches the station.", referenceIds: ["station", "traveler"], continuation: false }, { id: "boarding", title: "Boarding", duration: 2, prompt: "The traveler moves toward the train.", referenceIds: ["traveler", "station"], continuation: true }],
 };
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aBXkAAAAASUVORK5CYII=", "base64");
+describe("Comfy Cloud clip execution", () => {
+  const prepareCloud = () => vi.fn(async (_project: AgentProject, _input: ComfyCloudInput) => ({ baseUrl: "https://cloud.comfy.org", workflow: { "159": { class_type: "MiniMaxH3MotionContextSaveLatent", inputs: { storage_root: "" } } } }));
+  const generation = () => vi.fn(async input => ({ localId: input.requestId, id: `cloud-${input.requestId}`, endpoint: "comfy-cloud", prompt: input.settings.prompt, status: "COMPLETED", createdAt: Date.now(), output: { video: `data:video/mp4;base64,${video.toString("base64")}` } }));
+  const saveLatent = () => vi.fn(async (projectId, takeId) => writeAsset(projectId, `clips/${takeId}.safetensors`, Buffer.from(`saved AV latent ${takeId}`), "application/octet-stream", `${takeId}.safetensors`));
+  async function cloudScene() {
+    memory.db.comfyCloud = { apiKey: "test-cloud-key" };
+    const value = await project();
+    return updateProject(value.id, current => { current.settings.provider = "comfy-cloud"; return current; });
+  }
+  it("retains each latent, carries it into the next request and archives it with its original take", async () => {
+    const value = await cloudScene(), submit = generation(), prepare = prepareCloud(), save = saveLatent();
+    const check = vi.fn(async () => submit.mock.results.at(-1)!.value);
+    const overrides = { compile: async () => [], prepareCloud: prepare, saveLatent: save, submit, check };
+    await executeProject(value.id, await reserveRun(value.id, "test-model", { clipId: "arrival" }), overrides);
+    let saved = await getProject(value.id);
+    expect(saved.clips[0].status).toBe("complete"); expect(saved.clips[0].latent).toBeDefined();
+    const latent = saved.clips[0].latent!, videoAsset = saved.clips[0].video!;
+    await executeProject(value.id, await reserveRun(value.id, "test-model", { clipId: "boarding" }), overrides);
+    expect(submit.mock.calls[1][0].previousLatent).toEqual(latent);
+    expect(submit.mock.calls[1][0].previousClipId).toBe(saved.clips[0].latentId);
+    expect(prepare.mock.calls[1][1].previousLatent).toEqual(latent);
+    expect((await getProject(value.id)).clips[1].status).toBe("complete");
+    const response = await projectRoute(localMutation("agent/project", { projectId: value.id, action: "prepareClip", clipId: "arrival", prompt: "The traveler pauses.", referenceIds: ["traveler"] }));
+    expect(response.status).toBe(200);
+    await executeProject(value.id, await reserveRun(value.id, "test-model", { clipId: "arrival", revision: true }), overrides);
+    saved = await getProject(value.id);
+    expect(saved.clips[0].latent!.path).not.toBe(latent.path);
+    expect(saved.clips[0].versions![0].clip).toMatchObject({ latent, video: videoAsset });
+    expect(saved.clips[1].continuityOutdated).toBe(true);
+    expect(await readFile(assetPath(value.id, latent.path))).toBeTruthy();
+    const media = await mediaRoute(new Request(`http://127.0.0.1:3000/api/agent/media?projectId=${value.id}&id=arrival&kind=latent&version=0&download=1`, { headers: { Host: "127.0.0.1:3000" } }));
+    expect(media.status).toBe(200); expect(Buffer.from(await media.arrayBuffer())).toEqual(await readFile(assetPath(value.id, latent.path)));
+  }, 30000);
+  it("resumes a failed latent download while retaining the video source and submitting only once", async () => {
+    const value = await cloudScene(), submit = generation(), prepare = prepareCloud(), save = saveLatent(), download = vi.fn(downloadOutput);
+    save.mockRejectedValueOnce(new RequestError("Latent download interrupted", "cloud_download_failed"));
+    const check = vi.fn(async () => submit.mock.results[0].value);
+    const overrides = { compile: async () => [], prepareCloud: prepare, saveLatent: save, submit, check, download };
+    await executeProject(value.id, await reserveRun(value.id, "test-model", { clipId: "arrival" }), overrides);
+    const interrupted = await getProject(value.id);
+    expect(interrupted.clips[0]).toMatchObject({ status: "recoverable", endpoint: "comfy-cloud" });
+    expect(interrupted.clips[0].source).toBeDefined(); expect(interrupted.clips[0].latent).toBeUndefined();
+    await executeProject(value.id, await reserveRun(value.id, "test-model", { clipId: "arrival" }), overrides);
+    expect(submit).toHaveBeenCalledTimes(1); expect(prepare).toHaveBeenCalledTimes(1); expect(download).toHaveBeenCalledTimes(1);
+    expect((await getProject(value.id)).clips[0]).toMatchObject({ status: "complete", latent: { mime: "application/octet-stream" } });
+  }, 20000);
+  it("requires the local file for Cloud continuation and invalidates review if its bytes change", async () => {
+    const value = await cloudScene();
+    const frame = await writeAsset(value.id, "frames/arrival.png", png, "image/png", "arrival.png");
+    await updateProject(value.id, current => { Object.assign(current.clips[0], { status: "complete", endpoint: "comfy-cloud", latentId: crypto.randomUUID(), frame, jobId: "previous-cloud-job" }); return current; });
+    let saved = await getProject(value.id);
+    await expect(inputFor(saved, saved.clips[1])).rejects.toMatchObject({ code: "continuity_latent_missing" });
+    const latent = await writeAsset(value.id, "clips/prior.safetensors", Buffer.from("original latent"), "application/octet-stream", "prior.safetensors");
+    await updateProject(value.id, current => { current.clips[0].latent = latent; return current; });
+    saved = await getProject(value.id);
+    const approval = promptApprovalKey(saved, saved.clips[1]), planning = previousPromptKey(saved, saved.clips[1]);
+    await writeAsset(value.id, latent.path, Buffer.from("changed latent!"), latent.mime, latent.name);
+    expect(promptApprovalKey(saved, saved.clips[1])).not.toBe(approval);
+    expect(previousPromptKey(saved, saved.clips[1])).not.toBe(planning);
+  });
+});
+
+describe("timed actions and script-only dialogue", () => {
+  it.each(["runpod", "comfy-cloud"] as const)("restores timed H3 action explanations throughout %s planning and revisions", async provider => {
+    const value = await project(false); value.settings.provider = provider;
+    value.script = 'The traveler opens the door and says, "Hello." She boards the train.';
+    const timed = '0–1s: The traveler opens the door.\n1–2s: Traveler says: "Hello."';
+    const first = { ...plan.clips[0], referenceIds: [] as string[], prompt: timed, transition: "first" as const, continuityReason: "Start." };
+    planning.call.mockResolvedValueOnce({ clips: [first] });
+    expect((await planFromReferences(value, "test-model"))[0].prompt).toBe(timed);
+    planning.call.mockResolvedValueOnce({ clips: value.clips.map(clip => ({ id: clip.id, prompt: timed })) });
+    await compilePrompts(value);
+    planning.call.mockResolvedValueOnce({ prompt: timed });
+    await reviseClipPrompt(value, "arrival", "Explain when she opens the door and speaks.", "test-model");
+    value.clips[0].status = "complete"; value.clips[0].latentId = crypto.randomUUID();
+    planning.call.mockResolvedValueOnce({ prompt: "0–2s: The traveler boards the train." });
+    await planFollowingClipPrompt(value, "boarding", "test-model");
+    value.clips[0].status = "pending";
+    planning.call.mockResolvedValueOnce({ clips: [{ ...first, duration: 4, sourceClipIds: ["arrival", "boarding"] }] });
+    await optimizeScriptPlan(value, "test-model");
+    planning.call.mockResolvedValueOnce({ ...plan, clips: [first] });
+    await analyzeScript(value.script, "test-model", undefined, "low", provider);
+    expect(planning.call).toHaveBeenCalledTimes(6);
+    for (const call of planning.call.mock.calls) {
+      expect(call[1]).toContain("clip-local time ranges");
+      expect(call[1]).toContain("order of movements and relevant blocking or gestures");
+      expect(call[1]).toContain("Do not add any dialogue beyond what is present in the script");
+      expect(call[1]).toContain("Do not include camera instructions");
+      expect(call[1]).not.toContain("Avoid step-by-step choreography");
+    }
+  });
+  it.each(["runpod", "comfy-cloud", "apimart"] as const)("includes the dialogue constraint once in the actual %s renderer prompt", async provider => {
+    const value = await project(false); value.settings.provider = provider;
+    value.clips[0].compiledPrompt = '0–1s: The traveler opens the door.\n1–2s: Traveler says: "Hello."';
+    let built = await inputFor(value, value.clips[0]);
+    expect(built.input.settings.prompt).toContain(value.clips[0].compiledPrompt);
+    expect(built.input.settings.prompt).toContain("Do not add any dialogue beyond what is present in the script");
+    expect(built.input.settings.prompt).toContain("If no dialogue is scripted for this clip, include no speech");
+    value.clips[0].compiledPrompt += `\n\n${scriptedDialogueConstraint}`;
+    built = await inputFor(value, value.clips[0]);
+    expect(built.input.settings.prompt.split(scriptedDialogueConstraint)).toHaveLength(2);
+  });
+});
+
 describe("individual clip duration", () => {
   it("updates unsubmitted clips independently and validates each provider", async () => {
     const value = await project();
@@ -99,6 +208,14 @@ describe("individual clip duration", () => {
 });
 
 describe("project drafts", () => {
+  it.each(["runpod", "apimart", undefined] as const)("preserves an existing %s draft provider when reference discovery omits a selection", async provider => {
+    const value = await project(false);
+    await updateProject(value.id, current => { current.clips = []; current.references = []; current.settings.provider = provider; return current; });
+    planning.call.mockResolvedValue({ title: plan.title, summary: plan.summary, references: plan.references });
+    const response = await analyzeRoute(localMutation("agent/analyze", { projectId: value.id, script: value.script, model: "test-model" }));
+    expect(response.status).toBe(200);
+    expect((await response.json()).project.settings.provider).toBe(provider || "runpod");
+  });
   it("keeps scene files and scoped library assets inside their parent and rejects cross-project references", async () => {
     const parent = await createCollection("Film"), other = await createCollection("Other film");
     const item = await saveCharacter({ collectionId: parent.id, kind: "location", name: "Station", images: [{ name: "station.png", bytes: png.length, base64: png.toString("base64") }] });
@@ -161,12 +278,14 @@ describe("project drafts", () => {
     expect(response.status).toBe(200);
     const draft = (await response.json()).project;
     expect(draft.title).toBe("My film"); expect(draft.clips).toEqual([]);
+    expect(draft.settings.provider).toBe("comfy-cloud");
     const saved = await projectsRoute(localMutation("agent/projects", { action: "saveDraft", projectId: draft.id, script: "Traveler arrives and boards." }));
     expect(saved.status).toBe(200);
     planning.call.mockResolvedValue({ title: plan.title, summary: plan.summary, references: plan.references });
     const analyzed = await analyzeRoute(localMutation("agent/analyze", { projectId: draft.id, script: "Traveler arrives and boards.", model: "test-model" }));
     expect(analyzed.status).toBe(200);
     const result = (await analyzed.json()).project;
+    expect(result.settings.provider).toBe("comfy-cloud");
     expect(result.id).toBe(draft.id); expect(result.title).toBe("My film"); expect(result.createdAt).toBe(draft.createdAt);
     expect(result.clips).toEqual([]); expect(result.references).toHaveLength(2); expect(result.referencesIdentified).toBe(true); expect(await listProjects()).toHaveLength(1);
   });
@@ -203,7 +322,7 @@ function localMutation(path: string, body: unknown) {
   return new Request(`http://127.0.0.1:3000/api/${path}`, { method: "POST", headers: { Host: "127.0.0.1:3000", Origin: "http://127.0.0.1:3000", "Content-Type": "application/json" }, body: JSON.stringify(body) });
 }
 async function project(upload = true) {
-  const value: AgentProject = { ...structuredClone(plan), id: crypto.randomUUID(), script: "Traveler arrives and boards.", model: "test-model", createdAt: Date.now(), updatedAt: Date.now(), status: "ready", sequentialPrompts: false, reviewBeforeEachClip: false, reviewAfterEachClip: false, settings: { ...defaultGeneration }, clips: plan.clips.map(clip => ({ ...structuredClone(clip), status: "pending" })) };
+  const value: AgentProject = { ...structuredClone(plan), id: crypto.randomUUID(), script: "Traveler arrives and boards.", model: "test-model", createdAt: Date.now(), updatedAt: Date.now(), status: "ready", sequentialPrompts: false, reviewBeforeEachClip: false, reviewAfterEachClip: false, settings: { ...defaultGeneration, provider: "runpod" }, clips: plan.clips.map(clip => ({ ...structuredClone(clip), status: "pending" })) };
   await createProject(value);
   if (upload) { const asset = await writeAsset(value.id, "references/traveler.png", png, "image/png", "traveler.png"); await updateProject(value.id, current => { current.references[0].asset = asset; return current; }); }
   return getProject(value.id);

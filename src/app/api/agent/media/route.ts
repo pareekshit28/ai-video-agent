@@ -15,7 +15,7 @@ export async function GET(request: Request) {
     const current = project.clips.find(clip => clip.id === id);
     const clip = version !== null ? current?.versions?.[Number(version)]?.clip : current;
     const reference = project.references.find(slot => slot.id === id);
-    const asset = kind === "audio" ? reference?.audios?.[Number(params.get("index") || 0)] : kind === "referenceImage" ? reference?.images?.[Number(params.get("index") || 0)] : kind === "reference" ? project.references.find(slot => slot.id === id)?.asset : kind === "video" ? clip?.video : kind === "frame" ? clip?.frame : undefined;
+    const asset = kind === "audio" ? reference?.audios?.[Number(params.get("index") || 0)] : kind === "referenceImage" ? reference?.images?.[Number(params.get("index") || 0)] : kind === "reference" ? project.references.find(slot => slot.id === id)?.asset : kind === "video" ? clip?.video : kind === "frame" ? clip?.frame : kind === "latent" ? clip?.latent : undefined;
     if (!asset) throw new RequestError("Local media not found.", "media_not_found");
     const path = assetPath(project.id, asset.path); const size = (await stat(path)).size; let start = 0; let end = size - 1; let status = 200;
     const range = request.headers.get("range");

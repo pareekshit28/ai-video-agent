@@ -1,3 +1,4 @@
+import { scriptedDialogueConstraint } from "./agent-prompt-rules";
 import type { ReasoningEffort } from "./reasoning";
 import { z } from "zod";
 import { initialSettings, ratios } from "./h3";
@@ -17,16 +18,17 @@ export const planSchema = z.object({ title: z.string().trim().min(1).max(150), s
 });
 export const wanShotSchema = shotSchema.extend({ duration: z.number().int().min(2).max(30) });
 export const wanPlanSchema = planSchema.safeExtend({ clips: z.array(wanShotSchema).min(1).max(40) });
-export const videoProviderSchema = z.enum(["runpod", "apimart"]);
+export const videoProviderSchema = z.enum(["runpod", "apimart", "comfy-cloud"]);
 export type VideoProvider = z.infer<typeof videoProviderSchema>;
+export const DEFAULT_VIDEO_PROVIDER: VideoProvider = "comfy-cloud";
 export const generationSchema = z.object({ provider: videoProviderSchema.optional(), wanResolution: z.enum(["480P", "720P", "1080P"]).optional(), wanDurationMode: z.enum(["auto", "fixed"]).optional(), aspectRatio: z.enum(ratios), megapixels: z.number().min(0.25).max(4), steps: z.number().int().min(1).max(100), refImageSize: z.enum(["max", "match"]) });
 export type GenerationSettings = z.infer<typeof generationSchema>;
-export const defaultGeneration: GenerationSettings = { aspectRatio: initialSettings.aspectRatio, megapixels: initialSettings.megapixels, steps: initialSettings.steps, refImageSize: initialSettings.refImageSize };
+export const defaultGeneration: GenerationSettings = { provider: DEFAULT_VIDEO_PROVIDER, aspectRatio: initialSettings.aspectRatio, megapixels: initialSettings.megapixels, steps: initialSettings.steps, refImageSize: initialSettings.refImageSize };
 export type Asset = { path: string; name: string; bytes: number; mime: string; publicUrl?: string };
 export type ReferenceSlot = z.infer<typeof slotSchema> & { asset?: Asset; images?: Asset[]; audios?: Asset[]; characterId?: string };
 export type ClipRevision = { referenceIds?: string[]; reasoningEffort?: ReasoningEffort; prompt: string; comments: string; model: string; createdAt: number };
 export type ClipVersion = { archivedAt: number; clip: Omit<AgentClip, "versions" | "revision"> };
-export type AgentClip = z.infer<typeof shotSchema> & { delayTime?: number; executionTime?: number; latentId?: string; previousLatentId?: string; promptFromLatent?: string; nextDuration?: number; outline?: string; promptContextKey?: string; promptFromFrame?: string; promptFromJob?: string; promptPlanError?: string; status: "awaiting-approval" | "pending" | "preparing" | "submitting" | "queued" | "rendering" | "saving" | "complete" | "recoverable" | "submission-unknown" | "failed"; approvedPromptKey?: string; compiledPrompt?: string; promptGuideVersion?: number; requestedDuration?: number; seed?: number; requestId?: string; jobId?: string; endpoint?: string; video?: Asset; frame?: Asset; extractedFrame?: Asset; frameReplaced?: boolean; source?: Asset; firstFrameFrom?: string; continuityOutdated?: boolean; revision?: ClipRevision; revisionComments?: string; versions?: ClipVersion[]; error?: string; media?: { width: number; height: number; duration: number; fps: number }; };
+export type AgentClip = z.infer<typeof shotSchema> & { delayTime?: number; executionTime?: number; latentId?: string; previousLatentId?: string; promptFromLatent?: string; latent?: Asset; nextDuration?: number; outline?: string; promptContextKey?: string; promptFromFrame?: string; promptFromJob?: string; promptPlanError?: string; status: "awaiting-approval" | "pending" | "preparing" | "submitting" | "queued" | "rendering" | "saving" | "complete" | "recoverable" | "submission-unknown" | "failed"; approvedPromptKey?: string; compiledPrompt?: string; promptGuideVersion?: number; requestedDuration?: number; seed?: number; requestId?: string; jobId?: string; endpoint?: string; video?: Asset; frame?: Asset; extractedFrame?: Asset; frameReplaced?: boolean; source?: Asset; firstFrameFrom?: string; continuityOutdated?: boolean; revision?: ClipRevision; revisionComments?: string; versions?: ClipVersion[]; error?: string; media?: { width: number; height: number; duration: number; fps: number }; };
 export type AgentProject = { maxClipDuration?: number; sequentialPrompts?: boolean; referencesIdentified?: boolean; collectionId?: string; reasoningEffort?: ReasoningEffort; id: string; title: string; script: string; summary: string; model: string; runEndpoint?: string; runClipId?: string; reviewBeforeEachClip?: boolean; reviewAfterEachClip?: boolean; createdAt: number; updatedAt: number; status: "ready" | "preparing" | "running" | "paused" | "complete"; error?: string; settings: GenerationSettings; references: ReferenceSlot[]; clips: AgentClip[] };
 export type PublicProject = AgentProject & { folder: string; active: boolean };
 export function planningMaxDuration(project: Pick<AgentProject, "maxClipDuration" | "settings">) {
@@ -71,6 +73,7 @@ export function audioBindings(project: AgentProject, clip: AgentClip) { return s
 export function finalPrompt(project: AgentProject, clip: AgentClip) {
   const bindings = referenceBindings(project, clip);
   const text = clip.compiledPrompt || clip.prompt;
+  const dialogueConstraint = text.includes(scriptedDialogueConstraint) ? [] : [scriptedDialogueConstraint];
   if (/<(?:Picture|Audio|Video)\s*\d+>/i.test(text)) throw new Error("The clip prompt contains manually assigned reference tags. Remove them and compile again.");
   if (project.settings.provider === "apimart") {
     const references = bindings.map(ref => {
@@ -78,10 +81,10 @@ export function finalPrompt(project: AgentProject, clip: AgentClip) {
       const role = kind === "location" ? "the setting, spatial layout and environmental details" : kind === "prop" ? "the object's shape, material and appearance" : "the character's identity and appearance";
       return `${ref.tag} is the supplied reference for ${ref.name}. Use it for ${role}; do not transfer unrelated subjects or actions from this image.`;
     });
-    return [...references, ...audioBindings(project, clip).map(ref => `${ref.tag} supplies ${ref.name}'s voice timbre. Use this voice for their scripted dialogue, not the sample's spoken words.`), text].join("\n\n");
+    return [...references, ...audioBindings(project, clip).map(ref => `${ref.tag} supplies ${ref.name}'s voice timbre. Use this voice for their scripted dialogue, not the sample's spoken words.`), text, ...dialogueConstraint].join("\n\n");
   }
-  return [...bindings.map(ref => `${ref.tag} is the supplied reference for ${ref.name}. Use this image as the authority for their visual appearance.`), ...audioBindings(project, clip).map(ref => `${ref.tag} is the supplied voice reference for ${ref.name}. Preserve this voice for their dialogue.`), text, ...(previousFrameDecision(clip) ? ["Continue the preceding action from the supplied motion-context latent without resetting the scene or replaying completed action."] : [])].join("\n\n");
+  return [...bindings.map(ref => `${ref.tag} is the supplied reference for ${ref.name}. Use this image as the authority for their visual appearance.`), ...audioBindings(project, clip).map(ref => `${ref.tag} is the supplied voice reference for ${ref.name}. Preserve this voice for their dialogue.`), text, ...(previousFrameDecision(clip) ? ["Continue the preceding action from the supplied motion-context latent without resetting the scene or replaying completed action."] : []), ...dialogueConstraint].join("\n\n");
 }
-export function assetUrl(projectId: string, kind: "video" | "frame" | "reference", id: string, download = false) {
+export function assetUrl(projectId: string, kind: "video" | "frame" | "reference" | "latent", id: string, download = false) {
   return `/api/agent/media?projectId=${encodeURIComponent(projectId)}&kind=${kind}&id=${encodeURIComponent(id)}${download ? "&download=1" : ""}`;
 }

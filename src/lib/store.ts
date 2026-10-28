@@ -7,6 +7,7 @@ import { join } from "node:path";
 export type Database = {
   runpod?: { endpoint: string; apiKey?: string };
   apimart?: { apiKey?: string };
+  comfyCloud?: { apiKey?: string; baseUrl?: string };
   h3Jobs?: import("./h3").H3Job[];
 };
 
@@ -68,6 +69,7 @@ export function withDatabase<T>(action: (database: Database) => T | Promise<T>):
     const database: Database = {};
     if (stored.runpod !== undefined) database.runpod = stored.runpod as Database["runpod"];
     if (stored.apimart !== undefined) database.apimart = stored.apimart as Database["apimart"];
+    if (stored.comfyCloud !== undefined) database.comfyCloud = stored.comfyCloud as Database["comfyCloud"];
     if (stored.h3Jobs !== undefined) database.h3Jobs = stored.h3Jobs as Database["h3Jobs"];
     const save = async () => {
       const temporary = join(directory, `credentials.${randomUUID()}.tmp`);
@@ -75,7 +77,7 @@ export function withDatabase<T>(action: (database: Database) => T | Promise<T>):
       await rename(temporary, path);
     };
     // Complete the cleanup even if the requested operation subsequently fails.
-    if (Object.keys(stored).some(key => !["runpod", "apimart", "h3Jobs"].includes(key))) await save();
+    if (Object.keys(stored).some(key => !["runpod", "apimart", "comfyCloud", "h3Jobs"].includes(key))) await save();
     const result = await action(database);
     await save();
     return result;

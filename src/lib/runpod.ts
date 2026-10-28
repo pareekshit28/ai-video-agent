@@ -43,7 +43,7 @@ function providerError(status: number) {
   return status === 401 || status === 403 ? "RunPod rejected the API key or endpoint access. Check RunPod connection." : status === 429 ? "RunPod is rate limiting requests. Wait before trying again." : status === 404 ? "RunPod could not find this endpoint or job. Completed results may have expired." : `RunPod returned HTTP ${status}. Check the endpoint and job in the RunPod console.`;
 }
 export async function jobHistory() {
-  return withDatabase(db => (db.h3Jobs || []).map(job => job.status === "SUBMITTING" ? { ...job, status: "SUBMISSION_UNKNOWN", error: "Submission may still be in progress or its response was interrupted. Recover its job ID from RunPod before submitting again." } : job));
+  return withDatabase(db => (db.h3Jobs || []).map(job => job.status === "SUBMITTING" ? { ...job, status: "SUBMISSION_UNKNOWN", error: "Submission may still be in progress or its response was interrupted. Recover its job ID from the provider account before submitting again." } : job));
 }
 export async function submitVideo(value: unknown): Promise<H3Job> {
   return submit(value, false);
@@ -100,6 +100,7 @@ export async function checkVideo(jobId: string, localId?: string, collectionId?:
   const saved = await withDatabase(db => (db.h3Jobs || []).find(job => localId ? job.localId === localId : job.id === jobId && job.endpoint === currentEndpoint));
   if (collectionId) { await getCollection(collectionId); if (saved?.collectionId && saved.collectionId !== collectionId) throw new RequestError("This job belongs to a different project.", "invalid_project"); }
   if (localId && !saved) throw new RequestError("Saved job not found.", "job_not_found");
+  if (saved && ["apimart", "comfy-cloud"].includes(saved.endpoint)) throw new RequestError("This job belongs to another video provider. Resume it from its scene in the agent.", "invalid_job_id");
   if (saved?.id && saved.id !== jobId) throw new RequestError("This job ID differs from the saved job.", "invalid_job_id");
   const endpoint = saved?.endpoint || currentEndpoint;
   let data;
@@ -123,7 +124,7 @@ export async function resolveUnknown(localId: string) {
   return withDatabase(db => {
     const job = db.h3Jobs?.find(job => job.localId === localId);
     if (!job || !["SUBMITTING", "SUBMISSION_UNKNOWN"].includes(job.status)) throw new RequestError("This submission does not need reconciliation.", "invalid_job_state");
-    job.status = "REJECTED"; job.error = "Marked resolved after manual review of the RunPod console.";
+    job.status = "REJECTED"; job.error = "Marked resolved after manual review of the provider account.";
     return job;
   });
 }
