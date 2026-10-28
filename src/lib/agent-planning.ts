@@ -17,7 +17,7 @@ export function compactPlan(plan: Plan, maxSeconds = 10): Plan {
     let start = 0;
     const prompt = next.length === 1 ? shot.prompt : next.map(clip => { const end = start + clip.duration; const text = `${time(start)}–${time(end)}s: ${clip.prompt}`; start = end; return text; }).join("\n\n");
     const automatic = next.every(clip => !clip.continuityMode || clip.continuityMode === "auto");
-    if (group && automatic && previousFrameDecision(shot) && duration <= maxSeconds && refs.size <= 9 && prompt.length <= 5000) group.push(shot);
+    if (group && automatic && previousFrameDecision(shot) && duration <= maxSeconds && Math.round(duration * 100) / 100 <= maxSeconds && refs.size <= 9 && prompt.length <= 5000) group.push(shot);
     else groups.push([shot]);
   }
   return { ...plan, clips: groups.map((group, index) => {
@@ -25,7 +25,7 @@ export function compactPlan(plan: Plan, maxSeconds = 10): Plan {
     let start = 0;
     const prompt = group.length === 1 ? first.prompt : group.map(shot => { const end = start + shot.duration; const text = `${time(start)}–${time(end)}s: ${shot.prompt}`; start = end; return text; }).join("\n\n");
     const continuation = index > 0 && previousFrameDecision(first);
-    return { ...first, title: group.length > 1 ? `${first.title} · ${group.at(-1)!.title}`.slice(0, 150) : first.title, duration: Math.round(group.reduce((sum, shot) => sum + shot.duration, 0) * 100) / 100, prompt, referenceIds: [...new Set(group.flatMap(shot => shot.referenceIds))], continuation, autoContinuation: index > 0 && (first.transition ? first.transition === "continue" : first.autoContinuation ?? first.continuation), continuityMode: first.continuityMode || "auto", ...(index === 0 ? { transition: "first" as const, continuityReason: "The first clip starts a new sequence." } : {}) };
+    return { ...first, title: group.length > 1 ? `${first.title} · ${group.at(-1)!.title}`.slice(0, 150) : first.title, duration: group.length === 1 ? first.duration : Math.round(group.reduce((sum, shot) => sum + shot.duration, 0) * 100) / 100, prompt, referenceIds: [...new Set(group.flatMap(shot => shot.referenceIds))], continuation, autoContinuation: index > 0 && (first.transition ? first.transition === "continue" : first.autoContinuation ?? first.continuation), continuityMode: first.continuityMode || "auto", ...(index === 0 ? { transition: "first" as const, continuityReason: "The first clip starts a new sequence." } : {}) };
   }) };
 }
 

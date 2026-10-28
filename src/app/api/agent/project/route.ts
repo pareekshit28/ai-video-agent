@@ -4,7 +4,7 @@ import { assertLocalRequest } from "@/lib/config";
 import { apiError, privateHeaders } from "@/lib/http";
 import { jobHistory, readJson } from "@/lib/runpod";
 import { getProject, updateProject } from "@/lib/agent-store";
-import { generationSchema, needsPreviousPrompt, previousFrameDecision, shotSchema, wanShotSchema, entityIdSchema, type AgentProject } from "@/lib/agent-types";
+import { generationSchema, needsPreviousPrompt, planningMaxDuration, previousFrameDecision, shotSchema, wanShotSchema, entityIdSchema, type AgentProject } from "@/lib/agent-types";
 import { optimizeScriptPlan, reviseClipPrompt, planFromReferences } from "@/lib/agent-llm";
 import { assertEditable, isProjectActive, publicProject, recoverClip, retryClip } from "@/lib/agent-runner";
 import { RequestError } from "@/lib/request-error";
@@ -16,7 +16,7 @@ export const maxDuration = 300;
 const mutation = z.discriminatedUnion("action", [
   z.object({ projectId: z.uuid(), action: z.literal("setDuration"), clipId: entityIdSchema, duration: z.number() }),
   z.object({ projectId: z.uuid(), action: z.literal("planNextPrompt"), clipId: entityIdSchema, model: z.string().min(1).max(150), reasoningEffort: reasoningEffortSchema.optional(), prompt: shotSchema.shape.prompt.optional(), referenceIds: z.array(entityIdSchema).max(9).optional() }),
-  z.object({ projectId: z.uuid(), action: z.literal("plan"), model: z.string().min(1).max(150), reasoningEffort: reasoningEffortSchema.optional() }),
+  z.object({ projectId: z.uuid(), action: z.literal("plan"), model: z.string().min(1).max(150), reasoningEffort: reasoningEffortSchema.optional(), maxClipDuration: z.number().optional() }),
   z.object({ projectId: z.uuid(), action: z.literal("prepareClip"), clipId: entityIdSchema, prompt: shotSchema.shape.prompt, referenceIds: z.array(entityIdSchema).max(9) }),
   z.object({ projectId: z.uuid(), action: z.literal("approvePrompt"), clipId: entityIdSchema, prompt: shotSchema.shape.prompt }),
   z.object({ projectId: z.uuid(), action: z.literal("edit"), clip: shotSchema.or(wanShotSchema).optional(), settings: generationSchema.optional(), reviewBeforeEachClip: z.boolean().optional(), reviewAfterEachClip: z.boolean().optional() }),
@@ -63,11 +63,15 @@ export async function POST(request: Request) {
       if (snapshot.clips.length) throw new RequestError("This scene already has a clip plan. Edit its prompts individually.", "plan_locked");
       if (snapshot.settings.provider === "apimart" && !snapshot.references.some(slot => slot.asset || slot.images?.length || slot.audios?.length)) throw new RequestError("Supply at least one image or voice reference before planning Wan clips.", "missing_reference");
       const effort = data.reasoningEffort || snapshot.reasoningEffort || defaultReasoningEffort;
-      const clips = await planFromReferences(snapshot, data.model, request.signal, effort);
+      const maxClipDuration = data.maxClipDuration ?? planningMaxDuration(snapshot);
+      const durationSchema = (snapshot.settings.provider === "apimart" ? wanShotSchema : shotSchema).shape.duration;
+      if (!durationSchema.safeParse(maxClipDuration).success) throw new RequestError("Use a maximum from 2–10 seconds for H3 or 2–30 whole seconds for Wan.", "invalid_duration");
+      const clips = await planFromReferences({ ...snapshot, maxClipDuration }, data.model, request.signal, effort);
       project = await updateProject(data.projectId, current => {
         assertEditable(data.projectId);
         if (JSON.stringify(current) !== JSON.stringify(snapshot)) throw new RequestError("References changed while planning. Try again to use the latest references.", "project_changed");
         current.sequentialPrompts = true;
+        current.maxClipDuration = maxClipDuration;
         current.clips = clips.map((clip, index) => ({ ...clip, outline: clip.prompt, compiledPrompt: index ? undefined : clip.prompt, promptGuideVersion: wanPromptGuideVersion, status: "pending" }));
         current.model = data.model; current.reasoningEffort = effort; current.status = "ready"; current.error = undefined;
         return current;

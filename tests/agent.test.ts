@@ -429,6 +429,54 @@ describe("reference upload validation before generation", () => {
 });
 
 describe("scene planning and reference selection", () => {
+  it.each([
+    ["runpod", 2, 2, 2], ["runpod", 2.5, 2, 2], ["runpod", 4, 2, 1], ["runpod", 4.345, 2.1725, 2],
+    ["apimart", 5, 3, 2], ["apimart", 6, 3, 1], ["apimart", 30, 15, 1],
+  ] as const)("respects and saves a %s planning maximum of %s seconds during clip packing", async (provider, maximum, duration, count) => {
+    const value = await project();
+    await updateProject(value.id, current => { current.clips = []; current.settings.provider = provider; return current; });
+    planning.call.mockResolvedValue({ clips: plan.clips.map((clip, index) => ({ ...clip, duration, referenceIds: ["traveler"], transition: index ? "continue" : "first", continuityReason: "Continuous story." })) });
+    const response = await projectRoute(localMutation("agent/project", { projectId: value.id, action: "plan", model: "test-model", maxClipDuration: maximum }));
+    expect(response.status).toBe(200);
+    const saved = await getProject(value.id);
+    expect(saved.maxClipDuration).toBe(maximum);
+    expect(saved.clips).toHaveLength(count);
+    expect(saved.clips.every(clip => clip.duration <= maximum)).toBe(true);
+    expect(saved.clips.reduce((sum, clip) => sum + clip.duration, 0)).toBe(duration * 2);
+    expect(planning.call.mock.calls[0][1]).toContain(`never exceed ${maximum} seconds`);
+    expect(JSON.parse(planning.call.mock.calls[0][2]).maxClipDuration).toBe(maximum);
+  });
+  it.each(["runpod", "apimart"] as const)("rejects an invalid %s maximum before calling the planner", async provider => {
+    const value = await project();
+    await updateProject(value.id, current => { current.clips = []; current.settings.provider = provider; return current; });
+    for (const maximum of provider === "apimart" ? [0, 1, 4.5, 31] : [0, 1, 10.5, 30]) {
+      expect((await projectRoute(localMutation("agent/project", { projectId: value.id, action: "plan", model: "test-model", maxClipDuration: maximum }))).status).toBe(400);
+    }
+    expect(planning.call).not.toHaveBeenCalled();
+    expect((await getProject(value.id)).references).toEqual(value.references);
+  });
+  it("rejects overlong planner output without trimming the story and keeps the scene available for retry", async () => {
+    const value = await project();
+    await updateProject(value.id, current => { current.clips = []; return current; });
+    const clip = { ...plan.clips[0], duration: 6, referenceIds: ["traveler"], transition: "first", continuityReason: "Start." };
+    planning.call.mockResolvedValue({ clips: [clip] });
+    const request = () => projectRoute(localMutation("agent/project", { projectId: value.id, action: "plan", model: "test-model", maxClipDuration: 5 }));
+    const response = await request();
+    expect(response.status).toBe(422);
+    expect((await response.json()).error).toContain("5-second maximum");
+    expect(await getProject(value.id)).toMatchObject({ clips: [], script: value.script, references: value.references });
+    planning.call.mockResolvedValue({ clips: [{ ...clip, duration: 5 }] });
+    expect((await request()).status).toBe(200);
+    expect((await getProject(value.id)).maxClipDuration).toBe(5);
+    // The planning preference must not prevent later manual duration changes.
+    expect((await projectRoute(localMutation("agent/project", { projectId: value.id, action: "setDuration", clipId: clip.id, duration: 8 }))).status).toBe(200);
+  });
+  it("keeps the saved maximum when optimizing an unsubmitted plan", async () => {
+    const value = await project(); value.maxClipDuration = 3;
+    planning.call.mockResolvedValue({ clips: [{ ...plan.clips[0], duration: 4, transition: "first", continuityReason: "Start.", sourceClipIds: ["arrival", "boarding"] }] });
+    await expect(optimizeScriptPlan(value, "test-model")).rejects.toThrow("3-second maximum");
+    expect(planning.call.mock.calls[0][1]).toContain("never exceed 3 seconds");
+  });
   async function sequentialScene() {
     const value = await project();
     return updateProject(value.id, current => { current.sequentialPrompts = true; current.reviewBeforeEachClip = true; current.clips[0].compiledPrompt = current.clips[0].prompt; current.clips[1].outline = current.clips[1].prompt; return current; });

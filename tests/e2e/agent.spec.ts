@@ -42,7 +42,7 @@ async function setup(page: Page, initial?: PublicProject) {
   await page.route(url => url.pathname === "/api/agent/project", route => {
     if (route.request().method() === "POST") {
       const body = route.request().postDataJSON(); requests.push({ path: "project", body });
-      if (body.action === "plan") { project!.sequentialPrompts = true; project!.clips = planned().clips.map((clip, index) => ({ ...clip, outline: clip.prompt, compiledPrompt: index ? undefined : clip.prompt, referenceIds: project!.references.filter(slot => slot.asset || slot.audios?.length).map(slot => slot.id) })); }
+      if (body.action === "plan") { project!.maxClipDuration = body.maxClipDuration; project!.sequentialPrompts = true; project!.clips = planned().clips.map((clip, index) => ({ ...clip, duration: Math.min(clip.duration, body.maxClipDuration ?? 30), outline: clip.prompt, compiledPrompt: index ? undefined : clip.prompt, referenceIds: project!.references.filter(slot => slot.asset || slot.audios?.length).map(slot => slot.id) })); }
       if (body.action === "planNextPrompt") { const index = project!.clips.findIndex(clip => clip.id === body.clipId); const clip = project!.clips[index], previous = project!.clips[index - 1]; Object.assign(clip, { compiledPrompt: "Static shot. Continue from the observed replacement pose.", promptContextKey: "refreshed-frame-key", promptFromLatent: previous.latentId, promptFromFrame: previous.frame!.path, promptFromJob: previous.jobId, referenceIds: body.referenceIds || clip.referenceIds }); }
       if (body.action === "prepareClip") {
         const clip = project!.clips.find(clip => clip.id === body.clipId)!;
@@ -76,6 +76,36 @@ async function setup(page: Page, initial?: PublicProject) {
     return route.fulfill({ json: { project } });
   });
   await page.goto("/"); return requests;
+}
+
+for (const provider of ["runpod", "apimart"] as const) {
+  test(`maximum clip duration is validated before ${provider} planning and saved with the scene`, async ({ page }, info) => {
+    const value = planned(); value.clips = []; value.referencesIdentified = true; value.settings.provider = provider;
+    value.references[0].asset = { path: "references/traveler.png", name: "traveler.png", bytes: png.length, mime: "image/png" };
+    await page.route("**/api/apimart/settings", route => route.fulfill({ json: { configured: true, environmentKey: true } }));
+    const requests = await setup(page, value);
+    const maximum = page.getByLabel("Maximum clip duration", { exact: true });
+    const limit = provider === "apimart" ? 30 : 10;
+    await expect(maximum).toBeEditable();
+    await expect(maximum).toHaveValue(String(limit));
+    await expect(maximum).toHaveAttribute("max", String(limit));
+    await maximum.fill(String(limit + 1));
+    await page.getByRole("button", { name: "Understand references & plan clips", exact: true }).click();
+    await expect(page.getByRole("alert").filter({ hasText: "Use a maximum from" }).first()).toBeVisible();
+    expect(requests.filter(item => item.body.action === "plan")).toHaveLength(0);
+    const selected = provider === "apimart" ? 12 : 6;
+    await maximum.fill(String(selected));
+    await page.locator(".agent-generation").screenshot({ path: `test-results/${info.project.name}-${provider}-planning-maximum.png` });
+    await page.getByRole("button", { name: "Understand references & plan clips", exact: true }).click();
+    await expect(page.getByLabel("Prompt for clip 1", { exact: true })).toBeVisible();
+    expect(requests.find(item => item.body.action === "plan")?.body.maxClipDuration).toBe(selected);
+    expect(requests.filter(item => item.path === "run")).toHaveLength(0);
+    await page.reload();
+    await expect(maximum).toHaveValue(String(selected));
+    await expect(maximum).toBeDisabled();
+    await expect(page.getByLabel("Clip 1 duration", { exact: true })).toBeEditable();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  });
 }
 
 test("clip duration stays editable after generation and persists on reload", async ({ page }, info) => {
